@@ -1,4 +1,4 @@
-# Scramjet CFD — Hybrid FVM/FEM Compressible Flow Solver with Surrogate-Accelerated Design Optimization
+# Scramjet CFD Solver
 
 ## Motivation
 
@@ -6,8 +6,8 @@ Scramjet (supersonic combustion ramjet) engines are one of the few viable
 propulsion concepts for sustained atmospheric flight above Mach 5. Unlike
 turbojets, they have no moving parts — the vehicle's own speed compresses
 incoming air — which makes them mechanically simple but aerodynamically
-strictt. Small changes in duct geometry can push the combustor into
-thermal choking, shift the shock train, or collapse the inlet entirely.
+strict. Small changes in duct geometry can push the combustor into thermal 
+choking, shift the shock train, or collapse the inlet entirely.
 Understanding and optimizing these interactions requires resolving coupled
 compressible flow, variable-area duct effects, and finite-rate combustion
 simultaneously, which is expensive even in 2D.
@@ -45,9 +45,12 @@ heat release. All numerical routines are implemented using NumPy/SciPy
 
 The governing equations:
 
-$$\partial_t U + \partial_x F(U) + \partial_y G(U) \;=\; S_{\text{area}}(U) + S_{\text{chem}}(U) + \nabla\!\cdot\!(\mu\nabla u,\,k\nabla T,\,\rho D \nabla Y_f)$$
+```math
+\partial_t U + \partial_x F(U) + \partial_y G(U)
+= S_{\text{area}}(U) + S_{\text{chem}}(U)
++ \nabla\\!\cdot\\!(\mu \nabla u,\\, k \nabla T,\\, \rho D \nabla Y_f)
 
-with $U = [\rho,\;\rho u,\;\rho v,\;\rho E,\;\rho Y_f]^\top$.
+with $U = [\rho, \rho u, \rho v, \rho E, \rho Y_f]^\top$.
 
 - **Convective flux** — HLLC approximate Riemann solver on MUSCL-reconstructed
   left/right states with the Venkatakrishnan limiter, evolved by 3rd-order SSP
@@ -97,8 +100,8 @@ The peak Mach of 7.18 matches area-Mach theory for a supersonic duct with
 A_exit/A_throat = 3. No cells contain negative density, pressure, or
 temperature.
 
-![Mach field](verify_mach.png)
-![Centreline profiles](verify_centerline.png)
+![Mach field](verification/verify_mach.png)
+![Centreline profiles](verification/verify_centerline.png)
 
 ### POD reduced-order model — 28 000x speedup
 
@@ -125,7 +128,7 @@ t_{\text{mix}} = 0.2\,t_{\text{full}} + 0.8\,t_{\text{ROM}}, \quad
 \text{saving} = 1 - t_{\text{mix}}/t_{\text{full}} = 79.997\%
 $$
 
-![POD energy spectrum](verify_pod_energy.png)
+![POD energy spectrum](verification/verify_pod_energy.png)
 
 ### Bayesian optimization — 94% thrust increase
 
@@ -154,7 +157,7 @@ The optimizer nearly doubles thrust relative to the baseline geometry by
 driving exit area toward the upper bound, which increases the expansion ratio
 and the resulting momentum flux at the nozzle exit.
 
-![BO convergence](verify_bo_convergence.png)
+![BO convergence](verification/verify_bo_convergence.png)
 
 ## Contents
 
@@ -167,7 +170,7 @@ and the resulting momentum flux at the nozzle exit.
 | `rom.py` | Snapshot collection, `PODBasis` (SVD truncation), `ReducedSolver` (inverse-distance interpolation in POD coefficient space), `ROMEvaluator`. |
 | `optimization.py` | `DesignSpace` (Latin hypercube), `GPSurrogate` (ARD-RBF kernel), `AcquisitionFunction` (Expected Improvement), `BayesianOptimizer` (multi-fidelity ROM/full-solver dispatch). |
 | `tests.py` | Sod shock tube, Couette flow, 0-D ignition delay — three canonical validation cases. |
-| `verify_all.py` | End-to-end verification harness. Writes `verify_results.json` and all `verify_*.png` plots. |
+| `verification/verify_all.py` | End-to-end verification harness. Writes `verify_results.json` and all `verify_*.png` plots. |
 
 
 ## Quick start
@@ -175,7 +178,7 @@ and the resulting momentum flux at the nozzle exit.
 ```bash
 pip install numpy scipy matplotlib numba   # numba is optional
 python3 tests.py                           # 3 validation tests (~10 s), writes test_*.png
-python3 verify_all.py                      # full pipeline (~3 min), writes verify_*.png + verify_results.json
+python3 verification/verify_all.py                      # full pipeline (~3 min), writes verify_*.png + verify_results.json
 ```
 
 Minimal programmatic run:
@@ -198,8 +201,8 @@ solver.plot_mach().savefig("mach.png")
 
 ```bash
 python3 tests.py          # 3 validations (~10 s)
-python3 verify_all.py     # full pipeline (~3 min)
+python3 verification/verify_all.py     # full pipeline (~3 min)
 ```
 
-`verify_all.py` writes `verify_results.json` (all numbers cited above) and the
-`verify_*.png` plots.
+`verification/verify_all.py` writes `verification/verify_results.json` (all
+numbers cited above) and the `verification/verify_*.png` plots.
