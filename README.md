@@ -48,7 +48,8 @@ The governing equations:
 ```math
 \partial_t U + \partial_x F(U) + \partial_y G(U)
 = S_{\text{area}}(U) + S_{\text{chem}}(U)
-+ \nabla\\!\cdot\\!(\mu \nabla u,\\, k \nabla T,\\, \rho D \nabla Y_f)
++ \nabla \cdot (\mu \nabla u, k \nabla T, \rho D \nabla Y_f)
+```
 
 with $U = [\rho, \rho u, \rho v, \rho E, \rho Y_f]^\top$.
 
