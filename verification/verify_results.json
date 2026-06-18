@@ -6,7 +6,7 @@
     "p_inf_Pa": 2486.918638664724,
     "rho_inf_kg_m3": 0.03999640774293907,
     "u_inf_m_s": 1770.2539139908713,
-    "wall_time_s": 71.01356196403503,
+    "wall_time_s": 119.2643609046936,
     "n_cells": 1280,
     "n_steps": 1500,
     "final_time_s": 0.0027056565045800447,
@@ -29,7 +29,7 @@
     "Arrhenius_A_pre": 1000000.0,
     "Arrhenius_Ea_J_mol": 65000.0,
     "Arrhenius_Q_heat_J_kg": 1500000.0,
-    "wall_time_s": 14.988991975784302,
+    "wall_time_s": 26.009459018707275,
     "n_cells": 720,
     "n_steps": 600,
     "Yf_inlet_mean": 0.019999999999999997,
@@ -45,22 +45,22 @@
     "n_training_snapshots": 9,
     "n_modes": 8,
     "energy_threshold": 0.999,
-    "mean_full_solver_s": 6.2338774469163685,
-    "mean_rom_eval_s": 0.00022101402282714844,
-    "speedup": 28205.800551360422,
-    "wall_saving_pct_at_80pct_rom": 79.9971637039745,
+    "mean_full_solver_s": 9.665478971269396,
+    "mean_rom_eval_s": 7.565816243489583e-05,
+    "speedup": 127751.96568627452,
+    "wall_saving_pct_at_80pct_rom": 79.99937378654356,
     "mean_rel_err_thrust": 0.057587926839789944,
     "mean_rel_err_Isp": 0.05758792683979,
     "mean_rel_err_exit_mach": 0.022245933764292875,
     "mean_rel_err_pressure_recovery": 0.059187956304645434
   },
   "bayes_opt": {
-    "total_wall_s": 44.00045990943909,
+    "total_wall_s": 66.54188704490662,
     "n_total_evals": 20,
     "n_full_evals": 7,
     "n_rom_evals": 13,
-    "full_solver_wall_s": 42.4070987701416,
-    "rom_wall_s": 0.004827737808227539,
+    "full_solver_wall_s": 65.0283350944519,
+    "rom_wall_s": 0.0012044906616210938,
     "pct_rom_evals": 65.0,
     "best_params": {
       "A_exit": 0.19854914276432978,
@@ -70,6 +70,6 @@
     "best_thrust": 11694.226589079874,
     "best_Isp": 168.42023870205796,
     "best_objective": -11778.436708430903,
-    "estimated_wall_saving_pct": 64.99601550617258
+    "estimated_wall_saving_pct": 64.99935171071049
   }
 }

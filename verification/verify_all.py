@@ -5,15 +5,22 @@ Runs every subsystem of the scramjet project and writes the numbers we need
 for the report: a converged clean scramjet run (Mach 6, 25 km, inviscid
 with variable-area source), a separate low-intensity combustion run to
 exercise the heat-release model in flowing conditions, a POD ROM build +
-held-out validation, and a Bayesian-optimisation loop that uses the ROM.
+held-out validation, and a Bayesian-optimization loop that uses the ROM.
 Results are dumped to verify_results.json.
 """
 import json
+import os
+import sys
 import time
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.dirname(_HERE)
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 
 from solver import SolverConfig, Solver, InletConfig, MeshConfig, CombustionConfig
 from rom import ROMEvaluator, _compute_qoi
@@ -70,9 +77,9 @@ print(f"  wall={wall_full:.2f}s  thrust={qoi['thrust']:.1f}  Isp={qoi['Isp']:.1f
 print(f"  M range=[{M.min():.3f},{M.max():.3f}]  T range=[{T.min():.0f},{T.max():.0f}]K")
 
 fig = solver.plot_mach()
-fig.savefig("verify_mach.png", dpi=140); plt.close(fig)
+fig.savefig(os.path.join(_HERE, "verify_mach.png"), dpi=140); plt.close(fig)
 fig = solver.plot_centerline()
-fig.savefig("verify_centerline.png", dpi=140); plt.close(fig)
+fig.savefig(os.path.join(_HERE, "verify_centerline.png"), dpi=140); plt.close(fig)
 
 # 2) combustion-coupled run (mild heat release for stability)
 print("\n[2] Combustion-coupled run (mild Arrhenius)")
@@ -97,7 +104,7 @@ wall_comb = time.time() - t0
 
 qoi2 = _compute_qoi(solver2)
 rho2, u2, v2, p2, T2, Yf2 = solver2.state.primitives()
-# centreline Yf depletion
+# centerline Yf depletion
 j_mid = solver2.mesh.ny // 2
 Yf_inlet_mean = float(np.mean(Yf2[0, :]))
 Yf_exit_mean = float(np.mean(Yf2[-1, :]))
@@ -130,9 +137,9 @@ print(f"  T inlet={T_inlet_mean:.1f}K -> exit={T_exit_mean:.1f}K  "
       f"(dT={results['scramjet_combustion']['delta_T_K']:.1f}K)")
 
 fig = solver2.plot_field("temperature")
-fig.savefig("verify_combustion_T.png", dpi=140); plt.close(fig)
+fig.savefig(os.path.join(_HERE, "verify_combustion_T.png"), dpi=140); plt.close(fig)
 fig = solver2.plot_field("fuel_fraction")
-fig.savefig("verify_combustion_Yf.png", dpi=140); plt.close(fig)
+fig.savefig(os.path.join(_HERE, "verify_combustion_Yf.png"), dpi=140); plt.close(fig)
 
 # 3) POD ROM build + held-out validation
 print("\n[3] POD ROM build")
@@ -171,7 +178,7 @@ rom_eval_time = (time.time() - t0) / len(test_params)
 
 mean_full = rom.collector.mean_wall_time()
 speedup = mean_full / max(rom_eval_time, 1e-9)
-# wall-time reduction when 80% of optimisation evaluations use ROM
+# wall-time reduction when 80% of optimization evaluations use ROM
 wall_saving_pct = (1.0 - (0.2 * mean_full + 0.8 * rom_eval_time) / mean_full) * 100.0
 
 results['rom'] = {
@@ -189,10 +196,10 @@ results['rom'] = {
 }
 
 fig = rom.pod.plot_energy()
-fig.savefig("verify_pod_energy.png", dpi=140); plt.close(fig)
+fig.savefig(os.path.join(_HERE, "verify_pod_energy.png"), dpi=140); plt.close(fig)
 
-# 4) Bayesian optimisation with ROM acceleration
-print("\n[4] Bayesian optimisation with ROM acceleration")
+# 4) Bayesian optimization with ROM acceleration
+print("\n[4] Bayesian optimization with ROM acceleration")
 bo_cfg = SolverConfig()
 bo_cfg.mesh.nx = 40
 bo_cfg.mesh.ny = 10
@@ -241,9 +248,9 @@ if optimizer.n_full > 0:
     results['bayes_opt']['estimated_wall_saving_pct'] = float(savings)
 
 fig = optimizer.plot_convergence()
-fig.savefig("verify_bo_convergence.png", dpi=140); plt.close(fig)
+fig.savefig(os.path.join(_HERE, "verify_bo_convergence.png"), dpi=140); plt.close(fig)
 
-with open("verify_results.json", "w") as f:
+with open(os.path.join(_HERE, "verify_results.json"), "w") as f:
     json.dump(results, f, indent=2)
 
 print("\n" + "=" * 60)
