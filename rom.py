@@ -9,7 +9,7 @@ Contains:
 
 The ROM operates in **parametric** mode: POD is taken over snapshots at
 different design parameters (not over timesteps of a single run). This
-maps the steady-state QoI landscape cheaply for the optimiser.
+maps the steady-state QoI landscape cheaply for the optimizer.
 
 Dependency: solver.py (full-order model), numpy, scipy
 """
@@ -18,7 +18,7 @@ import numpy as np
 from scipy.linalg import svd
 import matplotlib.pyplot as plt
 
-from mesh import GeometryProfile
+from mesh import GeometryProfile, LocalizedAreaPerturbation, PerturbedGeometryProfile
 from solver import SolverConfig, Solver
 
 
@@ -277,7 +277,7 @@ class ReducedSolver:
             [p[k] for k in self.param_keys] for p in train_params
         ])
 
-        # normalise parameter space for distance computation
+        # normalize parameter space for distance computation
         self.X_min = self.X_train.min(axis=0)
         self.X_max = self.X_train.max(axis=0)
         self.X_range = np.maximum(self.X_max - self.X_min, 1e-30)
@@ -297,13 +297,13 @@ class ReducedSolver:
             qoi_pred: dict with predicted thrust, Isp, etc.
             state_flat: reconstructed full-order state (n_dof,)
         """
-        # normalise query point
+        # normalize query point
         x_new = np.array([params[k] for k in self.param_keys])
         x_norm = (x_new - self.X_min) / self.X_range
         X_norm = (self.X_train - self.X_min) / self.X_range
 
         # inverse-distance weights with Shepard exponent p=2
-        # w_k = 1 / d_k^2, normalised
+        # w_k = 1 / d_k^2, normalized
         dists = np.linalg.norm(X_norm - x_norm, axis=1)
         dists = np.maximum(dists, 1e-12)  # avoid division by zero
 
@@ -484,15 +484,18 @@ def _clone_config(cfg):
     new.mesh = MeshConfig(
         nx=cfg.mesh.nx, ny=cfg.mesh.ny, y_stretch=cfg.mesh.y_stretch,
     )
-    new.geometry = GeometryProfile(
-        L_inlet=cfg.geometry.L_inlet,
-        L_combustor=cfg.geometry.L_combustor,
-        L_nozzle=cfg.geometry.L_nozzle,
-        A_inlet=cfg.geometry.A_inlet,
-        A_throat=cfg.geometry.A_throat,
-        A_comb_exit=cfg.geometry.A_comb_exit,
-        A_exit=cfg.geometry.A_exit,
-    )
+    if hasattr(cfg.geometry, "copy"):
+        new.geometry = cfg.geometry.copy()
+    else:
+        new.geometry = GeometryProfile(
+            L_inlet=cfg.geometry.L_inlet,
+            L_combustor=cfg.geometry.L_combustor,
+            L_nozzle=cfg.geometry.L_nozzle,
+            A_inlet=cfg.geometry.A_inlet,
+            A_throat=cfg.geometry.A_throat,
+            A_comb_exit=cfg.geometry.A_comb_exit,
+            A_exit=cfg.geometry.A_exit,
+        )
     cc = cfg.combustion
     new.combustion = CombustionConfig(
         enabled=cc.enabled, A_pre=cc.A_pre, Ea=cc.Ea,
@@ -500,23 +503,77 @@ def _clone_config(cfg):
     )
     new.cfl = cfg.cfl
     new.n_steps = cfg.n_steps
+    new.t_final = cfg.t_final
     new.print_interval = cfg.print_interval
     new.viscous = cfg.viscous
     new.wall_type = cfg.wall_type
+    new.passive_scalar_enabled = getattr(cfg, "passive_scalar_enabled", False)
+    new.heat_release_model = getattr(cfg, "heat_release_model", "none")
+    new.simple_heat_release_rate = getattr(cfg, "simple_heat_release_rate", 0.0)
+    new.simple_heat_release_fuel_coupled = getattr(
+        cfg, "simple_heat_release_fuel_coupled", True,
+    )
+    new.turbulence_model = getattr(cfg, "turbulence_model", "none")
     new.area_source = cfg.area_source
     return new
 
 
 def _apply_params(cfg, params):
     """Override config fields from a parameter dict."""
+    geom_existing = cfg.geometry
+    perturbation_existing = getattr(geom_existing, "perturbation", None)
+    min_area_existing = getattr(geom_existing, "min_area", 1.0e-6)
+    base_existing = getattr(geom_existing, "base_geometry", geom_existing)
+
     # geometry parameters
     geom_keys = ['L_inlet', 'L_combustor', 'L_nozzle',
                  'A_inlet', 'A_throat', 'A_comb_exit', 'A_exit']
     geom_vals = {}
     for k in geom_keys:
-        geom_vals[k] = params.get(k, getattr(cfg.geometry, k))
+        geom_vals[k] = params.get(k, getattr(base_existing, k))
 
-    cfg.geometry = GeometryProfile(**geom_vals)
+    base_geometry = GeometryProfile(**geom_vals)
+
+    perturbation_keys = {
+        'q_throat', 'area_amplitude', 'area_enabled', 'area_mode',
+        'area_x_center', 'area_width', 'min_area',
+    }
+    use_perturbation = perturbation_existing is not None or any(k in params for k in perturbation_keys)
+
+    if use_perturbation:
+        if perturbation_existing is not None:
+            perturbation = perturbation_existing.copy()
+        else:
+            perturbation = LocalizedAreaPerturbation(
+                enabled=True,
+                mode='throat_gaussian',
+                amplitude=0.0,
+                x_center=base_geometry.x_throat,
+                width=max(0.05 * base_geometry.L_total, 1e-6),
+            )
+
+        if 'area_enabled' in params:
+            perturbation.enabled = bool(params['area_enabled'])
+        if 'area_mode' in params:
+            if params['area_mode'] != 'throat_gaussian':
+                raise ValueError(f"Unsupported area perturbation mode: {params['area_mode']}")
+            perturbation.mode = params['area_mode']
+        if 'q_throat' in params:
+            perturbation.amplitude = float(params['q_throat'])
+        if 'area_amplitude' in params:
+            perturbation.amplitude = float(params['area_amplitude'])
+        if 'area_x_center' in params:
+            perturbation.x_center = float(params['area_x_center'])
+        if 'area_width' in params:
+            perturbation.width = float(params['area_width'])
+            if perturbation.width <= 0.0:
+                raise ValueError("area_width must be positive")
+
+        min_area = float(params.get('min_area', min_area_existing))
+        perturbation.min_area = min_area
+        cfg.geometry = PerturbedGeometryProfile(base_geometry, perturbation)
+    else:
+        cfg.geometry = base_geometry
 
     # inlet parameters
     if 'mach' in params:

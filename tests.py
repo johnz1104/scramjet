@@ -1,14 +1,16 @@
 """
 tests.py — Validation test suite for the scramjet CFD solver.
 
-Three canonical test cases, each targeting a different solver component:
+Validation cases, each targeting a different solver component:
 
+    0. Area perturbation    — validates static throat-area wrapper
     1. Sod shock tube       — validates FVM (HLLC, MUSCL, RK3-SSP)
     2. Couette flow         — validates FEM viscous diffusion
     3. Ignition delay       — validates Arrhenius combustion model
 
 Usage:
     python tests.py              # run all tests
+    python tests.py geometry     # area perturbation only
     python tests.py sod          # Sod shock tube only
     python tests.py couette      # Couette flow only
     python tests.py ignition     # ignition delay only
@@ -21,9 +23,472 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from mesh import StructuredMesh2D
+from mesh import (
+    StructuredMesh2D,
+    GeometryProfile,
+    LocalizedAreaPerturbation,
+    PerturbedGeometryProfile,
+    SinusoidalAreaForcing,
+    TimeDependentPerturbedGeometryProfile,
+)
 from fvm import StateVector, BoundaryConditions, FVMResidual, TimeIntegrator
-from physics import TransportProperties, FEMViscous, SingleStepArrhenius
+from physics import (
+    TransportProperties,
+    FEMViscous,
+    SingleStepArrhenius,
+    SimpleHeatRelease,
+)
+from solver import SolverConfig, Solver, InletConfig
+from diagnostics import scalar_diagnostics
+from response_metrics import extract_response_metrics, fit_sinusoid
+
+
+def test_area_perturbation():
+    """
+    Localized throat-area perturbation sanity test.
+
+    This verifies the static effective-area mode used by the cold-flow
+    wall-position workflow. It does not represent moving-wall CFD.
+    """
+    print("=" * 60)
+    print("TEST 0: Localized Area Perturbation")
+    print("=" * 60)
+
+    base = GeometryProfile.default()
+    x = np.linspace(0.0, base.L_total, 200)
+    x_center = base.x_throat
+    x_c = np.array([x_center])
+
+    zero = LocalizedAreaPerturbation(
+        enabled=True,
+        amplitude=0.0,
+        x_center=x_center,
+        width=0.05,
+        min_area=1.0e-6,
+    )
+    geom_zero = PerturbedGeometryProfile(base, zero)
+    zero_area_ok = np.array_equal(geom_zero.area(x), base.area(x))
+    zero_grad_ok = np.array_equal(geom_zero.area_gradient(x), base.area_gradient(x))
+
+    positive = LocalizedAreaPerturbation(
+        enabled=True,
+        amplitude=0.005,
+        x_center=x_center,
+        width=0.05,
+        min_area=1.0e-6,
+    )
+    geom_positive = PerturbedGeometryProfile(base, positive)
+    positive_ok = geom_positive.area(x_c)[0] > base.area(x_c)[0]
+
+    negative = LocalizedAreaPerturbation(
+        enabled=True,
+        amplitude=-0.005,
+        x_center=x_center,
+        width=0.05,
+        min_area=0.01,
+    )
+    geom_negative = PerturbedGeometryProfile(base, negative)
+    A_negative = geom_negative.area(x_c)[0]
+    negative_ok = A_negative < base.area(x_c)[0] and A_negative > negative.min_area
+
+    invalid_raised = False
+    try:
+        invalid = LocalizedAreaPerturbation(
+            enabled=True,
+            amplitude=-0.2,
+            x_center=x_center,
+            width=0.05,
+            min_area=0.01,
+        )
+        PerturbedGeometryProfile(base, invalid)
+    except ValueError:
+        invalid_raised = True
+
+    grad_mode = LocalizedAreaPerturbation(
+        enabled=True,
+        amplitude=0.003,
+        x_center=x_center,
+        width=0.08,
+        min_area=1.0e-6,
+    )
+    geom_grad = PerturbedGeometryProfile(base, grad_mode)
+    x_fd = np.linspace(0.05, base.L_total - 0.05, 120)
+    x_fd = x_fd[np.abs(x_fd - base.x_throat) > 1.0e-3]
+    x_fd = x_fd[np.abs(x_fd - base.x_comb_exit) > 1.0e-3]
+    h = 1.0e-6
+    grad_exact = geom_grad.area_gradient(x_fd)
+    grad_fd = (geom_grad.area(x_fd + h) - geom_grad.area(x_fd - h)) / (2.0 * h)
+    grad_ok = np.max(np.abs(grad_exact - grad_fd)) < 5.0e-5
+
+    disabled = LocalizedAreaPerturbation(
+        enabled=False,
+        amplitude=-1.0,
+        x_center=x_center,
+        width=0.05,
+        min_area=0.01,
+    )
+    geom_disabled = PerturbedGeometryProfile(base, disabled)
+    disabled_ok = np.array_equal(geom_disabled.area(x), base.area(x))
+
+    forcing = SinusoidalAreaForcing(
+        amplitude=0.002,
+        frequency_hz=250.0,
+        phase=0.3,
+    )
+    t_samples = np.array([0.0, 0.0005, 0.001, 0.0015])
+    q_expected = 0.002 * np.sin(2.0 * np.pi * 250.0 * t_samples + 0.3)
+    q_actual = np.array([forcing.value(t) for t in t_samples])
+    forcing_ok = np.allclose(q_actual, q_expected, rtol=0.0, atol=1e-15)
+
+    forcing_with_mean = SinusoidalAreaForcing(
+        amplitude=0.002,
+        frequency_hz=250.0,
+        phase=0.3,
+        mean=0.01,
+    )
+    q_with_mean_expected = 0.01 + q_expected
+    q_with_mean_actual = np.array([forcing_with_mean.value(t) for t in t_samples])
+    forcing_mean_ok = np.allclose(q_with_mean_actual, q_with_mean_expected,
+                                   rtol=0.0, atol=1e-15)
+
+    dyn_zero = TimeDependentPerturbedGeometryProfile(
+        base,
+        LocalizedAreaPerturbation(
+            enabled=True,
+            amplitude=0.0,
+            x_center=x_center,
+            width=0.05,
+            min_area=1.0e-6,
+        ),
+        SinusoidalAreaForcing(amplitude=0.0, frequency_hz=100.0, phase=1.1),
+    )
+    dyn_zero.set_time(0.123)
+    dyn_zero_ok = np.array_equal(dyn_zero.area(x), base.area(x))
+
+    static_forcing = TimeDependentPerturbedGeometryProfile(
+        base,
+        LocalizedAreaPerturbation(
+            enabled=True,
+            amplitude=0.0,
+            x_center=x_center,
+            width=0.05,
+            min_area=1.0e-6,
+        ),
+        SinusoidalAreaForcing(amplitude=0.004, frequency_hz=0.0, phase=np.pi / 2.0),
+    )
+    A_static_0 = static_forcing.area_at_time(x_c, 0.0)[0]
+    A_static_1 = static_forcing.area_at_time(x_c, 99.0)[0]
+    static_forcing_ok = (
+        abs(A_static_0 - (base.area(x_c)[0] + 0.004)) < 1.0e-12
+        and abs(A_static_1 - A_static_0) < 1.0e-12
+    )
+
+    dynamic_invalid_raised = False
+    try:
+        TimeDependentPerturbedGeometryProfile(
+            base,
+            LocalizedAreaPerturbation(
+                enabled=True,
+                amplitude=0.0,
+                x_center=x_center,
+                width=0.05,
+                min_area=0.01,
+            ),
+            SinusoidalAreaForcing(amplitude=0.2, frequency_hz=100.0, phase=0.0),
+        )
+    except ValueError:
+        dynamic_invalid_raised = True
+
+    checks = {
+        "q=0 area recovers baseline": zero_area_ok,
+        "q=0 gradient recovers baseline": zero_grad_ok,
+        "positive q increases throat area": positive_ok,
+        "negative q decreases throat area above min_area": negative_ok,
+        "invalid negative area raises ValueError": invalid_raised,
+        "analytical gradient matches finite difference": grad_ok,
+        "disabled perturbation recovers baseline": disabled_ok,
+        "sinusoidal q(t) matches analytic value": forcing_ok,
+        "sinusoidal q(t) with mean offset matches analytic": forcing_mean_ok,
+        "epsilon=0 dynamic geometry recovers baseline": dyn_zero_ok,
+        "frequency=0 dynamic forcing is static offset": static_forcing_ok,
+        "dynamic area positivity is enforced": dynamic_invalid_raised,
+    }
+
+    for name, ok in checks.items():
+        print(f"  {name}: {'PASS' if ok else 'FAIL'}")
+
+    passed = all(checks.values())
+    print(f"  {'PASS' if passed else 'FAIL'}")
+    return passed
+
+
+def test_reduced_fidelity_extensions():
+    """
+    Passive-scalar, simple heat-release, and turbulence flag sanity tests.
+
+    These are reduced-fidelity controls only. They do not validate realistic
+    combustion or turbulence closure.
+    """
+    print("\n" + "=" * 60)
+    print("TEST 0B: Reduced-Fidelity Extension Controls")
+    print("=" * 60)
+
+    cfg_cold = SolverConfig()
+    cfg_cold.mesh.nx = 8
+    cfg_cold.mesh.ny = 2
+    cfg_cold.n_steps = 1
+    cfg_cold.print_interval = 10
+    solver_cold = Solver(cfg_cold)
+    cold_ok = solver_cold.simple_heat_release is None and solver_cold.combustion is None
+
+    cfg_passive_zero = SolverConfig()
+    cfg_passive_zero.inlet = InletConfig(Yf_inlet=0.0)
+    cfg_passive_zero.mesh.nx = 8
+    cfg_passive_zero.mesh.ny = 2
+    cfg_passive_zero.n_steps = 3
+    cfg_passive_zero.print_interval = 10
+    cfg_passive_zero.passive_scalar_enabled = True
+    cfg_passive_zero.area_source = False
+    solver_passive_zero = Solver(cfg_passive_zero)
+    solver_passive_zero.run()
+    diag_zero = scalar_diagnostics(solver_passive_zero)
+    no_fuel_created_ok = abs(diag_zero["integrated_fuel_scalar"]) < 1.0e-14
+
+    cfg_passive = SolverConfig()
+    cfg_passive.inlet = InletConfig(Yf_inlet=0.1)
+    cfg_passive.mesh.nx = 8
+    cfg_passive.mesh.ny = 2
+    cfg_passive.n_steps = 3
+    cfg_passive.print_interval = 10
+    cfg_passive.passive_scalar_enabled = True
+    cfg_passive.area_source = False
+    solver_passive = Solver(cfg_passive)
+    solver_passive.run()
+    diag_passive = scalar_diagnostics(solver_passive)
+    scalar_bounded_ok = diag_passive["fuel_scalar_bounded"]
+
+    U = np.zeros((5, 1, 1))
+    U[0, 0, 0] = 1.0
+    U[3, 0, 0] = 250000.0
+    U[4, 0, 0] = 0.5
+    heat_on = SimpleHeatRelease(heat_rate=1000.0, fuel_coupled=True).compute(U)
+    heat_off = SimpleHeatRelease(heat_rate=0.0, fuel_coupled=True).compute(U)
+    heat_on_ok = heat_on[3, 0, 0] > 0.0
+    heat_off_ok = np.allclose(heat_off, 0.0)
+
+    cfg_simple = SolverConfig()
+    cfg_simple.heat_release_model = "simple"
+    cfg_simple.simple_heat_release_rate = 1000.0
+    cfg_simple.mesh.nx = 4
+    cfg_simple.mesh.ny = 2
+    cfg_simple.n_steps = 1
+    cfg_simple.print_interval = 10
+    simple_solver = Solver(cfg_simple)
+    simple_model_ok = simple_solver.simple_heat_release is not None
+
+    cfg_none = SolverConfig()
+    cfg_none.turbulence_model = "none"
+    turbulence_none_ok = Solver(cfg_none) is not None
+
+    rans_raised = False
+    try:
+        cfg_rans = SolverConfig()
+        cfg_rans.turbulence_model = "rans"
+        Solver(cfg_rans)
+    except NotImplementedError:
+        rans_raised = True
+
+    les_raised = False
+    try:
+        cfg_les = SolverConfig()
+        cfg_les.turbulence_model = "les"
+        Solver(cfg_les)
+    except NotImplementedError:
+        les_raised = True
+
+    checks = {
+        "cold-flow default has no heat or combustion source": cold_ok,
+        "passive scalar with zero inlet creates no fuel": no_fuel_created_ok,
+        "passive scalar remains bounded": scalar_bounded_ok,
+        "simple heat release adds energy": heat_on_ok,
+        "turning simple heat release off removes source": heat_off_ok,
+        "simple heat-release config constructs source": simple_model_ok,
+        "turbulence_model=none works": turbulence_none_ok,
+        "turbulence_model=rans raises NotImplementedError": rans_raised,
+        "turbulence_model=les raises NotImplementedError": les_raised,
+    }
+
+    for name, ok in checks.items():
+        print(f"  {name}: {'PASS' if ok else 'FAIL'}")
+
+    passed = all(checks.values())
+    print(f"  {'PASS' if passed else 'FAIL'}")
+    return passed
+
+
+def test_response_metrics():
+    """
+    Synthetic-signal validation for response_metrics.extract_response_metrics.
+
+    Covers: clean amplitude/phase recovery, transient cutoff behavior,
+    insufficient-cycle phase-lag rejection, flat-response phase-lag
+    rejection, epsilon=0 reporting, and probe pressure aggregation.
+
+    These checks do not validate a CFD solution; they validate the metric
+    extractor itself.
+    """
+    print("\n" + "=" * 60)
+    print("TEST 0C: Response Metrics (synthetic signals)")
+    print("=" * 60)
+
+    rng = np.random.default_rng(seed=12345)
+
+    def build_rows(t, q, qoi_keys_values, probe_pressures=None):
+        forcing_rows = [{"time": float(ti), "q": float(qi)}
+                        for ti, qi in zip(t, q)]
+        qoi_rows = []
+        for k, ti in enumerate(t):
+            row = {"time": float(ti)}
+            for key, series in qoi_keys_values.items():
+                row[key] = float(series[k])
+            qoi_rows.append(row)
+        probe_rows = None
+        if probe_pressures is not None:
+            probe_rows = []
+            for k, ti in enumerate(t):
+                row = {"time": float(ti)}
+                for name, series in probe_pressures.items():
+                    row[f"{name}_pressure"] = float(series[k])
+                probe_rows.append(row)
+        return forcing_rows, qoi_rows, probe_rows
+
+    # 1. Clean sinusoid with a known phase lag.
+    freq = 200.0
+    omega = 2.0 * np.pi * freq
+    n_samples = 600
+    t_clean = np.linspace(0.0, 4.0 / freq, n_samples)
+    forcing_amp = 0.02
+    forcing_mean = -0.01
+    forcing_phase = 0.0
+    q_clean = forcing_mean + forcing_amp * np.sin(omega * t_clean + forcing_phase)
+    qoi_amp = 1.5
+    qoi_mean = 5.0
+    expected_lag = 0.7  # rad
+    response = qoi_mean + qoi_amp * np.sin(omega * t_clean + forcing_phase + expected_lag)
+    flat_series = np.full_like(t_clean, 4.2)
+    forcing_rows, qoi_rows, probe_rows = build_rows(
+        t_clean, q_clean,
+        {"exit_mach": response, "mdot": flat_series, "pressure_recovery": response,
+         "max_mach": response, "thrust": response},
+        probe_pressures={"inlet_side": response * 100.0, "throat": flat_series},
+    )
+    metrics_clean = extract_response_metrics(
+        qoi_rows=qoi_rows, forcing_rows=forcing_rows, probe_rows=probe_rows,
+        frequency_hz=freq, discard_fraction=0.25, min_cycles=1.0, min_samples=8,
+    )
+    forcing_amp_ok = abs(metrics_clean["forcing"]["amplitude"] - forcing_amp) < 1e-6
+    forcing_mean_ok = abs(metrics_clean["forcing"]["mean"] - forcing_mean) < 1e-6
+    response_amp_ok = abs(metrics_clean["qoi"]["exit_mach"]["amplitude"] - qoi_amp) < 1e-6
+    response_mean_ok = abs(metrics_clean["qoi"]["exit_mach"]["mean"] - qoi_mean) < 1e-6
+    response_phase_ok = abs(metrics_clean["qoi"]["exit_mach"]["phase_lag_vs_q_rad"]
+                            - expected_lag) < 1e-3
+
+    # Probe pressure amplitude reflects scaling.
+    probe_amp_ok = abs(metrics_clean["probes"]["inlet_side"]["pressure_amplitude"]
+                       - qoi_amp * 100.0) < 1e-4
+
+    # Flat QoI must report null phase lag with a warning.
+    flat_qoi_warning = metrics_clean["qoi"]["mdot"]["warning"]
+    flat_qoi_null = metrics_clean["qoi"]["mdot"]["phase_lag_vs_q_rad"] is None
+    flat_qoi_ok = flat_qoi_null and "flat" in flat_qoi_warning.lower()
+
+    flat_probe_warning = metrics_clean["probes"]["throat"]["warning"]
+    flat_probe_ok = (metrics_clean["probes"]["throat"]["pressure_phase_lag_vs_q_rad"] is None
+                     and "flat" in flat_probe_warning.lower())
+
+    # 2. Transient cutoff: corrupt the first 25% with a wild offset and check
+    #    that the post-transient amplitude is still correct.
+    contaminated = response.copy()
+    n_corrupt = n_samples // 4
+    contaminated[:n_corrupt] += 30.0 * rng.standard_normal(n_corrupt)
+    forcing_rows_c, qoi_rows_c, _ = build_rows(
+        t_clean, q_clean, {"exit_mach": contaminated},
+    )
+    metrics_transient = extract_response_metrics(
+        qoi_rows=qoi_rows_c, forcing_rows=forcing_rows_c,
+        frequency_hz=freq, discard_fraction=0.25, min_cycles=1.0, min_samples=8,
+        qoi_keys=("exit_mach",),
+    )
+    transient_amp_ok = abs(metrics_transient["qoi"]["exit_mach"]["amplitude"] - qoi_amp) < 5e-2
+    transient_phase_ok = abs(metrics_transient["qoi"]["exit_mach"]["phase_lag_vs_q_rad"]
+                             - expected_lag) < 5e-2
+
+    # 3. Insufficient cycles: only ~0.5 cycles of forcing, min_cycles = 1.0.
+    n_short = 32
+    t_short = np.linspace(0.0, 0.5 / freq, n_short)
+    q_short = forcing_amp * np.sin(omega * t_short)
+    y_short = qoi_amp * np.sin(omega * t_short + expected_lag) + qoi_mean
+    forcing_rows_s, qoi_rows_s, _ = build_rows(
+        t_short, q_short, {"exit_mach": y_short},
+    )
+    metrics_short = extract_response_metrics(
+        qoi_rows=qoi_rows_s, forcing_rows=forcing_rows_s,
+        frequency_hz=freq, discard_fraction=0.25, min_cycles=1.0, min_samples=8,
+        qoi_keys=("exit_mach",),
+    )
+    insufficient_cycle_null = (
+        metrics_short["qoi"]["exit_mach"]["phase_lag_vs_q_rad"] is None
+    )
+    insufficient_cycle_warning_ok = any(
+        "insufficient cycles" in w.lower() for w in metrics_short["warnings"]
+    )
+
+    # 4. epsilon=0 (zero forcing): mean is preserved but phase lag must be null.
+    n_zero = 200
+    t_zero = np.linspace(0.0, 2.0 / freq, n_zero)
+    q_zero = np.zeros_like(t_zero)
+    y_zero = qoi_mean + 0.0 * t_zero
+    forcing_rows_z, qoi_rows_z, _ = build_rows(
+        t_zero, q_zero, {"exit_mach": y_zero},
+    )
+    metrics_zero = extract_response_metrics(
+        qoi_rows=qoi_rows_z, forcing_rows=forcing_rows_z,
+        frequency_hz=freq, discard_fraction=0.25, min_cycles=1.0, min_samples=8,
+        qoi_keys=("exit_mach",),
+    )
+    zero_mean_ok = abs(metrics_zero["forcing"]["mean"] - 0.0) < 1e-12
+    zero_amp_small = metrics_zero["forcing"]["amplitude"] < 1e-12
+    zero_phase_null = metrics_zero["qoi"]["exit_mach"]["phase_lag_vs_q_rad"] is None
+
+    # 5. Convenience utility round-trips.
+    mean_fit, amp_fit, phase_fit = fit_sinusoid(t_clean, response, freq)
+    fit_ok = (abs(mean_fit - qoi_mean) < 1e-6
+              and abs(amp_fit - qoi_amp) < 1e-6
+              and abs(phase_fit - (forcing_phase + expected_lag)) < 1e-3)
+
+    checks = {
+        "clean signal recovers forcing amplitude": forcing_amp_ok,
+        "clean signal recovers forcing mean": forcing_mean_ok,
+        "clean signal recovers response amplitude": response_amp_ok,
+        "clean signal recovers response mean": response_mean_ok,
+        "clean signal recovers response phase lag": response_phase_ok,
+        "probe amplitude reflects scaling": probe_amp_ok,
+        "flat QoI phase lag is null with warning": flat_qoi_ok,
+        "flat probe phase lag is null with warning": flat_probe_ok,
+        "transient is removed: amplitude still correct": transient_amp_ok,
+        "transient is removed: phase still correct": transient_phase_ok,
+        "insufficient cycles yields null phase lag": insufficient_cycle_null,
+        "insufficient cycles emits warning": insufficient_cycle_warning_ok,
+        "epsilon=0 mean preserved": zero_mean_ok,
+        "epsilon=0 amplitude is ~zero": zero_amp_small,
+        "epsilon=0 phase lag is null": zero_phase_null,
+        "fit_sinusoid utility round-trips": fit_ok,
+    }
+    for name, ok in checks.items():
+        print(f"  {name}: {'PASS' if ok else 'FAIL'}")
+    passed = all(checks.values())
+    print(f"  {'PASS' if passed else 'FAIL'}")
+    return passed
 
 
 def test_sod_shock_tube():
@@ -314,7 +779,7 @@ def test_couette_flow():
         # solve tridiagonal system (Thomas algorithm)
         u_profile = _solve_tridiag(lower, diag, upper, rhs_vec)
 
-    # exact solution at cell centres
+    # exact solution at cell centers
     y = mesh.yc
     u_exact = U_wall * y / H
 
@@ -388,7 +853,7 @@ def test_ignition_delay():
         - No flow (u=v=0), no spatial gradients
         - Only the combustion source term is active
 
-    Expected behaviour:
+    Expected behavior:
         - Temperature and pressure remain nearly constant until ignition
         - At ignition, rapid temperature rise as fuel is consumed
         - Final state approaches adiabatic flame temperature
@@ -512,6 +977,9 @@ def test_ignition_delay():
 
 if __name__ == "__main__":
     tests = {
+        "geometry": test_area_perturbation,
+        "reduced": test_reduced_fidelity_extensions,
+        "metrics": test_response_metrics,
         "sod": test_sod_shock_tube,
         "couette": test_couette_flow,
         "ignition": test_ignition_delay,

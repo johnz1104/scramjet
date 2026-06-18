@@ -30,10 +30,10 @@ from solver import SolverConfig, Solver
 
 class DesignSpace:
     """
-    Defines the optimisation design variables with bounds and sampling.
+    Defines the optimization design variables with bounds and sampling.
 
     Each variable is a key in the parameter dict passed to the solver.
-    Variables are normalised to [0, 1] internally for the GP.
+    Variables are normalized to [0, 1] internally for the GP.
     """
 
     def __init__(self, variables):
@@ -47,11 +47,11 @@ class DesignSpace:
         self.upper = np.array([v[2] for v in variables])
         self.ndim = len(variables)
 
-    def normalise(self, x):
+    def normalize(self, x):
         """Map physical values to [0, 1]."""
         return (np.asarray(x) - self.lower) / (self.upper - self.lower)
 
-    def denormalise(self, x_norm):
+    def denormalize(self, x_norm):
         """Map [0, 1] to physical values."""
         return np.asarray(x_norm) * (self.upper - self.lower) + self.lower
 
@@ -89,13 +89,13 @@ class DesignSpace:
                 hi = (intervals[i] + 1) / n_samples
                 X_norm[i, d] = rng.uniform(lo, hi)
 
-        return self.denormalise(X_norm)
+        return self.denormalize(X_norm)
 
     def random_samples(self, n_samples, seed=None):
         """Uniform random samples in physical space."""
         rng = np.random.RandomState(seed)
         X_norm = rng.uniform(0, 1, size=(n_samples, self.ndim))
-        return self.denormalise(X_norm)
+        return self.denormalize(X_norm)
 
 
 class GPSurrogate:
@@ -116,12 +116,12 @@ class GPSurrogate:
     def __init__(self, ndim):
         self.ndim = ndim
 
-        # hyperparameters (log-space for optimisation)
+        # hyperparameters (log-space for optimization)
         self.log_sigma_f = 0.0               # log signal variance
         self.log_lengthscales = np.zeros(ndim)  # log ARD lengthscales
         self.log_sigma_n = -3.0              # log noise variance
 
-        # training data (normalised)
+        # training data (normalized)
         self.X_train = None  # (n, ndim)
         self.y_train = None  # (n,)
         self.y_mean = 0.0
@@ -152,9 +152,9 @@ class GPSurrogate:
         Fit GP hyperparameters by maximising log marginal likelihood.
 
         Args:
-            X: training inputs, (n, ndim) — normalised to [0,1]
+            X: training inputs, (n, ndim) — normalized to [0,1]
             y: training outputs, (n,)
-            n_restarts: number of random restarts for optimisation
+            n_restarts: number of random restarts for optimization
         """
         self.X_train = np.asarray(X, dtype=np.float64)
         self.y_mean = np.mean(y)
@@ -182,7 +182,7 @@ class GPSurrogate:
             nll += 0.5 * n * np.log(2.0 * np.pi)
             return nll
 
-        # optimise from multiple starting points
+        # optimize from multiple starting points
         best_theta = None
         best_nll = np.inf
         rng = np.random.RandomState(0)
@@ -220,7 +220,7 @@ class GPSurrogate:
         GP posterior mean and variance at new points.
 
         Args:
-            X_new: (m, ndim) query points (normalised)
+            X_new: (m, ndim) query points (normalized)
 
         Returns:
             mu:  (m,) posterior mean (in original scale)
@@ -387,7 +387,7 @@ class BayesianOptimizer:
             best_qoi:    dict of QoI at best parameters
         """
         print("=" * 60)
-        print("BAYESIAN OPTIMISATION")
+        print("BAYESIAN OPTIMIZATION")
         print(f"  Design variables: {self.space.names}")
         print(f"  Objective: {self.obj_weights}")
         print(f"  n_init={n_init}, n_iter={n_iter}")
@@ -439,12 +439,12 @@ class BayesianOptimizer:
             # fit GP on all evaluations so far
             X_arr = np.array(self.X_eval)
             y_arr = np.array(self.y_eval)
-            X_norm = self.space.normalise(X_arr)
+            X_norm = self.space.normalize(X_arr)
             self.gp.train(X_norm, y_arr, n_restarts=3)
 
             # generate candidate points and evaluate EI
             X_cand = self.space.random_samples(n_candidates, seed=it * 1000)
-            X_cand_norm = self.space.normalise(X_cand)
+            X_cand_norm = self.space.normalize(X_cand)
             mu, var = self.gp.predict(X_cand_norm)
 
             ei = AcquisitionFunction.expected_improvement(mu, var, self.best_y)
@@ -503,7 +503,7 @@ class BayesianOptimizer:
         pct_rom = self.n_rom / max(self.n_rom + self.n_full, 1) * 100
 
         print(f"\n{'='*60}")
-        print("OPTIMISATION COMPLETE")
+        print("OPTIMIZATION COMPLETE")
         print(f"{'='*60}")
         print(f"  Total evaluations: {len(self.X_eval)}")
         print(f"    Full solver: {self.n_full} ({self.full_solver_time:.1f} s)")
@@ -538,7 +538,7 @@ class BayesianOptimizer:
 
         ax.set_xlabel("Evaluation number")
         ax.set_ylabel("Objective (lower is better)")
-        ax.set_title("Bayesian Optimisation Convergence")
+        ax.set_title("Bayesian Optimization Convergence")
         ax.legend()
         ax.grid(True, alpha=0.3)
         plt.tight_layout()
@@ -557,7 +557,7 @@ class BayesianOptimizer:
                                    self.space.upper[dim_idx], n_grid)
         X_query = np.tile(self.best_x, (n_grid, 1))
         X_query[:, dim_idx] = x_grid_phys
-        X_query_norm = self.space.normalise(X_query)
+        X_query_norm = self.space.normalize(X_query)
 
         mu, var = self.gp.predict(X_query_norm)
         std = np.sqrt(var)
@@ -654,7 +654,7 @@ class PerformanceSweep:
 
 
 if __name__ == "__main__":
-    print("=== Optimisation standalone test ===\n")
+    print("=== Optimization standalone test ===\n")
 
     # small mesh for fast testing
     cfg = SolverConfig()
@@ -674,10 +674,10 @@ if __name__ == "__main__":
     gp = GPSurrogate(ndim=2)
     X_test = space.latin_hypercube(8)
     y_test = np.array([np.sin(x[0] * 10) + x[1]**2 for x in X_test])
-    X_norm = space.normalise(X_test)
+    X_norm = space.normalize(X_test)
     gp.train(X_norm, y_test)
 
-    X_pred = space.normalise(space.random_samples(5, seed=99))
+    X_pred = space.normalize(space.random_samples(5, seed=99))
     mu, var = gp.predict(X_pred)
     print(f"  GP predictions: mu={mu}, std={np.sqrt(var)}")
 
@@ -699,4 +699,4 @@ if __name__ == "__main__":
     print(f"\n  Best design: {best_params}")
     print(f"  Best thrust: {best_qoi['thrust']:.2f} N")
 
-    print("\nOptimisation standalone test complete.")
+    print("\nOptimization standalone test complete.")

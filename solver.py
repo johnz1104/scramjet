@@ -15,7 +15,13 @@ import matplotlib.pyplot as plt
 
 from mesh import StructuredMesh2D, GeometryProfile
 from fvm import StateVector, BoundaryConditions, FVMResidual, TimeIntegrator
-from physics import TransportProperties, VariableAreaSource, SingleStepArrhenius, FEMViscous
+from physics import (
+    TransportProperties,
+    VariableAreaSource,
+    SingleStepArrhenius,
+    SimpleHeatRelease,
+    FEMViscous,
+)
 
 
 class InletConfig:
@@ -117,11 +123,17 @@ class SolverConfig:
         # time stepping
         self.cfl = 0.4
         self.n_steps = 2000
+        self.t_final = None
         self.print_interval = 200
 
         # physics toggles
         self.viscous = False
         self.wall_type = "slip"   # "slip" or "no_slip"
+        self.passive_scalar_enabled = False
+        self.heat_release_model = "none"  # "none", "passive", or "simple"
+        self.simple_heat_release_rate = 0.0
+        self.simple_heat_release_fuel_coupled = True
+        self.turbulence_model = "none"
 
         # variable-area source
         self.area_source = True
@@ -147,6 +159,7 @@ class Solver:
             config: SolverConfig instance
         """
         self.cfg = config
+        self._validate_model_flags()
 
         # build mesh
         geom = config.geometry
@@ -200,6 +213,13 @@ class Solver:
                 gamma=inlet.gamma, R_gas=inlet.R_gas,
             )
 
+        self.simple_heat_release = None
+        if getattr(config, "heat_release_model", "none") == "simple":
+            self.simple_heat_release = SimpleHeatRelease(
+                heat_rate=getattr(config, "simple_heat_release_rate", 0.0),
+                fuel_coupled=getattr(config, "simple_heat_release_fuel_coupled", True),
+            )
+
         # viscous operator
         self.fem_viscous = None
         if config.viscous:
@@ -216,6 +236,24 @@ class Solver:
         self.dt_history = []
         self.residual_history = []
 
+    def _validate_model_flags(self):
+        """Validate reduced-fidelity feature flags."""
+        heat_release_model = getattr(self.cfg, "heat_release_model", "none")
+        turbulence_model = getattr(self.cfg, "turbulence_model", "none")
+        if heat_release_model not in ("none", "passive", "simple"):
+            raise ValueError(
+                "heat_release_model must be 'none', 'passive', or 'simple'"
+            )
+        if turbulence_model != "none":
+            raise NotImplementedError(
+                f"turbulence_model='{turbulence_model}' is not implemented "
+                "in the Python prototype; use OpenFOAM/FUN3D for RANS/LES."
+            )
+        if self.cfg.combustion.enabled and heat_release_model != "none":
+            raise ValueError(
+                "Use either CombustionConfig.enabled or heat_release_model, not both"
+            )
+
     def _rhs(self, U):
         """
         Full right-hand-side: FVM convective residual + source terms.
@@ -225,10 +263,13 @@ class Solver:
         dUdt = self.fvm_residual.compute(U)
 
         if self.area_source is not None:
-            dUdt += self.area_source.compute(U, self.cfg.inlet.gamma)
+            dUdt += self.area_source.compute(U, self.cfg.inlet.gamma, time=self.time)
 
         if self.combustion is not None:
             dUdt += self.combustion.compute(U)
+
+        if self.simple_heat_release is not None:
+            dUdt += self.simple_heat_release.compute(U)
 
         return dUdt
 
@@ -236,52 +277,86 @@ class Solver:
         """Apply boundary conditions in-place."""
         self.bc.apply(U)
 
-    def run(self):
+    def compute_dt(self, t_final=None):
+        """Compute the next CFL-limited time step."""
+        dt = self.integrator.compute_dt(self.state, self.mesh)
+
+        # viscous CFL constraint (explicit diffusive stability)
+        if self.fem_viscous is not None:
+            # for implicit FEM, the viscous step is unconditionally stable
+            # but we limit dt to avoid large temporal splitting error
+            rho, u, v, p, T, Yf = self.state.primitives()
+            mu_max = self.fem_viscous.transport.viscosity(T).max()
+            rho_min = np.maximum(rho.min(), 1e-30)
+            dx_min = min(self.mesh.dx.min(), self.mesh.dy.min())
+            # diffusive CFL: dt_diff = 0.5 * rho * dx^2 / mu
+            dt_diff = 0.5 * rho_min * dx_min**2 / max(mu_max, 1e-30)
+            dt = min(dt, dt_diff)
+
+        if t_final is not None:
+            remaining = float(t_final) - self.time
+            if remaining <= 0.0:
+                return 0.0
+            dt = min(dt, remaining)
+
+        return max(dt, 1e-15)
+
+    def advance_one_step(self, dt=None, t_final=None):
+        """Advance by one solver step and return the step size used."""
+        if dt is None:
+            dt = self.compute_dt(t_final=t_final)
+        if dt <= 0.0:
+            return 0.0
+
+        self.dt_history.append(dt)
+
+        if self.area_source is not None:
+            self.area_source.update(self.time)
+
+        # --- Strang splitting ---
+        if self.fem_viscous is not None:
+            # half-step viscous (L_FEM(dt/2))
+            self.fem_viscous.step(self.state.U, 0.5 * dt)
+
+        # full-step convective + sources (L_FVM(dt))
+        self.integrator.step(self.state, dt, self._rhs, self._bc)
+
+        if self.fem_viscous is not None:
+            # half-step viscous (L_FEM(dt/2))
+            self.fem_viscous.step(self.state.U, 0.5 * dt)
+
+        self.time += dt
+        self.step_count += 1
+        return dt
+
+    def run(self, n_steps=None, t_final=None, step_callback=None):
         """Execute the time-marching loop."""
         cfg = self.cfg
+        if n_steps is None:
+            n_steps = cfg.n_steps
+        if t_final is None:
+            t_final = cfg.t_final
 
         print(f"Scramjet CFD Solver")
         print(f"  Mach = {cfg.inlet.mach:.1f}, alt = {cfg.inlet.altitude:.0f} m")
         print(f"  Mesh: {self.mesh.nx} x {self.mesh.ny} = {self.mesh.n_cells} cells")
         print(f"  Viscous: {cfg.viscous}, Combustion: {cfg.combustion.enabled}")
-        print(f"  Steps: {cfg.n_steps}, CFL: {cfg.cfl}")
+        if t_final is None:
+            print(f"  Steps: {n_steps}, CFL: {cfg.cfl}")
+        else:
+            print(f"  Steps max: {n_steps}, t_final: {t_final:.4e} s, CFL: {cfg.cfl}")
         print("-" * 60)
 
-        for n in range(cfg.n_steps):
-            dt = self.integrator.compute_dt(self.state, self.mesh)
+        for n in range(n_steps):
+            if t_final is not None and self.time >= t_final:
+                break
 
-            # viscous CFL constraint (explicit diffusive stability)
-            if self.fem_viscous is not None:
-                # for implicit FEM, the viscous step is unconditionally stable
-                # but we limit dt to avoid large temporal splitting error
-                rho, u, v, p, T, Yf = self.state.primitives()
-                mu_max = self.fem_viscous.transport.viscosity(T).max()
-                rho_min = np.maximum(rho.min(), 1e-30)
-                dx_min = min(self.mesh.dx.min(), self.mesh.dy.min())
-                # diffusive CFL: dt_diff = 0.5 * rho * dx^2 / mu
-                dt_diff = 0.5 * rho_min * dx_min**2 / max(mu_max, 1e-30)
-                dt = min(dt, dt_diff)
-
-            dt = max(dt, 1e-15)
-            self.dt_history.append(dt)
-
-            # --- Strang splitting ---
-            if self.fem_viscous is not None:
-                # half-step viscous (L_FEM(dt/2))
-                self.fem_viscous.step(self.state.U, 0.5 * dt)
-
-            # full-step convective + sources (L_FVM(dt))
-            self.integrator.step(self.state, dt, self._rhs, self._bc)
-
-            if self.fem_viscous is not None:
-                # half-step viscous (L_FEM(dt/2))
-                self.fem_viscous.step(self.state.U, 0.5 * dt)
-
-            self.time += dt
-            self.step_count += 1
+            dt = self.advance_one_step(t_final=t_final)
+            if dt <= 0.0:
+                break
 
             # residual monitoring
-            if n % cfg.print_interval == 0:
+            if cfg.print_interval and n % cfg.print_interval == 0:
                 rho, u, v, p, T, Yf = self.state.primitives()
                 M = self.state.mach()
                 res = np.sqrt(np.mean(self._rhs(self.state.U)**2))
@@ -290,6 +365,9 @@ class Solver:
                 print(f"  step {n:5d} | t = {self.time:.4e} s | dt = {dt:.3e} s "
                       f"| M_max = {M.max():.3f} | p_max = {p.max():.1f} Pa "
                       f"| res = {res:.3e}")
+
+            if step_callback is not None:
+                step_callback(self)
 
         print("-" * 60)
         print(f"Done. {self.step_count} steps, t_final = {self.time:.4e} s")
@@ -328,7 +406,7 @@ class Solver:
         return fig
 
     def plot_centerline(self):
-        """Line plots of key variables along the domain centreline (j = ny//2)."""
+        """Line plots of key variables along the domain centerline (j = ny//2)."""
         rho, u, v, p, T, Yf = self.state.primitives()
         M = self.state.mach()
         j_mid = self.mesh.ny // 2
@@ -338,25 +416,25 @@ class Solver:
 
         axes[0, 0].plot(x, M[:, j_mid], "b-")
         axes[0, 0].set_ylabel("Mach")
-        axes[0, 0].set_title("Centreline Mach")
+        axes[0, 0].set_title("Centerline Mach")
 
         axes[0, 1].plot(x, p[:, j_mid], "r-")
         axes[0, 1].set_ylabel("Pressure [Pa]")
-        axes[0, 1].set_title("Centreline Pressure")
+        axes[0, 1].set_title("Centerline Pressure")
 
         axes[1, 0].plot(x, T[:, j_mid], "g-")
         axes[1, 0].set_ylabel("Temperature [K]")
-        axes[1, 0].set_title("Centreline Temperature")
+        axes[1, 0].set_title("Centerline Temperature")
 
         axes[1, 1].plot(x, rho[:, j_mid], "k-")
         axes[1, 1].set_ylabel("Density [kg/m³]")
-        axes[1, 1].set_title("Centreline Density")
+        axes[1, 1].set_title("Centerline Density")
 
         for ax in axes.flat:
             ax.set_xlabel("x [m]")
             ax.grid(True, alpha=0.3)
 
-        plt.suptitle(f"Centreline profiles (t = {self.time:.4e} s)")
+        plt.suptitle(f"Centerline profiles (t = {self.time:.4e} s)")
         plt.tight_layout()
         return fig
 

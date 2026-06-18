@@ -81,20 +81,32 @@ class VariableAreaSource:
 
         # precompute area and gradient at cell centroids
         # A(x_c[i]) and dA/dx(x_c[i]) for each column i
-        self.A_cell = geometry.area(mesh.xc)          # (nx,)
-        self.dAdx_cell = geometry.area_gradient(mesh.xc)  # (nx,)
+        self.A_cell = None
+        self.dAdx_cell = None
+        self.update(0.0)
 
-    def compute(self, U, gamma):
+    def update(self, time):
+        """Refresh area and gradient fields for static or time-dependent geometry."""
+        if hasattr(self.geometry, "set_time"):
+            self.geometry.set_time(time)
+        self.A_cell = self.geometry.area(self.mesh.xc)          # (nx,)
+        self.dAdx_cell = self.geometry.area_gradient(self.mesh.xc)  # (nx,)
+
+    def compute(self, U, gamma, time=None):
         """
         Evaluate the variable-area source term.
 
         Args:
             U:     conservative state, shape (5, nx, ny)
             gamma: ratio of specific heats
+            time:  optional physical time for time-dependent area forcing
 
         Returns:
             S: source term array, shape (5, nx, ny)
         """
+        if time is not None or getattr(self.geometry, "is_time_dependent", False):
+            self.update(0.0 if time is None else time)
+
         S = np.zeros_like(U)
         nx, ny = self.mesh.nx, self.mesh.ny
 
@@ -202,6 +214,34 @@ class SingleStepArrhenius:
         return S
 
 
+class SimpleHeatRelease:
+    """
+    Reduced-fidelity prescribed heat-release source.
+
+    This is a sensitivity-model source, not a combustion model. It adds energy
+    at a prescribed volumetric rate, optionally weighted by the local passive
+    fuel scalar. It does not consume fuel or model ignition chemistry.
+    """
+
+    def __init__(self, heat_rate=0.0, fuel_coupled=True):
+        self.heat_rate = float(heat_rate)
+        self.fuel_coupled = bool(fuel_coupled)
+
+    def compute(self, U):
+        """Return conservative source terms with energy-only heating."""
+        S = np.zeros_like(U)
+        if self.heat_rate == 0.0:
+            return S
+
+        if self.fuel_coupled:
+            rho = np.maximum(U[0], 1e-30)
+            Yf = np.clip(U[4] / rho, 0.0, 1.0)
+            S[3] = self.heat_rate * Yf
+        else:
+            S[3] = self.heat_rate
+        return S
+
+
 class FEMViscous:
     """
     Implicit viscous/thermal/species diffusion operator.
@@ -212,7 +252,7 @@ class FEMViscous:
         d(rho*E)/dt = div(k * grad(T))         (thermal diffusion)
         d(rho*Yf)/dt = div(rho*D * grad(Yf))   (species diffusion)
 
-    Uses cell-centred finite differences with implicit backward Euler and
+    Uses cell-centered finite differences with implicit backward Euler and
     direct sparse solve — functionally equivalent to a Q1 FEM with mass
     lumping on the structured mesh.
 
@@ -262,7 +302,7 @@ class FEMViscous:
         T = np.maximum(T, 50.0)
         Yf = np.clip(U[4] / rho_safe, 0.0, 1.0)
 
-        # transport coefficients at cell centres
+        # transport coefficients at cell centers
         mu = self.transport.viscosity(T)          # (nx, ny)
         k_th = self.transport.thermal_conductivity(T)
         D_sp = self.transport.species_diffusivity(T, rho)

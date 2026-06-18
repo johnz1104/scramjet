@@ -138,7 +138,7 @@ class GeometryProfile:
         2. Combustor (slight divergence): linear from A_throat to A_comb_exit
         3. Nozzle (strong divergence): power-law from A_comb_exit to A_exit
 
-    The area profile is normalised by A_throat so that A(x_throat) = 1.
+    The area profile is normalized by A_throat so that A(x_throat) = 1.
     """
 
     def __init__(self, L_inlet, L_combustor, L_nozzle,
@@ -177,6 +177,18 @@ class GeometryProfile:
         return GeometryProfile(
             L_inlet=0.3, L_combustor=0.5, L_nozzle=0.4,
             A_inlet=0.10, A_throat=0.05, A_comb_exit=0.07, A_exit=0.15,
+        )
+
+    def copy(self):
+        """Return an independent copy of this geometry profile."""
+        return GeometryProfile(
+            L_inlet=self.L_inlet,
+            L_combustor=self.L_combustor,
+            L_nozzle=self.L_nozzle,
+            A_inlet=self.A_inlet,
+            A_throat=self.A_throat,
+            A_comb_exit=self.A_comb_exit,
+            A_exit=self.A_exit,
         )
 
     def area(self, x):
@@ -258,6 +270,425 @@ class GeometryProfile:
 
         plt.tight_layout()
         return fig
+
+
+class LocalizedAreaPerturbation:
+    """
+    Localized effective-area perturbation for wall-position prototypes.
+
+    The perturbation is intentionally static and one-dimensional:
+
+        A(x; q) = A_base(x) + q * phi(x)
+
+    where phi(x) is a Gaussian mode. This models an effective throat-area
+    displacement, not body-fitted wall motion or a deforming mesh.
+    """
+
+    def __init__(self, enabled=True, mode="throat_gaussian", amplitude=0.0,
+                 x_center=None, width=0.05, min_area=1.0e-6):
+        if mode != "throat_gaussian":
+            raise ValueError(f"Unsupported area perturbation mode: {mode}")
+        if width <= 0.0:
+            raise ValueError("Area perturbation width must be positive")
+        if min_area <= 0.0:
+            raise ValueError("min_area must be positive")
+
+        self.enabled = bool(enabled)
+        self.mode = mode
+        self.amplitude = float(amplitude)
+        self.x_center = x_center
+        self.width = float(width)
+        self.min_area = float(min_area)
+
+    @property
+    def active(self):
+        """Whether the perturbation changes the base geometry."""
+        return self.enabled and abs(self.amplitude) > 0.0
+
+    def copy(self):
+        """Return an independent copy of this perturbation."""
+        return LocalizedAreaPerturbation(
+            enabled=self.enabled,
+            mode=self.mode,
+            amplitude=self.amplitude,
+            x_center=self.x_center,
+            width=self.width,
+            min_area=self.min_area,
+        )
+
+    def center(self, base_geometry):
+        """Resolve the perturbation center, defaulting to the throat."""
+        if self.x_center is None:
+            return base_geometry.x_throat
+        return float(self.x_center)
+
+    def shape(self, x, base_geometry):
+        """Gaussian localization function phi(x)."""
+        x = np.asarray(x, dtype=np.float64)
+        xi = (x - self.center(base_geometry)) / self.width
+        return np.exp(-0.5 * xi**2)
+
+    def shape_gradient(self, x, base_geometry):
+        """Analytical derivative dphi/dx for the Gaussian mode."""
+        x = np.asarray(x, dtype=np.float64)
+        phi = self.shape(x, base_geometry)
+        return -((x - self.center(base_geometry)) / self.width**2) * phi
+
+    def to_dict(self):
+        """JSON-serialisable representation."""
+        return {
+            "enabled": self.enabled,
+            "mode": self.mode,
+            "amplitude": self.amplitude,
+            "x_center": self.x_center,
+            "width": self.width,
+            "min_area": self.min_area,
+            "active": self.active,
+        }
+
+
+class PerturbedGeometryProfile:
+    """
+    Geometry wrapper adding one localized effective-area perturbation.
+
+    The wrapper mirrors the `GeometryProfile` interface used by the solver:
+    `area(x)` and `area_gradient(x)`. When disabled or when q = 0, it returns
+    the base geometry exactly.
+    """
+
+    def __init__(self, base_geometry, perturbation):
+        self.base_geometry = base_geometry.copy()
+        self.perturbation = perturbation.copy()
+
+        # Mirror base fields used elsewhere in the project.
+        self.L_inlet = self.base_geometry.L_inlet
+        self.L_combustor = self.base_geometry.L_combustor
+        self.L_nozzle = self.base_geometry.L_nozzle
+        self.L_total = self.base_geometry.L_total
+        self.A_inlet = self.base_geometry.A_inlet
+        self.A_throat = self.base_geometry.A_throat
+        self.A_comb_exit = self.base_geometry.A_comb_exit
+        self.A_exit = self.base_geometry.A_exit
+        self.x_throat = self.base_geometry.x_throat
+        self.x_comb_exit = self.base_geometry.x_comb_exit
+        self.x_exit = self.base_geometry.x_exit
+
+        self._validate_profile()
+
+    def copy(self):
+        """Return an independent copy of this perturbed geometry."""
+        return PerturbedGeometryProfile(self.base_geometry, self.perturbation)
+
+    @property
+    def min_area(self):
+        """Minimum allowable effective area."""
+        return self.perturbation.min_area
+
+    def _perturbed_area_unchecked(self, x):
+        """Return the perturbed area without validation."""
+        A_base = self.base_geometry.area(x)
+        if not self.perturbation.active:
+            return A_base
+        return (A_base
+                + self.perturbation.amplitude
+                * self.perturbation.shape(x, self.base_geometry))
+
+    def _validate_area_values(self, A):
+        """Raise if any sampled area violates the positivity floor."""
+        min_value = float(np.min(A))
+        if min_value <= self.min_area:
+            raise ValueError(
+                f"Perturbed area violates min_area: min(A)={min_value:.6e}, "
+                f"min_area={self.min_area:.6e}"
+            )
+
+    def _validate_profile(self, n_pts=2000):
+        """Best-effort whole-profile positivity check."""
+        if not self.perturbation.active:
+            return
+        x = np.linspace(0.0, self.L_total, n_pts)
+        self._validate_area_values(self._perturbed_area_unchecked(x))
+
+    def area(self, x):
+        """Return A(x; q), preserving the base geometry exactly when inactive."""
+        A = self._perturbed_area_unchecked(x)
+        if self.perturbation.active:
+            self._validate_area_values(A)
+        return A
+
+    def area_gradient(self, x):
+        """Return dA/dx, including q * dphi/dx for active perturbations."""
+        dAdx = self.base_geometry.area_gradient(x)
+        if not self.perturbation.active:
+            return dAdx
+        return (dAdx
+                + self.perturbation.amplitude
+                * self.perturbation.shape_gradient(x, self.base_geometry))
+
+    def min_area_value(self, n_pts=1000):
+        """Sample the current minimum area for validation and reporting."""
+        x = np.linspace(0.0, self.L_total, n_pts)
+        return float(np.min(self.area(x)))
+
+    def throat_area(self):
+        """Return the effective area at the nominal throat location."""
+        return float(self.area(np.array([self.x_throat]))[0])
+
+    def to_dict(self):
+        """JSON-serialisable representation."""
+        return {
+            "type": "PerturbedGeometryProfile",
+            "base": geometry_to_dict(self.base_geometry),
+            "perturbation": self.perturbation.to_dict(),
+            "min_area": self.min_area,
+            "throat_area": self.throat_area(),
+            "min_sampled_area": self.min_area_value(),
+        }
+
+    def plot(self, n_pts=500):
+        """Plot the active area profile and gradient."""
+        x = np.linspace(0.0, self.L_total, n_pts)
+        A = self.area(x)
+
+        fig, axes = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
+        axes[0].plot(x, self.base_geometry.area(x), "k--", lw=1.2, label="base")
+        axes[0].plot(x, A, "b-", lw=2, label="perturbed")
+        axes[0].set_ylabel("A(x) [m²]")
+        axes[0].set_title("Perturbed Effective Area Profile")
+        axes[0].axvline(self.x_throat, color="r", ls="--", lw=0.8, label="throat")
+        axes[0].legend()
+
+        dAdx = self.area_gradient(x)
+        axes[1].plot(x, self.base_geometry.area_gradient(x), "k--", lw=1.2, label="base")
+        axes[1].plot(x, dAdx, "r-", lw=2, label="perturbed")
+        axes[1].set_ylabel("dA/dx [m]")
+        axes[1].set_xlabel("x [m]")
+        axes[1].legend()
+
+        plt.tight_layout()
+        return fig
+
+
+class SinusoidalAreaForcing:
+    """
+    Time-dependent scalar throat-area forcing.
+
+        q(t) = mean + amplitude * sin(2*pi*f*t + phase)
+
+    `mean` is an optional static offset (`q_offset`) used by the
+    parametric DOE workflow. With `mean = 0.0` this reduces to the
+    pure-sinusoidal form `q(t) = amplitude * sin(...)` used by the
+    earlier unsteady prototype.
+
+    `frequency_hz = 0` is allowed and yields the static value
+    `mean + amplitude * sin(phase)`.
+    """
+
+    def __init__(self, amplitude=0.0, frequency_hz=0.0, phase=0.0,
+                 enabled=True, mean=0.0):
+        if frequency_hz < 0.0:
+            raise ValueError("frequency_hz must be non-negative")
+        self.amplitude = float(amplitude)
+        self.frequency_hz = float(frequency_hz)
+        self.phase = float(phase)
+        self.enabled = bool(enabled)
+        self.mean = float(mean)
+
+    def copy(self):
+        """Return an independent copy of this forcing."""
+        return SinusoidalAreaForcing(
+            amplitude=self.amplitude,
+            frequency_hz=self.frequency_hz,
+            phase=self.phase,
+            enabled=self.enabled,
+            mean=self.mean,
+        )
+
+    def value(self, time):
+        """Return q(t) = mean + amplitude * sin(2*pi*f*t + phase)."""
+        if not self.enabled:
+            return 0.0
+        omega = 2.0 * np.pi * self.frequency_hz
+        return self.mean + self.amplitude * np.sin(omega * float(time) + self.phase)
+
+    def to_dict(self):
+        """JSON-serialisable representation."""
+        return {
+            "type": "SinusoidalAreaForcing",
+            "enabled": self.enabled,
+            "amplitude": self.amplitude,
+            "frequency_hz": self.frequency_hz,
+            "phase": self.phase,
+            "mean": self.mean,
+        }
+
+
+class TimeDependentPerturbedGeometryProfile:
+    """
+    Time-dependent effective-area wrapper for reduced-fidelity forcing.
+
+    This reuses `LocalizedAreaPerturbation` for the Gaussian shape and
+    `SinusoidalAreaForcing` for q(t):
+
+        A(x, t) = A_base(x) + q(t) * phi(x)
+
+    It is an effective area-source model, not moving-wall CFD.
+    """
+
+    def __init__(self, base_geometry, perturbation, forcing):
+        self.base_geometry = base_geometry.copy()
+        self.perturbation = perturbation.copy()
+        self.forcing = forcing.copy()
+        self.time = 0.0
+
+        # Mirror base fields used elsewhere in the project.
+        self.L_inlet = self.base_geometry.L_inlet
+        self.L_combustor = self.base_geometry.L_combustor
+        self.L_nozzle = self.base_geometry.L_nozzle
+        self.L_total = self.base_geometry.L_total
+        self.A_inlet = self.base_geometry.A_inlet
+        self.A_throat = self.base_geometry.A_throat
+        self.A_comb_exit = self.base_geometry.A_comb_exit
+        self.A_exit = self.base_geometry.A_exit
+        self.x_throat = self.base_geometry.x_throat
+        self.x_comb_exit = self.base_geometry.x_comb_exit
+        self.x_exit = self.base_geometry.x_exit
+
+        self._validate_profile_over_cycle()
+
+    @property
+    def is_time_dependent(self):
+        """Marker used by the area source to refresh each time step."""
+        return True
+
+    @property
+    def min_area(self):
+        """Minimum allowable effective area."""
+        return self.perturbation.min_area
+
+    def copy(self):
+        """Return an independent copy of this geometry."""
+        new = TimeDependentPerturbedGeometryProfile(
+            self.base_geometry,
+            self.perturbation,
+            self.forcing,
+        )
+        new.time = self.time
+        return new
+
+    def set_time(self, time):
+        """Set the active physical time used by area(x)."""
+        self.time = float(time)
+
+    def current_amplitude(self, time=None):
+        """Return q(t) at a supplied or current time."""
+        t = self.time if time is None else float(time)
+        if not self.perturbation.enabled:
+            return 0.0
+        return self.forcing.value(t)
+
+    def _area_unchecked(self, x, time):
+        """Return A(x, t) without positivity validation."""
+        A_base = self.base_geometry.area(x)
+        q = self.current_amplitude(time)
+        if abs(q) == 0.0:
+            return A_base
+        return A_base + q * self.perturbation.shape(x, self.base_geometry)
+
+    def _validate_area_values(self, A):
+        """Raise if any sampled area violates the positivity floor."""
+        min_value = float(np.min(A))
+        if min_value <= self.min_area:
+            raise ValueError(
+                f"Time-dependent perturbed area violates min_area: "
+                f"min(A)={min_value:.6e}, min_area={self.min_area:.6e}"
+            )
+
+    def _sample_validation_times(self, n_phase=33):
+        """Sample one forcing cycle, or one representative static time."""
+        if self.forcing.frequency_hz == 0.0:
+            return np.array([0.0])
+        period = 1.0 / self.forcing.frequency_hz
+        return np.linspace(0.0, period, n_phase)
+
+    def _validate_profile_over_cycle(self, n_x=1000):
+        """Best-effort positivity check over one forcing cycle."""
+        x = np.linspace(0.0, self.L_total, n_x)
+        for t in self._sample_validation_times():
+            self._validate_area_values(self._area_unchecked(x, t))
+
+    def area_at_time(self, x, time):
+        """Return A(x, t)."""
+        A = self._area_unchecked(x, time)
+        self._validate_area_values(A)
+        return A
+
+    def area_gradient_at_time(self, x, time):
+        """Return dA/dx at a supplied physical time."""
+        dAdx = self.base_geometry.area_gradient(x)
+        q = self.current_amplitude(time)
+        if abs(q) == 0.0:
+            return dAdx
+        return dAdx + q * self.perturbation.shape_gradient(x, self.base_geometry)
+
+    def area(self, x):
+        """Return A(x) at the currently active time."""
+        return self.area_at_time(x, self.time)
+
+    def area_gradient(self, x):
+        """Return dA/dx at the currently active time."""
+        return self.area_gradient_at_time(x, self.time)
+
+    def min_area_value(self, n_pts=1000, time=None):
+        """Sample the minimum area at the supplied or current time."""
+        t = self.time if time is None else float(time)
+        x = np.linspace(0.0, self.L_total, n_pts)
+        return float(np.min(self.area_at_time(x, t)))
+
+    def max_area_value(self, n_pts=1000, time=None):
+        """Sample the maximum area at the supplied or current time."""
+        t = self.time if time is None else float(time)
+        x = np.linspace(0.0, self.L_total, n_pts)
+        return float(np.max(self.area_at_time(x, t)))
+
+    def throat_area(self, time=None):
+        """Return the effective throat area at the supplied or current time."""
+        t = self.time if time is None else float(time)
+        return float(self.area_at_time(np.array([self.x_throat]), t)[0])
+
+    def to_dict(self):
+        """JSON-serialisable representation."""
+        return {
+            "type": "TimeDependentPerturbedGeometryProfile",
+            "base": geometry_to_dict(self.base_geometry),
+            "perturbation": self.perturbation.to_dict(),
+            "forcing": self.forcing.to_dict(),
+            "min_area": self.min_area,
+            "current_time": self.time,
+            "current_amplitude": self.current_amplitude(),
+            "throat_area": self.throat_area(),
+            "min_sampled_area": self.min_area_value(),
+        }
+
+
+def geometry_to_dict(geometry):
+    """JSON-serialisable representation of a geometry object."""
+    if hasattr(geometry, "to_dict"):
+        return geometry.to_dict()
+    return {
+        "type": "GeometryProfile",
+        "L_inlet": geometry.L_inlet,
+        "L_combustor": geometry.L_combustor,
+        "L_nozzle": geometry.L_nozzle,
+        "L_total": geometry.L_total,
+        "A_inlet": geometry.A_inlet,
+        "A_throat": geometry.A_throat,
+        "A_comb_exit": geometry.A_comb_exit,
+        "A_exit": geometry.A_exit,
+        "x_throat": geometry.x_throat,
+        "x_comb_exit": geometry.x_comb_exit,
+        "x_exit": geometry.x_exit,
+    }
 
 
 # Standalone test
