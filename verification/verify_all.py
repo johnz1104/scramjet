@@ -70,7 +70,9 @@ results['scramjet_clean'] = {
     'T_min_K': float(T.min()),
     'thrust_N_per_m': float(qoi['thrust']),
     'Isp_s': float(qoi['Isp']),
-    'pressure_recovery': float(qoi['pressure_recovery']),
+    'pressure_recovery_static_legacy': float(qoi['pressure_recovery']),
+    'tpr': float(qoi['tpr']),
+    'shock_detected': bool(qoi['shock_detected']),
     'mdot_kg_s_per_m': float(qoi['mdot']),
 }
 print(f"  wall={wall_full:.2f}s  thrust={qoi['thrust']:.1f}  Isp={qoi['Isp']:.1f}")
