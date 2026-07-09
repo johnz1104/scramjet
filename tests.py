@@ -5,17 +5,26 @@ Validation cases, each targeting a different solver component:
 
     0. Area perturbation    — validates static throat-area wrapper
     1. Sod shock tube       — validates FVM (HLLC, MUSCL, RK3-SSP)
-    2. Couette flow         — validates FEM viscous diffusion
-    3. Ignition delay       — validates Arrhenius combustion model
+    2. Nozzle area–Mach     — validates the quasi-1D variable-area coupling
+                              against the exact isentropic solution
+                              (+ agreement with the standalone source form)
+    3. Shock position       — validates the back-pressure outlet BC and
+                              shock capture against the exact normal-shock-
+                              in-diverging-duct solution
+    4. Couette flow         — validates the FEMViscous implicit diffusion
+                              operator (the actual class, moving top wall)
+    5. Ignition delay       — validates Arrhenius combustion model
 
 Usage:
     python tests.py              # run all tests
     python tests.py geometry     # area perturbation only
     python tests.py sod          # Sod shock tube only
+    python tests.py nozzle       # isentropic area-Mach only
+    python tests.py shock        # analytic shock position only
     python tests.py couette      # Couette flow only
     python tests.py ignition     # ignition delay only
 
-Dependency: mesh.py, fvm.py, physics.py
+Dependency: mesh.py, fvm.py, physics.py, solver.py, diagnostics.py
 """
 import sys
 import numpy as np
@@ -29,6 +38,7 @@ from mesh import (
     LocalizedAreaPerturbation,
     PerturbedGeometryProfile,
     SinusoidalAreaForcing,
+    TabulatedAreaProfile,
     TimeDependentPerturbedGeometryProfile,
 )
 from fvm import StateVector, BoundaryConditions, FVMResidual, TimeIntegrator
@@ -37,10 +47,24 @@ from physics import (
     FEMViscous,
     SingleStepArrhenius,
     SimpleHeatRelease,
+    VariableAreaSource,
 )
-from solver import SolverConfig, Solver, InletConfig
-from diagnostics import scalar_diagnostics
+from solver import SolverConfig, Solver, InletConfig, CombustionConfig
+from diagnostics import scalar_diagnostics, shock_diagnostics
 from response_metrics import extract_response_metrics, fit_sinusoid
+
+
+# Exact gas-dynamics references live in gasdynamics.py (shared with the
+# forced-shock benchmark and the Busemann generator)
+from gasdynamics import isentropic_area_ratio as _isentropic_area_ratio
+from gasdynamics import mach_from_area_ratio as _mach_from_area_ratio
+from gasdynamics import normal_shock as _normal_shock_full
+
+
+def _normal_shock(M, gamma=1.4):
+    """Return (M_downstream, p0_downstream/p0_upstream)."""
+    ns = _normal_shock_full(M, gamma)
+    return ns["M2"], ns["p0_ratio"]
 
 
 def test_area_perturbation():
@@ -690,6 +714,317 @@ def _sod_exact(x, t, gamma):
     return rho_out, u_out, p_out
 
 
+def test_nozzle_area_mach():
+    """
+    Steady quasi-1D nozzle flow against the exact isentropic area–Mach
+    relation (Mach 6, default three-section duct, ny = 1).
+
+    This is the test that pins the variable-area coupling — the physics
+    the contraction/unstart and wall-motion studies rest on. A supersonic
+    stream must DEcelerate and compress through the converging inlet and
+    REaccelerate through the diverging sections.
+
+    Checks:
+        - centerline M(x) matches the exact isentropic solution
+        - mass conservation: rho*u*A equal at inlet/exit stations
+        - total pressure conserved (smooth flow, no entropy generation)
+        - solution is steady (no reconstruction limit cycle)
+        - the standalone source-vector form (physics.VariableAreaSource)
+          agrees with the primary area-weighted conservative path
+
+    Pass criteria (nx=200):
+        mean |M - M_isentropic| / M < 0.5%, max < 2%
+        |mdot_exit/mdot_inlet - 1| < 1%
+        p0 spread < 1%
+        unsteadiness (300-step rho fluctuation) < 1e-10
+        paths agree on exit Mach within 1%
+    """
+    print("\n" + "=" * 60)
+    print("TEST 2: Quasi-1D Nozzle vs Isentropic Area-Mach")
+    print("=" * 60)
+
+    nx, n_steps = 200, 8000
+    gamma = 1.4
+
+    def build_solver(area_source):
+        cfg = SolverConfig()
+        cfg.inlet = InletConfig(mach=6.0, altitude=25000.0)
+        cfg.mesh.nx = nx
+        cfg.mesh.ny = 1
+        cfg.cfl = 0.35
+        cfg.print_interval = 0
+        cfg.combustion = CombustionConfig(enabled=False)
+        cfg.area_source = area_source
+        return Solver(cfg)
+
+    # --- primary path: area-weighted conservative coupling ---
+    solver = build_solver(area_source=True)
+    for _ in range(n_steps):
+        solver.advance_one_step()
+
+    rho, u, v, p, T, Yf = solver.state.primitives()
+    M = solver.state.mach()[:, 0]
+    x = solver.mesh.xc
+    A = solver.cfg.geometry.area(x)
+
+    A_star = A[0] / _isentropic_area_ratio(M[0], gamma)
+    M_isen = np.array([_mach_from_area_ratio(a / A_star, True, gamma) for a in A])
+
+    interior = slice(2, nx - 2)
+    err = np.abs(M[interior] - M_isen[interior]) / M_isen[interior]
+
+    mdot = rho[:, 0] * u[:, 0] * A
+    i_in = np.argmin(np.abs(x - 0.1))     # smooth stations away from
+    i_ex = np.argmin(np.abs(x - 1.1))     # boundaries and the throat kink
+    mdot_err = abs(mdot[i_ex] / mdot[i_in] - 1.0)
+
+    p0 = p[:, 0] * (1.0 + 0.5 * (gamma - 1.0) * M**2) ** (gamma / (gamma - 1.0))
+    core = slice(5, nx - 5)
+    p0_spread = (p0[core].max() - p0[core].min()) / p0[5]
+
+    hist = []
+    for _ in range(300):
+        solver.advance_one_step()
+        hist.append(solver.state.U[0, :, 0].copy())
+    hist = np.array(hist)
+    unsteadiness = float((hist.std(axis=0) / hist.mean(axis=0)).max())
+
+    # --- reference path: standalone corrected source vector ---
+    solver_src = build_solver(area_source=False)
+    src = VariableAreaSource(solver_src.mesh, solver.cfg.geometry.copy())
+    base_rhs = solver_src._rhs
+
+    def rhs_with_source(U, time=None):
+        return base_rhs(U, time) + src.compute(U, gamma)
+
+    solver_src._rhs = rhs_with_source
+    for _ in range(n_steps):
+        solver_src.advance_one_step()
+    M_src = solver_src.state.mach()[:, 0]
+    path_agreement = abs(M_src[-3] / M[-3] - 1.0)
+
+    i_throat = int(np.argmin(np.abs(x - solver.cfg.geometry.x_throat)))
+    print(f"  M: inlet {M[0]:.3f} -> throat {M[i_throat]:.3f} -> exit {M[-3]:.3f}")
+    print(f"  isentropic:  {M_isen[0]:.3f} -> {M_isen[i_throat]:.3f} -> {M_isen[-3]:.3f}")
+    print(f"  Mach error: mean {err.mean()*100:.3f}%, max {err.max()*100:.3f}%")
+    print(f"  mass conservation |mdot_ex/mdot_in - 1|: {mdot_err*100:.3f}%")
+    print(f"  total-pressure spread: {p0_spread*100:.3f}%")
+    print(f"  unsteadiness: {unsteadiness:.2e}")
+    print(f"  source-vector path exit-Mach agreement: {path_agreement*100:.3f}%")
+
+    checks = {
+        "mean Mach error < 0.5%": err.mean() < 0.005,
+        "max Mach error < 2%": err.max() < 0.02,
+        "mass conserved inlet->exit < 1%": mdot_err < 0.01,
+        "total pressure spread < 1%": p0_spread < 0.01,
+        "steady (no limit cycle) < 1e-10": unsteadiness < 1e-10,
+        "source-vector path agrees < 1%": path_agreement < 0.01,
+    }
+    for name, ok in checks.items():
+        print(f"  {name}: {'PASS' if ok else 'FAIL'}")
+    passed = all(checks.values())
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.2))
+    axes[0].plot(x, M_isen, "k-", lw=2, label="exact isentropic")
+    axes[0].plot(x, M, "b--", lw=1.5, label="solver (conservative)")
+    axes[0].plot(x, M_src, "r:", lw=1.5, label="solver (source form)")
+    axes[0].set_xlabel("x [m]"); axes[0].set_ylabel("Mach")
+    axes[0].set_title("Quasi-1D nozzle, M$_\\infty$=6")
+    axes[0].legend(fontsize=8)
+    axes[1].plot(x, mdot / mdot[i_in], "b-", lw=1.5)
+    axes[1].axhline(1.0, color="k", lw=0.8)
+    axes[1].set_xlabel("x [m]"); axes[1].set_ylabel("$\\dot m(x)/\\dot m_{in}$")
+    axes[1].set_title("Mass conservation")
+    for ax in axes:
+        ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    fig.savefig("test_nozzle.png", dpi=150)
+    print("  Plot saved: test_nozzle.png")
+
+    print(f"  {'PASS' if passed else 'FAIL'}")
+    return passed
+
+
+def test_shock_position():
+    """
+    Steady normal shock in a diverging duct against the exact solution.
+
+    A linear diffuser (A: 0.05 -> 0.10 over 1 m) with a Mach 2 supersonic
+    inlet and an imposed exit back pressure supports a normal shock whose
+    position follows from isentropic + normal-shock relations. The solver
+    is initialized with the shock deliberately misplaced (x = 0.42) and
+    must migrate it to the analytic location (x = 0.50) selected by the
+    imposed back pressure.
+
+    Validates: the back-pressure outlet BC, shock capturing inside the
+    quasi-1D area coupling, and diagnostics.shock_diagnostics (which the
+    shock_x QoI uses).
+
+    Pass criteria (nx=100):
+        |x_shock - 0.5| <= 0.03 m (3 cells)
+        measured p0 ratio across shock within 0.02 of analytic
+        realized exit pressure within 2% of imposed
+    """
+    print("\n" + "=" * 60)
+    print("TEST 3: Analytic Shock Position (back-pressure BC)")
+    print("=" * 60)
+
+    gamma = 1.4
+    R_gas = 287.0
+    A_in, A_ex, L = 0.05, 0.10, 1.0
+    M1, p1, T1 = 2.0, 20000.0, 300.0
+    x_target, x_init = 0.5, 0.42
+    nx, n_steps = 100, 15000
+
+    p01 = p1 * (1.0 + 0.2 * M1**2) ** 3.5
+    T01 = T1 * (1.0 + 0.2 * M1**2)
+    A_star1 = A_in / _isentropic_area_ratio(M1, gamma)
+
+    def shock_solution(x_s):
+        """Exit pressure and post-shock references for a shock at x_s."""
+        A_s = A_in + (A_ex - A_in) * x_s / L
+        M_su = _mach_from_area_ratio(A_s / A_star1, True, gamma)
+        M_sd, r_p0 = _normal_shock(M_su, gamma)
+        p02 = p01 * r_p0
+        A_star2 = A_s / _isentropic_area_ratio(M_sd, gamma)
+        M_e = _mach_from_area_ratio(A_ex / A_star2, False, gamma)
+        p_e = p02 * (1.0 + 0.2 * M_e**2) ** -3.5
+        return p_e, r_p0, A_star2, p02, M_e
+
+    p_e, r_p0_exact, _, _, M_e_exact = shock_solution(x_target)
+    _, _, A_star2_0, p02_0, _ = shock_solution(x_init)
+
+    x_samp = np.linspace(0.0, L, 60)
+    geom = TabulatedAreaProfile(x_samp, A_in + (A_ex - A_in) * x_samp / L,
+                                name="linear_diffuser")
+
+    cfg = SolverConfig()
+    cfg.inlet = InletConfig(mach=M1, T_inf=T1, p_inf=p1)
+    cfg.geometry = geom
+    cfg.mesh.nx = nx
+    cfg.mesh.ny = 1
+    cfg.cfl = 0.35
+    cfg.print_interval = 0
+    cfg.combustion = CombustionConfig(enabled=False)
+    cfg.outlet_type = "back_pressure"
+    cfg.outlet_p_back = p_e
+    solver = Solver(cfg)
+
+    # initialize with the shock misplaced at x_init
+    xc = solver.mesh.xc
+    A = geom.area(xc)
+    rho0 = np.empty(nx); u0 = np.empty(nx); p0_arr = np.empty(nx)
+    for i in range(nx):
+        if xc[i] < x_init:
+            M_i = _mach_from_area_ratio(A[i] / A_star1, True, gamma)
+            p_tot = p01
+        else:
+            M_i = _mach_from_area_ratio(A[i] / A_star2_0, False, gamma)
+            p_tot = p02_0
+        p_i = p_tot * (1.0 + 0.2 * M_i**2) ** -3.5
+        T_i = T01 / (1.0 + 0.2 * M_i**2)
+        rho0[i] = p_i / (R_gas * T_i)
+        u0[i] = M_i * np.sqrt(gamma * R_gas * T_i)
+        p0_arr[i] = p_i
+    ones = np.ones((nx, 1))
+    solver.state.set_primitive(rho0[:, None] * ones, u0[:, None] * ones,
+                               np.zeros((nx, 1)), p0_arr[:, None] * ones)
+
+    for _ in range(n_steps):
+        solver.advance_one_step()
+
+    diag = shock_diagnostics(solver)
+    rho, u, v, p, T, Yf = solver.state.primitives()
+    p_exit = float(np.mean(p[-2, :]))
+    M_exit = float(solver.state.mach()[-2, 0])
+
+    x_err = abs(diag["shock_x"] - x_target)
+    p0_ratio_err = abs(diag["shock_p0_ratio"] - r_p0_exact)
+    p_exit_err = abs(p_exit / p_e - 1.0)
+
+    print(f"  analytic: shock at x={x_target}, p0 ratio {r_p0_exact:.4f}, "
+          f"p_exit {p_e:.0f} Pa, M_exit {M_e_exact:.3f}")
+    print(f"  solver:   shock at x={diag['shock_x']:.4f} (started at {x_init}), "
+          f"p0 ratio {diag['shock_p0_ratio']:.4f}, "
+          f"p_exit {p_exit:.0f} Pa, M_exit {M_exit:.3f}")
+
+    checks = {
+        "shock detected": diag["shock_detected"],
+        "shock position within 3 cells": x_err <= 0.03,
+        "shock p0 ratio within 0.02": p0_ratio_err <= 0.02,
+        "exit pressure within 2%": p_exit_err <= 0.02,
+    }
+    for name, ok in checks.items():
+        print(f"  {name}: {'PASS' if ok else 'FAIL'}")
+    passed = all(checks.values())
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.2))
+    M_line = solver.state.mach()[:, 0]
+    axes[0].plot(xc, M_line, "b-", lw=1.5)
+    axes[0].axvline(x_target, color="k", ls="--", lw=1, label="analytic shock")
+    axes[0].axvline(x_init, color="gray", ls=":", lw=1, label="initial guess")
+    axes[0].set_xlabel("x [m]"); axes[0].set_ylabel("Mach")
+    axes[0].set_title("Normal shock in diverging duct (M$_1$=2)")
+    axes[0].legend(fontsize=8)
+    axes[1].plot(xc, p[:, 0] / p1, "r-", lw=1.5)
+    axes[1].axvline(x_target, color="k", ls="--", lw=1)
+    axes[1].set_xlabel("x [m]"); axes[1].set_ylabel("p / p$_1$")
+    axes[1].set_title("Static pressure")
+    for ax in axes:
+        ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    fig.savefig("test_shock.png", dpi=150)
+    print("  Plot saved: test_shock.png")
+
+    print(f"  {'PASS' if passed else 'FAIL'}")
+    return passed
+
+
+def test_busemann_generator():
+    """
+    Busemann inlet generator self-consistency (Taylor–Maccoll integration).
+
+    Exact checks with no tunable thresholds beyond integration accuracy:
+        - the integration terminates exactly on the freestream Mach conoid
+          (theta1 = pi - mu(M1)) — the entry surface of a Busemann flow is
+          a characteristic of the uniform freestream
+        - mass balance between the entry streamtube and exit tube using
+          isentropic conical compression + terminal-shock relations
+        - the wall contour contracts monotonically
+        - theta-beta-M closure of the terminal shock
+    """
+    print("\n" + "=" * 60)
+    print("TEST 0D: Busemann Generator (Taylor-Maccoll)")
+    print("=" * 60)
+
+    from busemann import generate_busemann_inlet
+
+    checks = {}
+    for M2, d2 in [(2.5, 12.0), (3.0, 15.0), (3.5, 20.0)]:
+        res = generate_busemann_inlet(M2=M2, delta2_deg=d2)
+        c = res["checks"]
+        label = f"M2={M2}, d2={d2}"
+        checks[f"{label}: lands on Mach conoid"] = (
+            c["mach_conoid_residual_deg"] < 1e-6)
+        checks[f"{label}: mass balance closes"] = (
+            c["mass_balance_residual"] < 1e-8)
+        checks[f"{label}: contour monotone"] = (
+            c["contour_monotonic_fraction"] > 0.999)
+        checks[f"{label}: shock closure exact"] = (
+            c["shock_deflection_residual_deg"] < 1e-9)
+        checks[f"{label}: M1 > M2 (compression)"] = res["M1"] > M2
+        print(f"  {label}: M1={res['M1']:.3f}, CR={res['contraction_ratio']:.1f}, "
+              f"p0rec={res['p0_ratio_overall']:.4f}, "
+              f"conoid res={c['mach_conoid_residual_deg']:.1e} deg, "
+              f"mass res={c['mass_balance_residual']:.1e}")
+
+    for name, ok in checks.items():
+        print(f"  {name}: {'PASS' if ok else 'FAIL'}")
+    passed = all(checks.values())
+    print(f"  {'PASS' if passed else 'FAIL'}")
+    return passed
+
+
 def test_couette_flow():
     """
     Steady-state Couette flow between parallel plates.
@@ -702,12 +1037,14 @@ def test_couette_flow():
 
     Exact solution: u(y) = U_wall * y / H  (linear profile)
 
-    This tests the implicit diffusion solver (FEM-style) with Dirichlet wall BCs.
+    This exercises the ACTUAL physics.FEMViscous operator (implicit
+    backward-Euler diffusion with Dirichlet wall velocities) on a real
+    conservative state — not a reimplementation of the same math.
 
     Pass criterion: L2 error in u-profile < 0.05 * U_wall
     """
     print("\n" + "=" * 60)
-    print("TEST 2: Couette Flow (FEM Viscous)")
+    print("TEST 4: Couette Flow (FEMViscous operator)")
     print("=" * 60)
 
     gamma = 1.4
@@ -724,60 +1061,29 @@ def test_couette_flow():
 
     mesh = StructuredMesh2D.uniform(0.0, L, 0.0, H, nx, ny)
     transport = TransportProperties(gamma=gamma, R_gas=R_gas)
+    fem = FEMViscous(mesh, transport, gamma=gamma, R_gas=R_gas,
+                     wall_u_bottom=0.0, wall_u_top=U_wall)
 
     mu = transport.viscosity(np.array([T_ref]))[0]
     nu = mu / rho_ref
     tau = H**2 / nu  # diffusion timescale
 
-    # we solve the pure diffusion problem for u(y) directly
-    # d(u)/dt = nu * d^2(u)/dy^2
-    # with u(0) = 0, u(H) = U_wall
-    # at steady state: u(y) = U_wall * y / H
-
-    # use implicit backward Euler with large dt to reach steady state fast
-    dt = 0.5 * tau  # large fraction of diffusion timescale
-    n_steps = 20     # 20 steps of dt = 0.5*tau => 10 diffusion timescales
+    dt = 0.5 * tau   # implicit solver: large steps to steady state
+    n_steps = 20     # 10 diffusion timescales
 
     print(f"  nu = {nu:.4e} m^2/s, tau = {tau:.4e} s")
     print(f"  dt = {dt:.4e} s, n_steps = {n_steps}")
 
-    # solve on a 1D column (all x-columns are identical)
-    # build tridiagonal system for u(j), j=0..ny-1
-    dy_arr = mesh.dy
-    u_profile = np.zeros(ny)
+    # conservative state at rest
+    state = StateVector(nx, ny, gamma=gamma, R_gas=R_gas)
+    fill = np.full((nx, ny), 1.0)
+    state.set_primitive(rho_ref * fill, 0.0 * fill, 0.0 * fill, p_ref * fill)
 
-    for step in range(n_steps):
-        # backward Euler: (u^{n+1} - u^n) / dt = nu * d^2(u^{n+1})/dy^2
-        # => -nu*dt/dy^2 * u_{j-1} + (1 + 2*nu*dt/dy^2) * u_j - nu*dt/dy^2 * u_{j+1} = u_j^n
+    for _ in range(n_steps):
+        fem.step(state.U, dt)
 
-        diag = np.ones(ny)
-        lower = np.zeros(ny - 1)
-        upper = np.zeros(ny - 1)
-        rhs_vec = u_profile.copy()
-
-        for j in range(ny):
-            d = dy_arr[j]
-            coeff = nu * dt / d**2
-
-            if j > 0:
-                lower[j - 1] = -coeff
-                diag[j] += coeff
-            else:
-                # bottom wall: u=0 (Dirichlet)
-                # ghost: u_{-1} = -u_0 => flux = nu*(u_{-1}-u_0)/(dy/2) = -2*nu*u_0/dy
-                diag[j] += 2.0 * coeff
-                # rhs += 2*coeff * 0.0 (wall value = 0)
-
-            if j < ny - 1:
-                upper[j] = -coeff
-                diag[j] += coeff
-            else:
-                # top wall: u=U_wall (Dirichlet)
-                diag[j] += 2.0 * coeff
-                rhs_vec[j] += 2.0 * coeff * U_wall
-
-        # solve tridiagonal system (Thomas algorithm)
-        u_profile = _solve_tridiag(lower, diag, upper, rhs_vec)
+    rho, u, v, p, T, Yf = state.primitives()
+    u_profile = u[nx // 2, :]
 
     # exact solution at cell centers
     y = mesh.yc
@@ -794,7 +1100,7 @@ def test_couette_flow():
     # save plot
     fig, ax = plt.subplots(figsize=(6, 6))
     ax.plot(u_exact, y * 1000, "k-", lw=2, label="Exact (linear)")
-    ax.plot(u_profile, y * 1000, "ro", ms=5, label="FEM")
+    ax.plot(u_profile, y * 1000, "ro", ms=5, label="FEMViscous")
     ax.set_xlabel("u [m/s]")
     ax.set_ylabel("y [mm]")
     ax.set_title("Couette Flow Validation")
@@ -805,43 +1111,6 @@ def test_couette_flow():
     print(f"  Plot saved: test_couette.png")
 
     return passed
-
-
-def _solve_tridiag(lower, diag, upper, rhs):
-    """
-    Thomas algorithm for tridiagonal system.
-
-    Args:
-        lower: sub-diagonal, length n-1
-        diag:  main diagonal, length n
-        upper: super-diagonal, length n-1
-        rhs:   right-hand side, length n
-
-    Returns:
-        x: solution vector, length n
-    """
-    n = len(diag)
-    c = np.zeros(n)
-    d = np.zeros(n)
-
-    # forward sweep
-    c[0] = upper[0] / diag[0]
-    d[0] = rhs[0] / diag[0]
-    for i in range(1, n):
-        if i < n - 1:
-            w = diag[i] - lower[i - 1] * c[i - 1]
-            c[i] = upper[i] / w
-        else:
-            w = diag[i] - lower[i - 1] * c[i - 1]
-        d[i] = (rhs[i] - lower[i - 1] * d[i - 1]) / w
-
-    # back substitution
-    x = np.zeros(n)
-    x[-1] = d[-1]
-    for i in range(n - 2, -1, -1):
-        x[i] = d[i] - c[i] * x[i + 1]
-
-    return x
 
 
 def test_ignition_delay():
@@ -980,7 +1249,10 @@ if __name__ == "__main__":
         "geometry": test_area_perturbation,
         "reduced": test_reduced_fidelity_extensions,
         "metrics": test_response_metrics,
+        "busemann": test_busemann_generator,
         "sod": test_sod_shock_tube,
+        "nozzle": test_nozzle_area_mach,
+        "shock": test_shock_position,
         "couette": test_couette_flow,
         "ignition": test_ignition_delay,
     }
