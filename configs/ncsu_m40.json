@@ -1,0 +1,21 @@
+{
+  "name": "NC State supersonic tunnel — Config B (streamtraced Busemann inlet) conditions",
+  "description": "Freestream conditions for the Schram & Narayanaswamy streamtraced-inlet unstart experiment (research plan Config B). The q (contraction) axis maps onto this configuration.",
+  "source": "Schram & Narayanaswamy, Experiments in Fluids 67:64, 2026. doi:10.1007/s00348-026-04215-0 and companion AIAA J papers",
+  "status": "PLACEHOLDER freestream: tunnel Mach number is documented (M = 4); static T/p below are ASSUMED from a generic blowdown tunnel (p0 ~ 1.1 MPa, T0 ~ 300 K expanded to M 4) and MUST be replaced with values from the paper PDF before any quantitative use.",
+  "inlet": {
+    "mach": 4.0,
+    "T_inf_K": 71.4,
+    "p_inf_Pa": 7240.0,
+    "gamma": 1.4,
+    "R_gas": 287.0
+  },
+  "reference": {
+    "p0_MPa_assumed": 1.1,
+    "T0_K_assumed": 300.0,
+    "aoa_deg_tested": [-5.0, 0.0, 3.0],
+    "inlet_design_mach_approx": 5.5,
+    "contraction_ratio_approx": 3.0
+  },
+  "geometry_notes": "Use busemann.generate_busemann_inlet() for a parametric Busemann-family contour and its TabulatedAreaProfile; the actual experiment used a streamtraced half-Busemann ('sugar scoop') — request the CAD/contour from the NC State group for exact comparisons."
+}

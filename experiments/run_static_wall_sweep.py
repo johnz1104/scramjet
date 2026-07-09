@@ -39,10 +39,14 @@ def default_q_values():
 
 def make_config(q, nx=40, ny=8, n_steps=120, cfl=0.35,
                 mach=6.0, altitude=25000.0, width=None,
-                x_center=None, min_area=1.0e-4):
+                x_center=None, min_area=1.0e-4, preset=None):
     """Build a cold-flow solver config for one static perturbation value."""
     cfg = SolverConfig()
-    cfg.inlet = InletConfig(mach=mach, altitude=altitude, Yf_inlet=0.0)
+    if preset:
+        from experiments.presets import inlet_from_preset
+        cfg.inlet = inlet_from_preset(preset)
+    else:
+        cfg.inlet = InletConfig(mach=mach, altitude=altitude, Yf_inlet=0.0)
     cfg.mesh.nx = nx
     cfg.mesh.ny = ny
     cfg.n_steps = n_steps
@@ -325,6 +329,9 @@ def main(argv=None):
     parser.add_argument("--width", type=float, default=None)
     parser.add_argument("--x-center", type=float, default=None)
     parser.add_argument("--min-area", type=float, default=1.0e-4)
+    parser.add_argument("--preset", default=None,
+                        help="Experiment-condition preset (e.g. configs/tusq_m585.json); "
+                             "overrides --mach/--altitude.")
     args = parser.parse_args(argv)
 
     output_root, _ = run_sweep(
@@ -339,6 +346,7 @@ def main(argv=None):
         width=args.width,
         x_center=args.x_center,
         min_area=args.min_area,
+        preset=args.preset,
     )
     print(f"Static wall sweep written to: {output_root}")
 

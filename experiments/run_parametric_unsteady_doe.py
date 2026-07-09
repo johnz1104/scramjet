@@ -152,7 +152,7 @@ def select_t_final(frequency_hz, cycles, t_final_static):
 def run_one_case(case_dir, design_row, baseline_state_U, baseline_summary,
                  nx, ny, cfl, mach, altitude, width, x_center, min_area,
                  cycles, t_final_static, unsteady_steps, sample_interval_steps,
-                 discard_fraction):
+                 discard_fraction, preset=None):
     """Run a single DOE case. Returns a summary row (status PASS/FAIL)."""
     plots_dir = case_dir / "plots"
     case_dir.mkdir(parents=True, exist_ok=True)
@@ -173,7 +173,7 @@ def run_one_case(case_dir, design_row, baseline_state_U, baseline_summary,
 
         cfg = make_cold_flow_config(
             nx=nx, ny=ny, n_steps=unsteady_steps, cfl=cfl,
-            mach=mach, altitude=altitude,
+            mach=mach, altitude=altitude, preset=preset,
         )
         cfg.t_final = t_final
         cfg.geometry = build_time_dependent_geometry(
@@ -368,10 +368,10 @@ def plot_frequency_response(summary_rows, path):
     return True
 
 
-def warm_start_baseline(nx, ny, baseline_steps, cfl, mach, altitude):
+def warm_start_baseline(nx, ny, baseline_steps, cfl, mach, altitude, preset=None):
     """Run a short cold-flow baseline; supply its state as warm start."""
     cfg = make_cold_flow_config(nx=nx, ny=ny, n_steps=baseline_steps, cfl=cfl,
-                                mach=mach, altitude=altitude)
+                                mach=mach, altitude=altitude, preset=preset)
     solver = Solver(cfg)
     solver.run()
     return solver
@@ -382,7 +382,7 @@ def run_doe(output_root=None, q_offsets=None, epsilons=None,
             unsteady_steps=300, baseline_steps=80, cfl=0.35,
             mach=6.0, altitude=25000.0, width=None, x_center=None,
             min_area=1.0e-4, cycles=1.5, t_final_static=2.0e-4,
-            sample_interval_steps=2, discard_fraction=0.25):
+            sample_interval_steps=2, discard_fraction=0.25, preset=None):
     """Run the DOE and aggregate outputs."""
     q_offsets = list(default_q_offsets() if q_offsets is None else q_offsets)
     epsilons = list(default_epsilons() if epsilons is None else epsilons)
@@ -429,7 +429,7 @@ def run_doe(output_root=None, q_offsets=None, epsilons=None,
 
     baseline_solver = warm_start_baseline(
         nx=nx, ny=ny, baseline_steps=baseline_steps, cfl=cfl,
-        mach=mach, altitude=altitude,
+        mach=mach, altitude=altitude, preset=preset,
     )
     baseline_summary = {
         "steps": int(baseline_solver.step_count),
@@ -455,6 +455,7 @@ def run_doe(output_root=None, q_offsets=None, epsilons=None,
             unsteady_steps=unsteady_steps,
             sample_interval_steps=sample_interval_steps,
             discard_fraction=discard_fraction,
+            preset=preset,
         )
         summary_rows.append(row)
         if row["status"] != "ok":
@@ -520,6 +521,9 @@ def main(argv=None):
     parser.add_argument("--sample-interval-steps", type=int, default=2)
     parser.add_argument("--discard-fraction", type=float, default=0.25,
                         help="Fraction of early samples treated as transient.")
+    parser.add_argument("--preset", default=None,
+                        help="Experiment-condition preset (e.g. configs/tusq_m585.json); "
+                             "overrides --mach/--altitude.")
     args = parser.parse_args(argv)
 
     run_doe(
@@ -536,6 +540,7 @@ def main(argv=None):
         cycles=args.cycles, t_final_static=args.t_final_static,
         sample_interval_steps=args.sample_interval_steps,
         discard_fraction=args.discard_fraction,
+        preset=args.preset,
     )
 
 
