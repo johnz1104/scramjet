@@ -20,8 +20,17 @@ from typing import Iterable, List, Optional
 import numpy as np
 
 
-DEFAULT_QOI_KEYS = ("exit_mach", "max_mach", "pressure_recovery", "mdot", "thrust")
+DEFAULT_QOI_KEYS = ("exit_mach", "max_mach", "pressure_recovery", "tpr",
+                    "shock_x", "mdot", "thrust")
 DEFAULT_PROBE_FIELDS = ("pressure",)
+
+
+def wrap_phase(angle_rad: float) -> float:
+    """Wrap an angle to (-pi, pi]."""
+    wrapped = (float(angle_rad) + math.pi) % (2.0 * math.pi) - math.pi
+    if wrapped == -math.pi:
+        return math.pi
+    return wrapped
 
 
 def _rows_to_array(rows: Iterable[dict], key: str) -> np.ndarray:
@@ -65,7 +74,8 @@ def _is_flat(values: np.ndarray, rel_tol: float = 1.0e-9) -> bool:
 
 def _phase_lag_is_supported(forcing_amplitude: float, n_cycles: float,
                             n_samples: int, min_cycles: float, min_samples: int,
-                            forcing_flat: bool, response_flat: bool):
+                            forcing_flat: bool, response_flat: bool,
+                            min_samples_per_cycle: float = 4.0):
     """Return (supported, reason)."""
     if forcing_flat or forcing_amplitude <= 1.0e-12:
         return False, "epsilon=0 or numerically flat forcing"
@@ -75,6 +85,10 @@ def _phase_lag_is_supported(forcing_amplitude: float, n_cycles: float,
         return False, f"insufficient cycles: {n_cycles:.2f} < {min_cycles}"
     if n_samples < min_samples:
         return False, f"insufficient samples: {n_samples} < {min_samples}"
+    if n_cycles > 0.0 and n_samples / n_cycles < min_samples_per_cycle:
+        return False, (f"insufficient sampling density: "
+                       f"{n_samples / n_cycles:.1f} samples/cycle < "
+                       f"{min_samples_per_cycle} (aliasing risk)")
     return True, ""
 
 
@@ -85,7 +99,7 @@ def _phase_lag_metric(t: np.ndarray, y: np.ndarray, omega: float,
     """Estimate phase lag of y(t) relative to q(t).
 
     Returns (amplitude, mean, phase_lag_rad, warning_or_empty).
-    Phase lag is None when not supported.
+    Phase lag is wrapped to (-pi, pi] and None when not supported.
     """
     basis = np.column_stack([np.sin(omega * t), np.cos(omega * t), np.ones_like(t)])
     coeff = _safe_lstsq(basis, y)
@@ -100,7 +114,8 @@ def _phase_lag_metric(t: np.ndarray, y: np.ndarray, omega: float,
     )
     if not supported:
         return amplitude, mean, None, reason
-    return amplitude, mean, float(phase - forcing_phase), ""
+    # wrap so surrogates trained on phase lag never see spurious 2*pi jumps
+    return amplitude, mean, wrap_phase(phase - forcing_phase), ""
 
 
 def _probe_pressure_field_names(probe_rows: List[dict]) -> List[str]:

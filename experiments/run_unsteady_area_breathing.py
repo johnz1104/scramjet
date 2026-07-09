@@ -45,10 +45,14 @@ from experiments.run_static_wall_sweep import (
 
 
 def make_cold_flow_config(nx=30, ny=6, n_steps=120, cfl=0.35,
-                          mach=6.0, altitude=25000.0):
+                          mach=6.0, altitude=25000.0, preset=None):
     """Build a cold-flow config with combustion disabled."""
     cfg = SolverConfig()
-    cfg.inlet = InletConfig(mach=mach, altitude=altitude, Yf_inlet=0.0)
+    if preset:
+        from experiments.presets import inlet_from_preset
+        cfg.inlet = inlet_from_preset(preset)
+    else:
+        cfg.inlet = InletConfig(mach=mach, altitude=altitude, Yf_inlet=0.0)
     cfg.mesh.nx = nx
     cfg.mesh.ny = ny
     cfg.n_steps = n_steps
@@ -110,6 +114,8 @@ def qoi_row(solver):
         "exit_mach": float(qoi["exit_mach"]),
         "max_mach": float(np.max(M)),
         "pressure_recovery": float(qoi["pressure_recovery"]),
+        "tpr": float(qoi["tpr"]),
+        "shock_x": float(qoi["shock_x"]),
         "mdot": float(qoi["mdot"]),
         "thrust": float(qoi["thrust"]),
         "pressure_min": float(np.min(p)),

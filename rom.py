@@ -476,10 +476,13 @@ class ROMEvaluator:
 def _clone_config(cfg):
     """Deep-copy a SolverConfig by rebuilding it."""
     new = SolverConfig()
+    explicit = getattr(cfg.inlet, "explicit_conditions", False)
     new.inlet = InletConfig(
         mach=cfg.inlet.mach, altitude=cfg.inlet.altitude,
         gamma=cfg.inlet.gamma, R_gas=cfg.inlet.R_gas,
         Yf_inlet=cfg.inlet.Yf_inlet,
+        T_inf=cfg.inlet.T_inf if explicit else None,
+        p_inf=cfg.inlet.p_inf if explicit else None,
     )
     new.mesh = MeshConfig(
         nx=cfg.mesh.nx, ny=cfg.mesh.ny, y_stretch=cfg.mesh.y_stretch,
@@ -575,13 +578,17 @@ def _apply_params(cfg, params):
     else:
         cfg.geometry = base_geometry
 
-    # inlet parameters
+    # inlet parameters. Explicit tunnel conditions (presets) survive a Mach
+    # sweep; asking for an 'altitude' switches back to the atmosphere model.
+    explicit = getattr(cfg.inlet, "explicit_conditions", False) and 'altitude' not in params
     if 'mach' in params:
         cfg.inlet = InletConfig(
             mach=params['mach'],
             altitude=params.get('altitude', cfg.inlet.altitude),
             gamma=cfg.inlet.gamma, R_gas=cfg.inlet.R_gas,
             Yf_inlet=cfg.inlet.Yf_inlet,
+            T_inf=cfg.inlet.T_inf if explicit else None,
+            p_inf=cfg.inlet.p_inf if explicit else None,
         )
     elif 'altitude' in params:
         cfg.inlet = InletConfig(
@@ -594,14 +601,18 @@ def _apply_params(cfg, params):
 
 def _compute_qoi(solver):
     """
-    Extract performance quantities of interest from a converged solver.
+    Extract quantities of interest from a converged solver.
 
-    Thrust = (mdot_exit * u_exit - mdot_inlet * u_inlet) + (p_exit - p_inf) * A_exit
-    Isp = thrust / (mdot_fuel * g0)
+    Research QoIs (experiment-matched, see research plan §3.1):
+        tpr         — mass-flux-weighted total-pressure recovery p0_exit/p0_inf
+        shock_x     — dominant shock location on the centerline [m] (NaN if none)
 
-    For inviscid flow without combustion, Isp is based on the ram-drag
-    thrust and a notional fuel flow rate.
+    Extended/legacy QoIs (kept for continuity; thrust/Isp are out of the
+    paper scope and pressure_recovery is the legacy *static* ratio):
+        thrust, Isp, exit_mach, pressure_recovery, mdot
     """
+    from diagnostics import total_pressure_recovery, shock_diagnostics
+
     rho, u, v, p, T, Yf = solver.state.primitives()
     cfg = solver.cfg
     g0 = 9.80665
@@ -639,14 +650,21 @@ def _compute_qoi(solver):
     c_ex = np.sqrt(cfg.inlet.gamma * max(p_ex, 1e-30) / max(rho_ex, 1e-30))
     M_ex = np.sqrt(u_ex**2 + np.mean(v[-1, :])**2) / max(c_ex, 1e-30)
 
-    # pressure recovery
+    # legacy static pressure ratio (NOT total-pressure recovery)
     p_recovery = np.mean(p[-1, :]) / max(cfg.inlet.p_inf, 1e-30)
+
+    # experiment-matched QoIs
+    tpr = total_pressure_recovery(solver)
+    shock = shock_diagnostics(solver)
 
     return {
         'thrust': thrust,
         'Isp': Isp,
         'exit_mach': M_ex,
         'pressure_recovery': p_recovery,
+        'tpr': tpr,
+        'shock_x': shock['shock_x'],
+        'shock_detected': shock['shock_detected'],
         'mdot': mdot_in,
     }
 

@@ -10,6 +10,98 @@ import numpy as np
 from physics import TransportProperties
 
 
+def total_pressure_recovery(solver):
+    """
+    Total-pressure recovery: mass-flux-weighted exit p0 over freestream p0.
+
+    This is the experiment-matched TPR (isolator/exit stagnation pressure
+    ratio), distinct from the legacy static ratio p_exit/p_inf. The exit
+    station is the last physical column (nx-2); column nx-1 is the outlet
+    boundary-condition image.
+    """
+    rho, u, v, p, T, Yf = solver.state.primitives()
+    M = solver.state.mach()
+    gamma = solver.cfg.inlet.gamma
+
+    i_exit = -2 if solver.mesh.nx > 2 else -1
+    factor = 1.0 + 0.5 * (gamma - 1.0) * M[i_exit, :]**2
+    p0_exit = p[i_exit, :] * factor ** (gamma / (gamma - 1.0))
+
+    w = np.maximum(rho[i_exit, :] * u[i_exit, :], 0.0)  # mass-flux weights
+    if np.sum(w) <= 0.0:
+        p0_exit_avg = float(np.mean(p0_exit))
+    else:
+        p0_exit_avg = float(np.sum(p0_exit * w) / np.sum(w))
+
+    inlet = solver.cfg.inlet
+    f_inf = 1.0 + 0.5 * (gamma - 1.0) * inlet.mach**2
+    p0_inf = inlet.p_inf * f_inf ** (gamma / (gamma - 1.0))
+    return p0_exit_avg / max(p0_inf, 1e-30)
+
+
+def shock_diagnostics(solver, p0_loss_threshold=0.03):
+    """
+    Locate the dominant shock (if any) on the duct centerline.
+
+    Discriminator: local total-pressure destruction. A captured shock
+    drops p0 across a few cells; smooth isentropic compression (e.g. the
+    converging inlet) raises static pressure but conserves p0, so a
+    static-pressure-rise detector would false-positive there. A shock is
+    reported when the strongest 4-cell p0 drop exceeds
+    ``p0_loss_threshold`` (fractional). The location is refined by the
+    supersonic->subsonic crossing when one sits nearby (the
+    normal-shock-in-duct signature used by the back-pressure studies).
+
+    Returns:
+        dict(shock_detected, shock_x, shock_index, shock_p0_ratio)
+        shock_x is NaN when no shock is detected.
+    """
+    rho, u, v, p, T, Yf = solver.state.primitives()
+    M = solver.state.mach()
+    gamma = solver.cfg.inlet.gamma
+    j_mid = solver.mesh.ny // 2
+    x = solver.mesh.xc
+    nx = solver.mesh.nx
+
+    M_line = M[:, j_mid]
+    p0_line = (p[:, j_mid]
+               * (1.0 + 0.5 * (gamma - 1.0) * M_line**2) ** (gamma / (gamma - 1.0)))
+
+    # exclude BC image cells at both ends
+    lo, hi = 1, nx - 1
+    if hi - lo < 6:
+        return {"shock_detected": False, "shock_x": float("nan"),
+                "shock_index": -1, "shock_p0_ratio": 1.0}
+
+    dp0 = np.diff(p0_line[lo:hi])
+    i_rel = int(np.argmin(dp0))          # strongest single-face p0 drop
+    i_star = lo + i_rel                  # drop from cell i_star to i_star+1
+
+    i0 = max(i_star - 1, lo)
+    i1 = min(i_star + 3, hi - 1)
+    p0_ratio = float(p0_line[i1] / max(p0_line[i0], 1e-30))
+
+    detected = p0_ratio < 1.0 - p0_loss_threshold
+    x_shock = float("nan")
+    if detected:
+        x_shock = float(0.5 * (x[i_star] + x[i_star + 1]))
+        # refine with the sonic crossing when one exists near the drop
+        crossings = np.where((M_line[lo:hi - 1] > 1.0)
+                             & (M_line[lo + 1:hi] <= 1.0))[0]
+        if len(crossings) > 0:
+            ic = lo + int(crossings[0])
+            if abs(ic - i_star) <= 4:
+                x_shock = float(0.5 * (x[ic] + x[ic + 1]))
+                i_star = ic
+
+    return {
+        "shock_detected": bool(detected),
+        "shock_x": x_shock,
+        "shock_index": int(i_star) if detected else -1,
+        "shock_p0_ratio": p0_ratio,
+    }
+
+
 def scalar_diagnostics(solver):
     """Return passive fuel-scalar boundedness and inventory diagnostics."""
     rho, u, v, p, T, Yf = solver.state.primitives()
