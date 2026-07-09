@@ -91,16 +91,24 @@ def wall_contour_rows(geometry, n_points=300):
 def qoi_definitions():
     """Shared QoI metadata for low/high-fidelity comparisons."""
     return {
+        "tpr": ("total-pressure recovery: mass-flux-weighted exit stagnation "
+                "pressure divided by freestream stagnation pressure "
+                "(primary experiment-matched QoI)"),
+        "shock_x": ("dominant centerline shock location [m] from strongest "
+                    "pressure rise / sonic crossing; NaN when no shock "
+                    "(primary experiment-matched QoI)"),
         "exit_mach": "area-averaged exit Mach proxy from final x-column",
         "max_mach": "maximum cell Mach number",
-        "pressure_recovery": "exit static pressure divided by freestream pressure",
+        "pressure_recovery": ("LEGACY static ratio p_exit/p_inf — not total-"
+                              "pressure recovery; prefer tpr"),
         "mdot": "inlet mass-flow proxy per unit depth",
-        "thrust": "momentum plus pressure thrust proxy per unit depth",
+        "thrust": "momentum plus pressure thrust proxy per unit depth (out of paper scope)",
         "pressure_min": "minimum static pressure in domain",
         "pressure_max": "maximum static pressure in domain",
         "notes": [
             "All QoI are low-fidelity Python proxies. High-fidelity equivalents",
-            "should be defined by the OpenFOAM/FUN3D post-processing workflow.",
+            "should be defined by the OpenFOAM/FUN3D post-processing workflow",
+            "using these same definitions (especially tpr and shock_x).",
         ],
     }
 
@@ -233,8 +241,9 @@ def fun3d_metadata(case_name, config, selection_overlay=None):
     }
 
 
-def export_case(case_dir, output_dir, n_points=300, selection_overlay=None):
-    """Export one static sweep case."""
+def export_case(case_dir, output_dir, n_points=300, selection_overlay=None,
+                emit_gmsh=True, nx_cells=200, ny_cells=60):
+    """Export one static sweep case (+ optional Gmsh/OpenFOAM emission)."""
     case_dir = Path(case_dir)
     output_dir = Path(output_dir)
     config_data = load_json(case_dir / "config.json")
@@ -277,6 +286,24 @@ def export_case(case_dir, output_dir, n_points=300, selection_overlay=None):
     write_json(output_dir / "freestream_conditions.json",
                freestream_inflow_notes(config["inlet"]))
 
+    gmsh_report = {}
+    if emit_gmsh:
+        from experiments.gmsh_openfoam_export import emit_gmsh_openfoam
+        geo_path, foam_case = emit_gmsh_openfoam(
+            output_dir, contour_rows, config["inlet"],
+            nx_cells=nx_cells, ny_cells=ny_cells)
+        gmsh_report = {
+            "gmsh_geo": str(geo_path.relative_to(output_dir)),
+            "openfoam_case": str(foam_case.relative_to(output_dir)),
+            "notes": [
+                "Structured transfinite quad mesh, one-cell z-extrusion,",
+                "named Physical groups; build with 'gmsh -3 -format msh2'.",
+                "openfoam_case/ is a rhoCentralFoam TEMPLATE (inviscid, slip",
+                "walls, laminar) — review against your pinned version and",
+                "run openfoam_case/Allrun.sh inside its environment.",
+            ],
+        }
+
     report = {
         "case_name": case_name,
         "positive_area": positive_area,
@@ -284,15 +311,14 @@ def export_case(case_dir, output_dir, n_points=300, selection_overlay=None):
         "max_area": float(np.max(area_values)),
         "q_zero_matches_baseline": baseline_match,
         "complete_high_fidelity_case": False,
-        "scaffold_only": True,
-        "produces_runnable_openfoam_case": False,
+        "scaffold_only": not emit_gmsh,
+        "produces_runnable_openfoam_case": emit_gmsh,
         "produces_runnable_fun3d_case": False,
-        "missing_for_runnable_case": [
-            "body-fitted mesh",
-            "boundary patch/tag assignment",
-            "solver dictionaries or FUN3D namelists",
-            "wall y+ target and mesh convergence settings",
-            "turbulence model selection and inflow turbulence quantities",
+        "gmsh_openfoam": gmsh_report,
+        "remaining_manual_steps": [
+            "review solver dictionaries against the pinned OpenFOAM version",
+            "grid-convergence study (3 mesh levels) before quoting results",
+            "wall y+ target + no-slip walls + turbulence model for viscous runs",
             "fuel/oxidizer chemistry definition for reacting cases",
             "dynamic-mesh / ALE setup if oscillating-wall studies are required",
         ],
@@ -420,6 +446,7 @@ def select_cases_from_selection_json(selection_path, sweep_root):
 
 
 def export_sweep(sweep_root, output_root=None, case_names=None, n_points=300,
+                 emit_gmsh=True, nx_cells=200, ny_cells=60,
                   selected_cases=None):
     """Export selected cases from a completed static sweep.
 
@@ -455,22 +482,26 @@ def export_sweep(sweep_root, output_root=None, case_names=None, n_points=300,
             output_root / case_dir.name,
             n_points=n_points,
             selection_overlay=overlay,
+            emit_gmsh=emit_gmsh,
+            nx_cells=nx_cells,
+            ny_cells=ny_cells,
         ))
 
     write_json(output_root / "export_summary.json", {
         "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "source_sweep": str(sweep_root),
         "selected_cases_source": str(selected_cases) if selected_cases else None,
-        "status": "scaffold only",
-        "produces_runnable_openfoam_case": False,
+        "status": "scaffold + gmsh/openfoam templates" if emit_gmsh else "scaffold only",
+        "produces_runnable_openfoam_case": emit_gmsh,
         "produces_runnable_fun3d_case": False,
         "n_cases": len(reports),
         "cases": reports,
         "selection_metadata": selection_metadata,
         "limitations": [
-            "Python prototype produces effective-area scaffolds only.",
-            "No body-fitted mesh, no moving wall, no RANS/LES, no reacting flow.",
-            "Use with a real high-fidelity workflow to produce runnable cases.",
+            "Emitted OpenFOAM cases are inviscid slip-wall screening templates:",
+            "no moving wall, no RANS/LES, no reacting flow — review dictionaries",
+            "against the pinned OpenFOAM version and add viscous/turbulence setup",
+            "for the Phase 2 studies.",
         ],
     })
     return output_root, reports
@@ -485,6 +516,12 @@ def main(argv=None):
                         help=("Path to selected_cases.json from rank_candidate_cases.py; "
                               "filters the export to ranked candidates."))
     parser.add_argument("--n-points", type=int, default=300)
+    parser.add_argument("--no-gmsh", action="store_true",
+                        help="Skip the Gmsh .geo + OpenFOAM case emission.")
+    parser.add_argument("--nx-cells", type=int, default=200,
+                        help="Structured mesh streamwise cell count.")
+    parser.add_argument("--ny-cells", type=int, default=60,
+                        help="Structured mesh wall-normal cell count.")
     args = parser.parse_args(argv)
 
     output_root, reports = export_sweep(
@@ -493,6 +530,9 @@ def main(argv=None):
         case_names=args.case_names,
         n_points=args.n_points,
         selected_cases=args.selected_cases,
+        emit_gmsh=not args.no_gmsh,
+        nx_cells=args.nx_cells,
+        ny_cells=args.ny_cells,
     )
     print(f"Export scaffold written to: {output_root}")
     print(json.dumps({"n_cases": len(reports)}, indent=2))

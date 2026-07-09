@@ -154,7 +154,10 @@ class GPSurrogate:
         Args:
             X: training inputs, (n, ndim) — normalized to [0,1]
             y: training outputs, (n,)
-            n_restarts: number of random restarts for optimization
+            n_restarts: number of random restarts for optimization.
+                        n_restarts=0 keeps the current hyperparameters and
+                        only refits the Cholesky/alpha caches — used for
+                        cheap cross-validation refits on data subsets.
         """
         self.X_train = np.asarray(X, dtype=np.float64)
         self.y_mean = np.mean(y)
@@ -162,6 +165,15 @@ class GPSurrogate:
         self.y_train = (np.asarray(y) - self.y_mean) / self.y_std
 
         n = len(y)
+
+        if n_restarts == 0:
+            K = self._kernel_matrix(self.X_train, self.X_train,
+                                    self.log_sigma_f, self.log_lengthscales)
+            K += np.exp(2.0 * self.log_sigma_n) * np.eye(n) + 1e-8 * np.eye(n)
+            self._L = np.linalg.cholesky(K)
+            self._alpha = np.linalg.solve(
+                self._L.T, np.linalg.solve(self._L, self.y_train))
+            return
 
         def neg_log_marginal(theta):
             log_sf = theta[0]
