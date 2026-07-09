@@ -511,6 +511,13 @@ class SinusoidalAreaForcing:
         omega = 2.0 * np.pi * self.frequency_hz
         return self.mean + self.amplitude * np.sin(omega * float(time) + self.phase)
 
+    def rate(self, time):
+        """Return dq/dt = amplitude * omega * cos(2*pi*f*t + phase)."""
+        if not self.enabled or self.frequency_hz == 0.0:
+            return 0.0
+        omega = 2.0 * np.pi * self.frequency_hz
+        return self.amplitude * omega * np.cos(omega * float(time) + self.phase)
+
     def to_dict(self):
         """JSON-serialisable representation."""
         return {
@@ -631,6 +638,20 @@ class TimeDependentPerturbedGeometryProfile:
             return dAdx
         return dAdx + q * self.perturbation.shape_gradient(x, self.base_geometry)
 
+    def area_time_derivative_at_time(self, x, time):
+        """Return dA/dt(x, t) = (dq/dt) * phi(x) for the breathing mode."""
+        x = np.asarray(x, dtype=np.float64)
+        if not self.perturbation.enabled:
+            return np.zeros_like(x)
+        dqdt = self.forcing.rate(time)
+        if dqdt == 0.0:
+            return np.zeros_like(x)
+        return dqdt * self.perturbation.shape(x, self.base_geometry)
+
+    def area_time_derivative(self, x):
+        """Return dA/dt at the currently active time (wall-velocity term)."""
+        return self.area_time_derivative_at_time(x, self.time)
+
     def area(self, x):
         """Return A(x) at the currently active time."""
         return self.area_at_time(x, self.time)
@@ -669,6 +690,126 @@ class TimeDependentPerturbedGeometryProfile:
             "throat_area": self.throat_area(),
             "min_sampled_area": self.min_area_value(),
         }
+
+
+class TabulatedAreaProfile:
+    """
+    Area law defined by sampled (x, A) pairs with monotone PCHIP interpolation.
+
+    Mirrors the `GeometryProfile` interface used by the solver (`area`,
+    `area_gradient`, `copy`, section attributes), so calibrated experiment
+    geometries (Config A ramp/isolator, Busemann ducts) can drive the same
+    quasi-1D machinery as the parametric three-section duct.
+
+    Section attributes are derived: x_throat is the area minimum; the
+    "combustor" is collapsed to zero length (x_comb_exit = x_throat) since
+    tabulated experiment ducts have no meaningful three-section split.
+    """
+
+    def __init__(self, x_samples, A_samples, name="tabulated"):
+        from scipy.interpolate import PchipInterpolator
+
+        x = np.asarray(x_samples, dtype=np.float64)
+        A = np.asarray(A_samples, dtype=np.float64)
+        if x.ndim != 1 or x.shape != A.shape or len(x) < 4:
+            raise ValueError("need matching 1-D x/A samples (>= 4 points)")
+        if np.any(np.diff(x) <= 0.0):
+            raise ValueError("x samples must be strictly increasing")
+        if np.any(A <= 0.0):
+            raise ValueError("all sampled areas must be positive")
+        if abs(float(x[0])) > 1e-12:
+            raise ValueError("x samples must start at 0")
+
+        self.name = str(name)
+        self.x_samples = x.copy()
+        self.A_samples = A.copy()
+        self._interp = PchipInterpolator(x, A, extrapolate=True)
+        self._interp_deriv = self._interp.derivative()
+
+        # GeometryProfile-compatible attributes
+        self.L_total = float(x[-1])
+        i_min = int(np.argmin(A))
+        self.x_throat = float(x[i_min])
+        self.A_inlet = float(A[0])
+        self.A_throat = float(A[i_min])
+        self.A_exit = float(A[-1])
+        self.A_comb_exit = self.A_throat
+        self.x_comb_exit = self.x_throat
+        self.x_exit = self.L_total
+        self.L_inlet = self.x_throat
+        self.L_combustor = 0.0
+        self.L_nozzle = self.L_total - self.x_throat
+
+    def copy(self):
+        """Return an independent copy of this profile."""
+        return TabulatedAreaProfile(self.x_samples, self.A_samples, name=self.name)
+
+    def area(self, x):
+        """Interpolated A(x); clamped to the sampled range at the ends."""
+        x = np.clip(np.asarray(x, dtype=np.float64), 0.0, self.L_total)
+        return self._interp(x)
+
+    def area_gradient(self, x):
+        """Interpolated dA/dx from the PCHIP derivative."""
+        x = np.clip(np.asarray(x, dtype=np.float64), 0.0, self.L_total)
+        return self._interp_deriv(x)
+
+    def to_dict(self):
+        """JSON-serialisable representation (samples included)."""
+        return {
+            "type": "TabulatedAreaProfile",
+            "name": self.name,
+            "L_total": self.L_total,
+            "x_throat": self.x_throat,
+            "A_inlet": self.A_inlet,
+            "A_throat": self.A_throat,
+            "A_exit": self.A_exit,
+            "n_samples": int(len(self.x_samples)),
+            "x_samples": [float(v) for v in self.x_samples],
+            "A_samples": [float(v) for v in self.A_samples],
+        }
+
+
+def config_a_ramp_area_law(L_ramp=0.100, L_isolator=0.060,
+                           H_capture=0.050, incidence_deg=8.33,
+                           total_turn_deg=18.51, n_samples=200):
+    """
+    Approximate effective-area law for the UNSW Config A ramp + isolator.
+
+    Models the captured streamtube of the cantilevered concave (isentropic)
+    compression ramp of Bhattrai et al. (JPP 38(1), 2022): the local flow
+    turning grows linearly from `incidence_deg` at the leading edge to
+    `total_turn_deg` at the ramp end, contracting the captured height
+    dH/dx = -tan(theta(x)); the isolator then holds the area constant.
+
+    IMPORTANT: the turning schedule and angles are documented in the paper,
+    but the default lengths/capture height here are PLACEHOLDERS chosen at
+    model scale — calibrate L_ramp, L_isolator, H_capture against the paper
+    drawings / UNSW database before quantitative comparisons. Areas are per
+    unit depth (2-D planar), consistent with the rest of the repo.
+
+    Returns:
+        TabulatedAreaProfile
+    """
+    th0 = np.deg2rad(float(incidence_deg))
+    th1 = np.deg2rad(float(total_turn_deg))
+    x_ramp = np.linspace(0.0, L_ramp, max(n_samples // 2, 8))
+    theta = th0 + (th1 - th0) * (x_ramp / L_ramp)
+
+    # captured-height contraction: dH/dx = -tan(theta(x))
+    H = np.empty_like(x_ramp)
+    H[0] = H_capture
+    for i in range(1, len(x_ramp)):
+        dx = x_ramp[i] - x_ramp[i - 1]
+        H[i] = H[i - 1] - np.tan(0.5 * (theta[i] + theta[i - 1])) * dx
+    if H[-1] <= 0.0:
+        raise ValueError("Config A ramp closes the duct: reduce L_ramp or "
+                         "increase H_capture")
+
+    x_iso = np.linspace(L_ramp, L_ramp + L_isolator, max(n_samples // 4, 6))[1:]
+    x = np.concatenate([x_ramp, x_iso])
+    A = np.concatenate([H, np.full(len(x_iso), H[-1])])
+    return TabulatedAreaProfile(x, A, name="config_a_ramp_isolator")
 
 
 def geometry_to_dict(geometry):

@@ -17,7 +17,6 @@ from mesh import StructuredMesh2D, GeometryProfile
 from fvm import StateVector, BoundaryConditions, FVMResidual, TimeIntegrator
 from physics import (
     TransportProperties,
-    VariableAreaSource,
     SingleStepArrhenius,
     SimpleHeatRelease,
     FEMViscous,
@@ -36,14 +35,30 @@ class InletConfig:
     """
 
     def __init__(self, mach=6.0, altitude=25000.0, gamma=1.4, R_gas=287.0,
-                 Yf_inlet=0.0):
+                 Yf_inlet=0.0, T_inf=None, p_inf=None):
+        """
+        If T_inf and p_inf are given explicitly (e.g., wind-tunnel presets in
+        configs/), they override the standard-atmosphere model and `altitude`
+        is kept only as metadata.
+        """
         self.mach = mach
         self.altitude = altitude
         self.gamma = gamma
         self.R_gas = R_gas
         self.Yf_inlet = Yf_inlet
 
-        self._compute_freestream()
+        self.explicit_conditions = T_inf is not None or p_inf is not None
+        if self.explicit_conditions:
+            if T_inf is None or p_inf is None:
+                raise ValueError("provide both T_inf and p_inf, or neither")
+            self.T_inf = float(T_inf)
+            self.p_inf = float(p_inf)
+            self.rho_inf = self.p_inf / (R_gas * self.T_inf)
+            self.c_inf = np.sqrt(gamma * R_gas * self.T_inf)
+            self.u_inf = self.mach * self.c_inf
+            self.v_inf = 0.0
+        else:
+            self._compute_freestream()
 
     def _compute_freestream(self):
         """Compute freestream rho, u, v, p, T from Mach and altitude."""
@@ -135,8 +150,15 @@ class SolverConfig:
         self.simple_heat_release_fuel_coupled = True
         self.turbulence_model = "none"
 
-        # variable-area source
+        # variable-area (quasi-1D duct) coupling
         self.area_source = True
+
+        # outlet boundary condition
+        self.outlet_type = "supersonic"   # "supersonic" or "back_pressure"
+        self.outlet_p_back = None         # imposed exit pressure [Pa]
+        self.outlet_p_back_amplitude = 0.0     # fractional modulation
+        self.outlet_p_back_frequency_hz = 0.0
+        self.outlet_p_back_phase = 0.0
 
 
 class Solver:
@@ -194,15 +216,19 @@ class Solver:
             self.state, inlet.rho_inf, inlet.u_inf, inlet.v_inf,
             inlet.p_inf, inlet.Yf_inlet,
             wall_type=config.wall_type,
+            outlet_type=getattr(config, "outlet_type", "supersonic"),
+            outlet_p_back=getattr(config, "outlet_p_back", None),
+            outlet_p_amplitude=getattr(config, "outlet_p_back_amplitude", 0.0),
+            outlet_p_frequency_hz=getattr(config, "outlet_p_back_frequency_hz", 0.0),
+            outlet_p_phase=getattr(config, "outlet_p_back_phase", 0.0),
         )
 
-        # FVM residual
-        self.fvm_residual = FVMResidual(self.mesh, gamma=inlet.gamma)
-
-        # source terms
-        self.area_source = None
-        if config.area_source:
-            self.area_source = VariableAreaSource(self.mesh, config.geometry)
+        # FVM residual; the quasi-1D variable-area coupling lives inside it
+        # (area-weighted conservative form — see fvm.FVMResidual docstring)
+        self.fvm_residual = FVMResidual(
+            self.mesh, gamma=inlet.gamma,
+            geometry=config.geometry if config.area_source else None,
+        )
 
         self.combustion = None
         if config.combustion.enabled:
@@ -254,16 +280,15 @@ class Solver:
                 "Use either CombustionConfig.enabled or heat_release_model, not both"
             )
 
-    def _rhs(self, U):
+    def _rhs(self, U, time=None):
         """
-        Full right-hand-side: FVM convective residual + source terms.
+        Full right-hand-side: FVM convective residual (incl. quasi-1D area
+        coupling) + reacting/heating source terms.
 
-        This is the L_FVM operator in the Strang splitting.
+        This is the L_FVM operator in the Strang splitting. `time` is the
+        RK stage time, so breathing-area forcing is stage-accurate.
         """
-        dUdt = self.fvm_residual.compute(U)
-
-        if self.area_source is not None:
-            dUdt += self.area_source.compute(U, self.cfg.inlet.gamma, time=self.time)
+        dUdt = self.fvm_residual.compute(U, time=self.time if time is None else time)
 
         if self.combustion is not None:
             dUdt += self.combustion.compute(U)
@@ -273,9 +298,9 @@ class Solver:
 
         return dUdt
 
-    def _bc(self, U):
-        """Apply boundary conditions in-place."""
-        self.bc.apply(U)
+    def _bc(self, U, time=None):
+        """Apply boundary conditions in-place at the given stage time."""
+        self.bc.apply(U, time=self.time if time is None else time)
 
     def compute_dt(self, t_final=None):
         """Compute the next CFL-limited time step."""
@@ -310,16 +335,13 @@ class Solver:
 
         self.dt_history.append(dt)
 
-        if self.area_source is not None:
-            self.area_source.update(self.time)
-
         # --- Strang splitting ---
         if self.fem_viscous is not None:
             # half-step viscous (L_FEM(dt/2))
             self.fem_viscous.step(self.state.U, 0.5 * dt)
 
-        # full-step convective + sources (L_FVM(dt))
-        self.integrator.step(self.state, dt, self._rhs, self._bc)
+        # full-step convective + sources (L_FVM(dt)), stage-time accurate
+        self.integrator.step(self.state, dt, self._rhs, self._bc, t=self.time)
 
         if self.fem_viscous is not None:
             # half-step viscous (L_FEM(dt/2))

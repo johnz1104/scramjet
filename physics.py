@@ -61,20 +61,34 @@ class TransportProperties:
 
 class VariableAreaSource:
     """
-    Source term for variable-area duct in 2D.
+    Quasi-1D variable-area source term (standalone reference form).
 
-    For a duct with cross-sectional area A(x), the quasi-1D source is:
+    For a duct of area A(x), the quasi-1D equations written for the
+    non-area-weighted state U = [rho, rho u, rho v, rho E, rho Yf] carry a
+    geometric source in EVERY equation:
 
-        S = -(1/A) * (dA/dx) * [0, p, 0, 0, 0]^T
+        S = -(1/A) (dA/dx) * u * [rho, rho u, rho v, rho E + p, rho Yf]
+          (- (1/A) (dA/dt) * U for a breathing wall)
 
-    This appears in the x-momentum equation as a pressure-area force.
+    which yields the correct area-Mach behavior du/u = (dA/A)/(M^2 - 1):
+    a converging duct compresses and decelerates a supersonic stream.
+
+    NOTE: the Solver's primary path is the area-weighted conservative
+    coupling inside fvm.FVMResidual (discretely mass-conserving and
+    well-balanced). This class is retained as an independent reference
+    implementation of the same physics for cross-checks; the two agree
+    to discretization error (see tests.py: nozzle test).
+
+    History: an earlier version applied only S1 = -(A'/A) p to x-momentum,
+    which is the mirror image of the correct relation (flow accelerated
+    through contractions, and rho*u*A drifted ~2x along the duct).
     """
 
     def __init__(self, mesh, geometry):
         """
         Args:
             mesh:     StructuredMesh2D instance
-            geometry: GeometryProfile instance
+            geometry: GeometryProfile-compatible area law
         """
         self.mesh = mesh
         self.geometry = geometry
@@ -83,6 +97,7 @@ class VariableAreaSource:
         # A(x_c[i]) and dA/dx(x_c[i]) for each column i
         self.A_cell = None
         self.dAdx_cell = None
+        self.dAdt_cell = None
         self.update(0.0)
 
     def update(self, time):
@@ -91,6 +106,10 @@ class VariableAreaSource:
             self.geometry.set_time(time)
         self.A_cell = self.geometry.area(self.mesh.xc)          # (nx,)
         self.dAdx_cell = self.geometry.area_gradient(self.mesh.xc)  # (nx,)
+        if hasattr(self.geometry, "area_time_derivative"):
+            self.dAdt_cell = self.geometry.area_time_derivative(self.mesh.xc)
+        else:
+            self.dAdt_cell = np.zeros_like(self.A_cell)
 
     def compute(self, U, gamma, time=None):
         """
@@ -107,21 +126,22 @@ class VariableAreaSource:
         if time is not None or getattr(self.geometry, "is_time_dependent", False):
             self.update(0.0 if time is None else time)
 
-        S = np.zeros_like(U)
-        nx, ny = self.mesh.nx, self.mesh.ny
+        rho_safe = np.maximum(U[0], 1e-30)
+        u = U[1] / rho_safe
+        ke = 0.5 * (U[1]**2 + U[2]**2) / rho_safe
+        p = (gamma - 1.0) * (U[3] - ke)
 
-        # extract pressure: p = (gamma-1) * (rho*E - 0.5 * rho * (u^2 + v^2))
-        rho = U[0]
-        rhou = U[1]
-        rhov = U[2]
-        rhoE = U[3]
-        ke = 0.5 * (rhou**2 + rhov**2) / np.maximum(rho, 1e-30)
-        p = (gamma - 1.0) * (rhoE - ke)
+        ratio = (self.dAdx_cell / np.maximum(self.A_cell, 1e-30))[:, np.newaxis]
+        S = np.empty_like(U)
+        S[0] = -ratio * U[1]                # mass:      -(A'/A) rho u
+        S[1] = -ratio * U[1] * u            # x-mom:     -(A'/A) rho u^2
+        S[2] = -ratio * U[2] * u            # y-mom:     -(A'/A) rho u v
+        S[3] = -ratio * (U[3] + p) * u      # energy:    -(A'/A) (rho E + p) u
+        S[4] = -ratio * U[4] * u            # species:   -(A'/A) rho Yf u
 
-        # S_momentum_x = -(1/A) * (dA/dx) * p
-        for i in range(nx):
-            ratio = self.dAdx_cell[i] / max(self.A_cell[i], 1e-30)
-            S[1, i, :] = -ratio * p[i, :]
+        if np.any(self.dAdt_cell != 0.0):
+            rate = (self.dAdt_cell / np.maximum(self.A_cell, 1e-30))[:, np.newaxis]
+            S -= rate * U
 
         return S
 
@@ -256,19 +276,25 @@ class FEMViscous:
     direct sparse solve — functionally equivalent to a Q1 FEM with mass
     lumping on the structured mesh.
 
-    No-slip walls at j=0 and j=ny-1 (zero velocity, adiabatic dT/dn=0).
+    No-slip walls at j=0 and j=ny-1 (zero normal velocity, adiabatic
+    dT/dn=0). The walls may translate in x: `wall_u_bottom`/`wall_u_top`
+    set the tangential wall speed (Couette-type driving).
     """
 
-    def __init__(self, mesh, transport, gamma=1.4, R_gas=287.0):
+    def __init__(self, mesh, transport, gamma=1.4, R_gas=287.0,
+                 wall_u_bottom=0.0, wall_u_top=0.0):
         """
         Args:
             mesh:      StructuredMesh2D instance
             transport: TransportProperties instance
+            wall_u_bottom, wall_u_top: tangential wall velocities [m/s]
         """
         self.mesh = mesh
         self.transport = transport
         self.gamma = gamma
         self.R_gas = R_gas
+        self.wall_u_bottom = float(wall_u_bottom)
+        self.wall_u_top = float(wall_u_top)
 
     def step(self, U, dt):
         """
@@ -411,10 +437,12 @@ class FEMViscous:
             phi_flat = spsolve(A, rhs)
             return phi_flat.reshape(nx, ny)
 
-        # --- diffuse u-velocity ---
+        # --- diffuse u-velocity (tangential wall speed as Dirichlet value) ---
         # kinematic viscosity nu = mu / rho
         nu = mu / rho_safe
-        u_new = _build_diffusion_system(nu, u_vel, bc_type="dirichlet")
+        u_new = _build_diffusion_system(nu, u_vel, bc_type="dirichlet",
+                                        wall_bot_val=self.wall_u_bottom,
+                                        wall_top_val=self.wall_u_top)
 
         # --- diffuse v-velocity ---
         v_new = _build_diffusion_system(nu, v_vel, bc_type="dirichlet")
