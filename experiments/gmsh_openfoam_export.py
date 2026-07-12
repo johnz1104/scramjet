@@ -126,7 +126,7 @@ def _dict_file(cls, obj, body):
 
 
 def write_openfoam_case(case_dir, freestream, end_time, write_interval,
-                        p_back=None):
+                        p_back=None, x_end=1.0, y_mid=0.5, z_mid=0.005):
     """
     Write a minimal rhoCentralFoam case skeleton.
 
@@ -270,6 +270,59 @@ runTimeModifiable true;
 adjustTimeStep  yes;
 maxCo           0.3;
 maxDeltaT       1e-5;
+
+functions
+{{
+    exitPlaneSample
+    {{
+        type            surfaces;
+        libs            ("libsampling.so");
+        writeControl    writeTime;
+        surfaceFormat   raw;
+        interpolationScheme cell;
+        fields          (p rho U T);
+        surfaces
+        {{
+            exitPlane
+            {{
+                type sampledPatch;
+                patches (outlet);
+            }}
+        }}
+    }}
+
+    centerlineSample
+    {{
+        type            sets;
+        libs            ("libsampling.so");
+        writeControl    writeTime;
+        setFormat       raw;
+        interpolationScheme cellPoint;
+        fields          (p rho U T);
+        sets
+        {{
+            centerline
+            {{
+                type uniform;
+                axis x;
+                start (0 {y_mid} {z_mid});
+                end   ({x_end} {y_mid} {z_mid});
+                nPoints 400;
+            }}
+        }}
+    }}
+
+    wallPressureProbes
+    {{
+        type            probes;
+        libs            ("libsampling.so");
+        writeControl    writeTime;
+        fields          (p);
+        probeLocations  (({0.25 * x_end} {0.1 * y_mid} {z_mid})
+                         ({0.5 * x_end} {0.1 * y_mid} {z_mid})
+                         ({0.75 * x_end} {0.1 * y_mid} {z_mid}));
+    }}
+}}
 """))
 
     (case / "system" / "fvSchemes").write_text(_dict_file(
@@ -339,10 +392,10 @@ solvers
 """))
 
     allrun = case / "Allrun.sh"
-    allrun.write_text("""#!/bin/sh
+    allrun.write_text("""#!/bin/bash
 # TEMPLATE driver: gmsh mesh -> gmshToFoam -> patch types -> rhoCentralFoam.
 # Run inside your pinned OpenFOAM environment (e.g. the v2606 Docker image).
-set -e
+set -euo pipefail
 cd "$(dirname "$0")"
 
 gmsh -3 ../gmsh/duct2d.geo -format msh2 -o duct2d.msh
@@ -355,9 +408,141 @@ foamDictionary constant/polyMesh/boundary -entry entry0/topWall/type -set wall
 
 checkMesh
 rhoCentralFoam | tee log.rhoCentralFoam
+python3 postprocess_qoi.py
 """)
     allrun.chmod(0o755)
+    _write_qoi_bridge(case)
     return case
+
+
+def _write_qoi_bridge(case):
+    """Emit a self-contained raw-sample -> schema-v2 QoI postprocessor."""
+    script = case / "postprocess_qoi.py"
+    script.write_text(r'''#!/usr/bin/env python3
+"""Convert OpenFOAM raw exit/centerline samples to shared schema-v2 QoIs."""
+import argparse
+import json
+from pathlib import Path
+
+import numpy as np
+
+
+def latest_raw(root, token):
+    files = [path for path in Path(root).rglob("*.raw") if token.lower() in str(path).lower()]
+    if not files:
+        raise FileNotFoundError(f"no raw sample containing {token!r} under {root}")
+    return max(files, key=lambda path: path.stat().st_mtime)
+
+
+def read_raw(path, centerline=False):
+    rows = []
+    for line in Path(path).read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        values = []
+        for token in line.replace("(", " ").replace(")", " ").split():
+            try:
+                values.append(float(token))
+            except ValueError:
+                pass
+        if len(values) >= 9:
+            rows.append(values[:9])
+        elif centerline and len(values) >= 7:
+            # setFormat raw with axis=x writes x p rho Ux Uy Uz T.
+            rows.append([values[0], 0.0, 0.0, *values[1:7]])
+    if not rows:
+        raise ValueError(f"no numeric x y z p rho Ux Uy Uz T rows in {path}")
+    return np.asarray(rows, dtype=float)
+
+
+def quadrature_widths(y):
+    order = np.argsort(y)
+    ys = y[order]
+    if len(ys) == 1:
+        return order, np.ones(1)
+    edges = np.empty(len(ys) + 1)
+    edges[1:-1] = 0.5 * (ys[:-1] + ys[1:])
+    edges[0] = ys[0] - 0.5 * (ys[1] - ys[0])
+    edges[-1] = ys[-1] + 0.5 * (ys[-1] - ys[-2])
+    return order, np.diff(edges)
+
+
+def shock_diagnostics(center, gamma):
+    center = center[np.argsort(center[:, 0])]
+    x, p, rho = center[:, 0], center[:, 3], center[:, 4]
+    speed = np.linalg.norm(center[:, 5:8], axis=1)
+    mach = speed / np.sqrt(gamma * p / np.maximum(rho, 1e-30))
+    p0 = p * (1.0 + 0.5 * (gamma - 1.0) * mach**2) ** (gamma / (gamma - 1.0))
+    lo, hi = 1, len(x) - 1
+    if hi - lo < 6:
+        return {"shock_detected": False, "shock_x": None,
+                "shock_index": -1, "shock_p0_ratio": 1.0}
+    i_star = lo + int(np.argmin(np.diff(p0[lo:hi])))
+    i0, i1 = max(i_star - 1, lo), min(i_star + 3, hi - 1)
+    ratio = float(p0[i1] / max(p0[i0], 1e-30))
+    detected = ratio < 0.97
+    shock_x = None
+    if detected:
+        shock_x = float(0.5 * (x[i_star] + x[i_star + 1]))
+        crossings = np.where((mach[lo:hi - 1] > 1.0) & (mach[lo + 1:hi] <= 1.0))[0]
+        if len(crossings):
+            candidate = lo + int(crossings[0])
+            if abs(candidate - i_star) <= 4:
+                i_star = candidate
+                shock_x = float(0.5 * (x[i_star] + x[i_star + 1]))
+    return {"shock_detected": bool(detected), "shock_x": shock_x,
+            "shock_index": int(i_star) if detected else -1,
+            "shock_p0_ratio": ratio}
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--exit-raw", type=Path)
+    parser.add_argument("--centerline-raw", type=Path)
+    parser.add_argument("--freestream", type=Path,
+                        default=Path("../freestream_conditions.json"))
+    parser.add_argument("--output", type=Path, default=Path("qoi.json"))
+    args = parser.parse_args()
+    exit_path = args.exit_raw or latest_raw("postProcessing", "exitPlane")
+    center_path = args.centerline_raw or latest_raw("postProcessing", "centerline")
+    exit_data = read_raw(exit_path)
+    center = read_raw(center_path, centerline=True)
+    metadata = json.loads(args.freestream.read_text())
+    fs = metadata["freestream"]
+    gamma, gas_r = float(fs["gamma"]), float(fs["R_gas"])
+
+    order, dy = quadrature_widths(exit_data[:, 1])
+    exit_data, dy = exit_data[order], dy
+    p, rho = exit_data[:, 3], exit_data[:, 4]
+    velocity = exit_data[:, 5:8]
+    speed = np.linalg.norm(velocity, axis=1)
+    mach = speed / np.sqrt(gamma * p / np.maximum(rho, 1e-30))
+    p0 = p * (1.0 + 0.5 * (gamma - 1.0) * mach**2) ** (gamma / (gamma - 1.0))
+    mass_weights = np.maximum(rho * velocity[:, 0], 0.0) * dy
+    if np.sum(mass_weights) <= 0.0:
+        mass_weights = dy
+    p0_exit = float(np.sum(p0 * mass_weights) / np.sum(mass_weights))
+    factor = 1.0 + 0.5 * (gamma - 1.0) * float(fs["mach"])**2
+    p0_inf = float(fs["p_inf"]) * factor ** (gamma / (gamma - 1.0))
+    shock = shock_diagnostics(center, gamma)
+    qoi = {
+        "schema_version": 2,
+        "source": "OpenFOAM raw sampling bridge",
+        "exit_station": "outlet sampled patch (same last-physical-station intent as Python nx-2)",
+        "tpr": p0_exit / max(p0_inf, 1e-30),
+        "exit_mach": float(np.sum(mach * mass_weights) / np.sum(mass_weights)),
+        **shock,
+        "inputs": {"exit_raw": str(exit_path), "centerline_raw": str(center_path)},
+    }
+    args.output.write_text(json.dumps(qoi, indent=2, allow_nan=False) + "\n")
+    print(args.output)
+
+
+if __name__ == "__main__":
+    main()
+''')
+    script.chmod(0o755)
 
 
 def emit_gmsh_openfoam(output_dir, wall_rows, freestream, nx_cells=200,
@@ -391,5 +576,6 @@ def emit_gmsh_openfoam(output_dir, wall_rows, freestream, nx_cells=200,
     case_dir = write_openfoam_case(output_dir / "openfoam_case", freestream,
                                    end_time=f"{end_time:.6e}",
                                    write_interval=f"{end_time / 20.0:.6e}",
-                                   p_back=p_back)
+                                   p_back=p_back, x_end=float(x[-1]),
+                                   y_mid=0.5 * float(np.mean(y)), z_mid=0.005)
     return geo_path, case_dir

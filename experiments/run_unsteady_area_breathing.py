@@ -7,9 +7,9 @@ This script applies a sinusoidal throat-area forcing,
     A(x, t) = A_base(x) + q(t) * phi(x),
 
 inside the existing quasi-1D area-source framework. It is not true
-moving-wall CFD: there is no moving mesh, ALE formulation, geometric
-conservation law term, moving-wall boundary condition, turbulence model, or
-combustion model.
+moving-wall CFD: there is no moving mesh, ALE boundary condition, turbulence
+model, or combustion model.  It does include the quasi-1D moving-control-
+volume source, including wall-pressure work in the energy equation.
 """
 import argparse
 import csv
@@ -116,7 +116,9 @@ def qoi_row(solver):
         "pressure_recovery": float(qoi["pressure_recovery"]),
         "tpr": float(qoi["tpr"]),
         "shock_x": float(qoi["shock_x"]),
-        "mdot": float(qoi["mdot"]),
+        "mdot_prescribed": float(qoi["mdot_prescribed"]),
+        "mdot_exit": float(qoi["mdot_exit"]),
+        "mass_defect": float(qoi["mass_defect"]),
         "thrust": float(qoi["thrust"]),
         "pressure_min": float(np.min(p)),
         "pressure_max": float(np.max(p)),
@@ -337,7 +339,7 @@ def run_case(output_root=None, amplitude=0.001, frequency_hz=1000.0,
     write_csv(output_root / "qoi_history.csv", qoi_rows)
     write_csv(output_root / "probe_history.csv", probe_rows)
     write_csv(output_root / "residual.csv", residual_rows(solver),
-              fieldnames=["sample", "residual_l2"])
+              fieldnames=["sample", "step", "time", "residual_l2"])
     write_csv(output_root / "timestep_history.csv", timestep_rows(solver))
     metrics = response_metrics(qoi_rows, forcing_rows, frequency_hz,
                                probe_rows=probe_rows)

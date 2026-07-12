@@ -1,77 +1,211 @@
 {
+  "schema_version": 2,
   "scramjet_clean": {
-    "mach_freestream": 6.0,
-    "altitude_m": 25000.0,
-    "T_inf_K": 216.64999999999998,
-    "p_inf_Pa": 2486.918638664724,
-    "rho_inf_kg_m3": 0.03999640774293907,
-    "u_inf_m_s": 1770.2539139908713,
-    "wall_time_s": 1.9100768566131592,
-    "n_cells": 1280,
-    "n_steps": 1500,
-    "final_time_s": 0.002697444578499738,
-    "M_exit": 6.534794383053906,
-    "M_max": 6.534794383053999,
-    "M_min": 5.069987646778587,
-    "p_max_Pa": 6793.313938123884,
-    "p_min_Pa": 1452.6621859714455,
-    "T_max_K": 289.2921402502872,
-    "T_min_K": 186.20526781725215,
-    "thrust_N_per_m": 337.8926005427402,
-    "Isp_s": 4.866328867973906,
-    "pressure_recovery_static_legacy": 0.5841213151836062,
-    "tpr": 0.9923996674426162,
-    "shock_detected": false,
-    "mdot_kg_s_per_m": 7.080379735251268
+    "scope": "paper-1 cold-flow baseline",
+    "wall_time_s": 2.5653092861175537,
+    "n_cells": 768,
+    "run_status": {
+      "converged": true,
+      "steady_detection_enabled": true,
+      "steady_rtol": 1e-06,
+      "final_residual": 6.122225707326899e-09,
+      "residual_history": [
+        1.7579271734712414,
+        1.574703814174395,
+        1.1772335994570924,
+        0.9050111815445309,
+        0.6592328014424961,
+        0.40337374132693,
+        0.2452171926472767,
+        0.08094155759486872,
+        0.006021073410433549,
+        9.25587368793308e-06,
+        8.206936236133854e-07,
+        6.122225707326899e-09
+      ],
+      "residual_steps": [
+        1,
+        50,
+        100,
+        150,
+        200,
+        250,
+        300,
+        350,
+        400,
+        450,
+        500,
+        550
+      ],
+      "residual_times": [
+        2.1183401829322754e-06,
+        0.00010474036361891506,
+        0.00020786064940686293,
+        0.00031003684729794987,
+        0.0004117045073165477,
+        0.0005132912302787563,
+        0.0006153533906487564,
+        0.000719718678337018,
+        0.0008253770259896311,
+        0.0009310797895196718,
+        0.0010367825530497156,
+        0.0011424853165797617
+      ],
+      "steady_qoi_history": [],
+      "completed_time": false,
+      "reached_step_cap": false,
+      "steps": 550,
+      "time": 0.0011424853165797617
+    },
+    "qoi": {
+      "tpr": 0.9882974672369008,
+      "shock_x": null,
+      "shock_detected": false,
+      "shock_at_inlet": false,
+      "started": true,
+      "unstart_classification": "started",
+      "min_centerline_mach_contraction": 5.066020829828818,
+      "exit_mach": 6.518317663700128,
+      "mdot_prescribed": 7.076922518583665,
+      "mdot_exit": 6.933046985050604,
+      "mass_defect": -0.020330240037989743,
+      "pressure_recovery": 0.5909799054440663,
+      "thrust": -282.9404369137102,
+      "Isp": -4.076898539871418,
+      "state_admissible": true
+    },
+    "mach_range": [
+      5.066020829828781,
+      6.518317663700195
+    ],
+    "temperature_range_K": [
+      187.0485804257132,
+      289.6714630283454
+    ]
   },
-  "scramjet_combustion": {
-    "mach_freestream": 6.0,
-    "altitude_m": 25000.0,
-    "Yf_inlet": 0.02,
-    "Arrhenius_A_pre": 1000000.0,
-    "Arrhenius_Ea_J_mol": 65000.0,
-    "Arrhenius_Q_heat_J_kg": 1500000.0,
-    "wall_time_s": 0.4860951900482178,
-    "n_cells": 720,
-    "n_steps": 600,
-    "Yf_inlet_mean": 0.019999999999999997,
-    "Yf_exit_mean": 0.019999999999999536,
-    "Yf_consumed_frac": 2.3092638912203256e-14,
-    "T_inlet_mean_K": 216.65,
-    "T_exit_mean_K": 187.34217641213868,
-    "delta_T_K": -29.30782358786132,
-    "thrust_N_per_m": 456.4373293465045,
-    "Isp_s": 6.573609924135795
+  "extended_combustion_capability": {
+    "paper_scope": false,
+    "decision": "parked; revisit after cold-flow multi-fidelity loop closes",
+    "wall_time_s": 1.3596720695495605,
+    "fuel_range": [
+      0.019999999999999456,
+      0.020000000000000004
+    ],
+    "temperature_range_K": [
+      188.57680069328336,
+      290.4572218808848
+    ],
+    "qoi": {
+      "tpr": 0.9797528931806891,
+      "shock_x": null,
+      "shock_detected": false,
+      "shock_at_inlet": false,
+      "started": true,
+      "unstart_classification": "started",
+      "min_centerline_mach_contraction": 5.057826784894475,
+      "exit_mach": 6.488730246246208,
+      "mdot_prescribed": 7.07423357228664,
+      "mdot_exit": 6.8776670092804455,
+      "mass_defect": -0.027786269847838396,
+      "pressure_recovery": 0.6027955669683855,
+      "thrust": -376.22645790306996,
+      "Isp": -5.4231206102375165,
+      "state_admissible": true
+    }
   },
   "rom": {
-    "n_training_snapshots": 9,
+    "identity": "coefficient-interpolated POD state reconstruction",
+    "comparison_baseline": "direct QoI IDW",
+    "training_parameters": [
+      "A_exit",
+      "L_nozzle"
+    ],
+    "n_training_snapshots": 6,
     "n_modes": 4,
-    "energy_threshold": 0.999,
-    "mean_full_solver_s": 0.17853816350301108,
-    "mean_rom_eval_s": 4.99884287516276e-05,
-    "speedup": 3571.589825119237,
-    "wall_saving_pct_at_80pct_rom": 79.97760101133748,
-    "mean_rel_err_thrust": 0.035653771649932664,
-    "mean_rel_err_Isp": 0.03565377164993271,
-    "mean_rel_err_exit_mach": 0.005497382536280723,
-    "mean_rel_err_pressure_recovery": 0.03812478176711149
+    "build_time_s": 3.3646938800811768,
+    "mean_full_solver_s": 0.5571977694829305,
+    "validation_mean_relative_errors": {
+      "pod_state": {
+        "tpr": 0.012077791448260287,
+        "shock_x": null,
+        "min_centerline_mach_contraction": 0.0010286638990418852,
+        "exit_mach": 0.009102897300635026,
+        "mdot_prescribed": 0.0,
+        "mdot_exit": 0.02863750953665146,
+        "mass_defect": 0.6228364625981195,
+        "pressure_recovery": 0.047037703291634606,
+        "thrust": 0.57862715332477,
+        "Isp": 0.57862715332477
+      },
+      "idw": {
+        "tpr": 0.0024584272179226335,
+        "shock_x": null,
+        "min_centerline_mach_contraction": 0.00044927642918121756,
+        "exit_mach": 0.005756811783548521,
+        "mdot_prescribed": 1.9724091440029942e-05,
+        "mdot_exit": 0.000699945798107269,
+        "mass_defect": 0.015238084339311087,
+        "pressure_recovery": 0.04655270181273951,
+        "thrust": 0.020718955237900818,
+        "Isp": 0.020722618167160773
+      }
+    }
   },
-  "bayes_opt": {
-    "total_wall_s": 5.4021008014678955,
-    "n_total_evals": 20,
-    "n_full_evals": 6,
-    "n_rom_evals": 14,
-    "full_solver_wall_s": 1.1788012981414795,
-    "rom_wall_s": 0.0012743473052978516,
-    "pct_rom_evals": 70.0,
+  "adaptive_sampling": {
+    "total_session_wall_s": 6.874814033508301,
+    "objective": "maximize tpr",
     "best_params": {
-      "A_exit": 0.1600185835290535,
-      "L_nozzle": 0.384294267710059,
-      "L_combustor": 0.4547597682672338
+      "A_exit": 0.12085926525546051,
+      "L_nozzle": 0.3460599039101641
     },
-    "best_thrust": 721.8784480953243,
-    "best_Isp": 10.396492629586696,
-    "best_objective": -727.0766944101176,
-    "estimated_wall_saving_pct": 69.96756839408032
+    "best_qoi": {
+      "tpr": 0.9868985163112236,
+      "shock_x": null,
+      "shock_detected": false,
+      "shock_at_inlet": false,
+      "started": true,
+      "unstart_classification": "started",
+      "min_centerline_mach_contraction": 5.095605185303319,
+      "exit_mach": 6.167066293509598,
+      "mdot_prescribed": 7.067766144549984,
+      "mdot_exit": 6.801127739419946,
+      "mass_defect": -0.037725980129612174,
+      "pressure_recovery": 0.8331451557373231,
+      "thrust": -478.0211244080907,
+      "Isp": -6.896746167538991,
+      "state_admissible": true
+    },
+    "best_full_verified": true,
+    "all_gp_observations_full": true,
+    "cost_report": {
+      "n_full_optimizer": 9,
+      "n_full_rom_training": 6,
+      "n_rom_prescreen": 20,
+      "full_optimizer_wall_s": 5.456283330917358,
+      "rom_training_wall_s": 3.3646938800811768,
+      "rom_prescreen_wall_s": 0.16664576530456543,
+      "total_including_training_wall_s": 8.9876229763031,
+      "standard_bo_same_full_budget_wall_s": 5.279681968688965,
+      "overhead_vs_standard_bo_pct": 70.23038564830225,
+      "equivalent_top_m_full_screen_wall_s": 14.079151916503907,
+      "saving_vs_equivalent_top_m_full_screen_pct": 36.16360538188667,
+      "comparison_note": "ROM prescreening adds overhead versus standard one-full-candidate BO; savings apply only versus evaluating every top-m shortlist candidate at full fidelity."
+    }
+  },
+  "assertions": {
+    "passed": true,
+    "checks": {
+      "clean_run_converged": true,
+      "clean_mass_balance_within_8pct": true,
+      "clean_tpr_physical": true,
+      "clean_state_admissible": true,
+      "rom_has_modes": true,
+      "pod_tpr_error_below_loose_bound": true,
+      "idw_tpr_error_below_loose_bound": true,
+      "bo_best_is_full_verified": true,
+      "gp_trained_on_full_only": true,
+      "bo_best_tpr_finite": true,
+      "combustion_fuel_bounded": true
+    }
   }
 }

@@ -22,16 +22,20 @@ if str(REPO_ROOT) not in sys.path:
 
 import numpy as np
 
-from experiments.run_static_wall_sweep import write_csv, write_json
+from experiments.run_static_wall_sweep import (
+    ARTIFACT_SCHEMA_VERSION,
+    require_schema_v2,
+    write_csv,
+    write_json,
+)
 
 
 DEFAULT_WEIGHTS = {
-    "pressure_recovery_mean": 1.0,
-    "mdot_stability": 1.0,
-    "exit_mach_amplitude_low_is_good": 0.5,
-    "exit_mach_amplitude_high_is_good": 0.0,
+    "tpr_mean": 1.5,
+    "mass_conservation": 0.5,
+    "response_informativeness": 1.0,
     "numerical_stability": 1.0,
-    "warning_penalty": 0.5,
+    "warning_penalty": 0.1,
 }
 
 DESIGN_KEYS = ("q_offset", "epsilon", "frequency_hz", "phase")
@@ -105,40 +109,58 @@ def has_warnings(row):
     return bool(str(warnings).strip())
 
 
-def score_doe_cases(rows, weights, low_amplitude_preferred=True,
-                    require_finite_phase=False):
+def score_doe_cases(rows, weights, require_finite_phase=True,
+                    include_zero_eps=False):
     """Score each DOE row. Returns a list of (row, score, breakdown)."""
     weights = {**DEFAULT_WEIGHTS, **(weights or {})}
-    if not low_amplitude_preferred:
-        weights["exit_mach_amplitude_low_is_good"] = 0.0
-        weights["exit_mach_amplitude_high_is_good"] = max(
-            weights.get("exit_mach_amplitude_high_is_good", 1.0), 1.0,
-        )
+    eligible = []
+    for row in rows:
+        if is_failed(row):
+            continue
+        epsilon = _parse_float(row.get("epsilon"))
+        zero_epsilon = epsilon is not None and abs(epsilon) <= 1.0e-15
+        if not include_zero_eps and (epsilon is None or zero_epsilon):
+            continue
+        if (not zero_epsilon
+                and str(row.get("exit_mach_supported", "")).lower()
+                not in {"1", "true", "yes"}):
+            continue
+        if any(_parse_float(row.get(key)) is None for key in (
+            "tpr_mean", "mass_defect_mean",
+        )):
+            continue
+        amplitude_key = ("exit_mach_raw_amplitude" if zero_epsilon
+                         else "exit_mach_amplitude")
+        if _parse_float(row.get(amplitude_key)) is None:
+            continue
+        row = dict(row)
+        row["_ranking_exit_mach_amplitude"] = row.get(amplitude_key)
+        eligible.append(row)
+    tpr = [_parse_float(r.get("tpr_mean")) for r in eligible]
+    mass_defect = [abs(_parse_float(r.get("mass_defect_mean")))
+                   for r in eligible]
+    em_amp = [_parse_float(r.get("_ranking_exit_mach_amplitude")) for r in eligible]
 
-    eligible = [r for r in rows if not is_failed(r)]
-    p_rec = [_parse_float(r.get("pressure_recovery_mean")) for r in eligible]
-    mdot_amp = [_parse_float(r.get("mdot_amplitude")) for r in eligible]
-    em_amp = [_parse_float(r.get("exit_mach_amplitude")) for r in eligible]
-
-    n_rec_norm = normalized(p_rec, higher_is_better=True)
-    n_mdot_stab = normalized(mdot_amp, higher_is_better=False)
-    n_em_low = normalized(em_amp, higher_is_better=False)
+    n_tpr = normalized(tpr, higher_is_better=True)
+    n_mass = normalized(mass_defect, higher_is_better=False)
     n_em_high = normalized(em_amp, higher_is_better=True)
 
     breakdowns = []
     scored = []
     for k, r in enumerate(eligible):
         b = {
-            "pressure_recovery_mean": float(n_rec_norm[k]),
-            "mdot_stability": float(n_mdot_stab[k]),
-            "exit_mach_amplitude_low_is_good": float(n_em_low[k]),
-            "exit_mach_amplitude_high_is_good": float(n_em_high[k]),
+            "tpr_mean": float(n_tpr[k]),
+            "mass_conservation": float(n_mass[k]),
+            "response_informativeness": float(n_em_high[k]),
             "numerical_stability": 1.0,  # already non-failed
             "warning_penalty": 0.0 if has_warnings(r) else 1.0,
         }
         if require_finite_phase:
             phase_lag = _parse_float(r.get("exit_mach_phase_lag_rad"))
-            if phase_lag is None:
+            epsilon = _parse_float(r.get("epsilon"))
+            if phase_lag is None and not (
+                    include_zero_eps and epsilon is not None
+                    and abs(epsilon) <= 1.0e-15):
                 continue
         score = sum(weights[k] * b[k] for k in b)
         scored.append((r, float(score), b))
@@ -152,23 +174,21 @@ def score_static_cases(rows, weights):
     weights = {**DEFAULT_WEIGHTS, **(weights or {})}
     eligible = []
     for r in rows:
-        if any(_parse_float(r.get(k)) is None for k in ("q", "pressure_recovery", "thrust")):
+        if any(_parse_float(r.get(k)) is None for k in ("q", "tpr")):
+            continue
+        if str(r.get("converged", "")).lower() not in {"1", "true", "yes"}:
             continue
         eligible.append(r)
-    p_rec = [_parse_float(r.get("pressure_recovery")) for r in eligible]
-    thrust = [_parse_float(r.get("thrust")) for r in eligible]
-    n_rec_norm = normalized(p_rec, higher_is_better=True)
-    n_th_norm = normalized(thrust, higher_is_better=True)
+    tpr = [_parse_float(r.get("tpr")) for r in eligible]
+    n_tpr = normalized(tpr, higher_is_better=True)
     scored = []
     for k, r in enumerate(eligible):
         b = {
-            "pressure_recovery_mean": float(n_rec_norm[k]),
-            "thrust": float(n_th_norm[k]),
+            "tpr_mean": float(n_tpr[k]),
             "numerical_stability": 1.0,
             "warning_penalty": 1.0,
         }
-        score = (weights.get("pressure_recovery_mean", 1.0) * b["pressure_recovery_mean"]
-                 + 0.5 * b["thrust"]
+        score = (weights.get("tpr_mean", 1.0) * b["tpr_mean"]
                  + weights.get("numerical_stability", 1.0) * b["numerical_stability"])
         scored.append((r, float(score), b))
     return scored
@@ -179,8 +199,8 @@ def to_csv_row(row, score, breakdown, source):
     out = {"source": source, "score": score}
     for key in ("case_id", "q_offset", "epsilon", "frequency_hz", "phase",
                 "q", "exit_mach_mean", "exit_mach_amplitude",
-                "pressure_recovery_mean", "pressure_recovery",
-                "mdot_amplitude", "exit_mach_phase_lag_rad", "warnings",
+                "tpr_mean", "tpr", "mass_defect_mean",
+                "exit_mach_phase_lag_rad", "warnings",
                 "status"):
         if key in row:
             out[key] = row.get(key)
@@ -221,20 +241,20 @@ def write_selection_report(path, doe_root, static_root, weights,
     lines.append("")
     lines.append("## Top static-sweep candidates\n")
     if selected_static:
-        lines.append("| Rank | q | thrust | pressure_recovery | score |")
-        lines.append("|---|---|---|---|---|")
+        lines.append("| Rank | q | TPR | score |")
+        lines.append("|---|---|---|---|")
         for i, (row, score, _) in enumerate(selected_static[:top_k], start=1):
             lines.append(
-                f"| {i} | {row.get('q', '')} | {row.get('thrust', '')} | "
-                f"{row.get('pressure_recovery', '')} | {score:.4f} |"
+                f"| {i} | {row.get('q', '')} | {row.get('tpr', '')} | "
+                f"{score:.4f} |"
             )
     else:
         lines.append("(no static sweep summary provided or no eligible cases)")
     lines.append("")
     lines.append("## Limitations\n")
     lines.append("- Low-fidelity effective-area forcing only — not body-fitted CFD.")
-    lines.append("- Pressure recovery is a Python QoI proxy, not a stagnation pressure ")
-    lines.append("  ratio from a validated solver.")
+    lines.append("- TPR uses the shared mass-flux-weighted definition but remains a ")
+    lines.append("  low-fidelity prediction until an OpenFOAM case closes the loop.")
     lines.append("- Phase lag is reported only when post-transient sample count and ")
     lines.append("  cycle count are sufficient.")
     lines.append("- Rankings are intended to seed high-fidelity case selection, not ")
@@ -243,13 +263,46 @@ def write_selection_report(path, doe_root, static_root, weights,
     path.write_text("\n".join(lines) + "\n")
 
 
+def _greedy_diverse_selection(scored, top_k):
+    """Choose high-scoring cases while spreading (q_offset, epsilon, f)."""
+    if not scored or top_k <= 0:
+        return []
+    pool = scored[:max(top_k * 4, top_k)]
+    design = np.asarray([
+        [float(row[k]) for k in ("q_offset", "epsilon", "frequency_hz")]
+        for row, _, _ in pool
+    ])
+    lo, hi = design.min(axis=0), design.max(axis=0)
+    design = (design - lo) / np.maximum(hi - lo, 1.0e-30)
+    scores = np.asarray([item[1] for item in pool], dtype=float)
+    score_norm = ((scores - scores.min()) /
+                  max(float(scores.max() - scores.min()), 1.0e-30))
+    chosen = [int(np.argmax(scores))]
+    while len(chosen) < min(top_k, len(pool)):
+        candidates = [i for i in range(len(pool)) if i not in chosen]
+        utilities = []
+        for i in candidates:
+            separation = min(
+                float(np.linalg.norm(design[i] - design[j])) for j in chosen
+            ) / np.sqrt(3.0)
+            utilities.append(0.7 * score_norm[i] + 0.3 * separation)
+        chosen.append(candidates[int(np.argmax(utilities))])
+    return [pool[i] for i in chosen]
+
+
 def rank_cases(doe_root, output_root=None, static_root=None, top_k=5,
-               weights=None, low_amplitude_preferred=True,
-               require_finite_phase=False):
+               weights=None, require_finite_phase=True,
+               include_zero_eps=False):
     """Rank DOE + optional static-sweep candidates; write outputs."""
     doe_root = Path(doe_root)
     if not doe_root.is_absolute():
         doe_root = REPO_ROOT / doe_root
+    require_schema_v2(doe_root, "unsteady DOE")
+    if static_root:
+        static_root = Path(static_root)
+        if not static_root.is_absolute():
+            static_root = REPO_ROOT / static_root
+        require_schema_v2(static_root, "static sweep")
 
     if output_root is None:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -265,8 +318,8 @@ def rank_cases(doe_root, output_root=None, static_root=None, top_k=5,
 
     scored_doe, effective_weights = score_doe_cases(
         doe_rows, weights,
-        low_amplitude_preferred=low_amplitude_preferred,
         require_finite_phase=require_finite_phase,
+        include_zero_eps=include_zero_eps,
     )
     scored_doe.sort(key=lambda triple: triple[1], reverse=True)
     scored_static = score_static_cases(static_rows, weights)
@@ -280,10 +333,11 @@ def rank_cases(doe_root, output_root=None, static_root=None, top_k=5,
     fieldnames = sorted({k for r in csv_rows for k in r.keys()}) if csv_rows else []
     write_csv(output_root / "ranked_cases.csv", csv_rows, fieldnames=fieldnames)
 
-    selected_doe = scored_doe[:top_k]
+    selected_doe = _greedy_diverse_selection(scored_doe, top_k)
     selected_static = scored_static[:top_k]
 
     selected_cases = {
+        "schema_version": ARTIFACT_SCHEMA_VERSION,
         "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "low_fidelity_selected_cases_for_high_fidelity_followup": True,
         "validated_physical_optima": False,
@@ -308,8 +362,7 @@ def rank_cases(doe_root, output_root=None, static_root=None, top_k=5,
                 "rank": i + 1,
                 "score": float(score),
                 "q": _parse_float(row.get("q")),
-                "thrust": _parse_float(row.get("thrust")),
-                "pressure_recovery": _parse_float(row.get("pressure_recovery")),
+                "tpr": _parse_float(row.get("tpr")),
                 "exit_mach": _parse_float(row.get("exit_mach")),
                 "case_relpath": str(Path("cases") / row.get("q", "")),
             }
@@ -318,6 +371,8 @@ def rank_cases(doe_root, output_root=None, static_root=None, top_k=5,
         "notes": [
             "Rankings derived from low-fidelity effective-area forcing data.",
             "Failed cases and warning-flagged cases are filtered or down-weighted.",
+            "epsilon=0 baselines are excluded unless explicitly requested.",
+            "DOE top-k uses a score/spread greedy selection in (q_offset, epsilon, frequency).",
             "These selections seed a later high-fidelity CFD workflow.",
         ],
     }
@@ -362,10 +417,10 @@ def main(argv=None):
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--weights", default=None,
                         help="Comma-separated key=value pairs to override scoring weights.")
-    parser.add_argument("--prefer-high-amplitude", action="store_true",
-                        help="Reverse the default 'low response amplitude is good' bias.")
-    parser.add_argument("--require-finite-phase", action="store_true",
-                        help="Exclude cases without a finite exit-Mach phase lag.")
+    parser.add_argument("--allow-missing-phase", action="store_true",
+                        help="Allow cases without a finite exit-Mach phase lag.")
+    parser.add_argument("--include-zero-eps", action="store_true",
+                        help="Allow epsilon=0 labeled baselines in unsteady candidates.")
     args = parser.parse_args(argv)
 
     rank_cases(
@@ -374,8 +429,8 @@ def main(argv=None):
         static_root=args.static_sweep_root,
         top_k=args.top_k,
         weights=parse_weights(args.weights),
-        low_amplitude_preferred=not args.prefer_high_amplitude,
-        require_finite_phase=args.require_finite_phase,
+        require_finite_phase=not args.allow_missing_phase,
+        include_zero_eps=args.include_zero_eps,
     )
 
 

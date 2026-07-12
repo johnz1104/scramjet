@@ -208,7 +208,8 @@ class GPSurrogate:
                 theta0 = rng.uniform(-2, 2, size=1 + self.ndim + 1)
 
             result = minimize(neg_log_marginal, theta0, method='L-BFGS-B',
-                              bounds=[(-5, 5)] * (1 + self.ndim + 1))
+                              bounds=[(-5, 5)] * (1 + self.ndim + 1),
+                              options={"maxiter": 100, "maxfun": 1000})
 
             if result.fun < best_nll:
                 best_nll = result.fun
@@ -290,21 +291,20 @@ class AcquisitionFunction:
 
 class BayesianOptimizer:
     """
-    Bayesian optimization loop with multi-fidelity ROM acceleration.
+    Full-fidelity GP adaptive sampling with POD-ROM prescreening.
 
     Strategy:
         1. Latin hypercube initial design (n_init full-solver evaluations)
         2. Build ROM from initial snapshots
-        3. Fit GP surrogate over all evaluated QoI
+        3. Fit the GP on full-solver evaluations only
         4. Loop:
-           a. Maximise EI acquisition function -> candidate x*
-           b. Evaluate ROM at x* (cheap)
-           c. If GP uncertainty at x* > threshold -> also run full solver
-           d. Update GP with new data
-           e. Optionally rebuild ROM every k iterations
+           a. Rank a candidate pool by expected improvement
+           b. Evaluate the top-m candidates with the state-derived POD ROM
+           c. Confirm the best ROM-predicted candidate with the full solver
+           d. Add only that full result to the GP
 
-    The GP is trained on thrust (or a weighted objective combining
-    thrust and Isp). The objective is MINIMISED (so we negate thrust).
+    The default objective maximises experiment-matched TPR.  Best tracking
+    contains full evaluations only, so the returned result is full-verified.
     """
 
     def __init__(self, design_space, base_config, rom_evaluator=None,
@@ -315,16 +315,14 @@ class BayesianOptimizer:
             base_config:       SolverConfig template
             rom_evaluator:     ROMEvaluator instance (pre-built or None)
             objective_weights: dict of QoI name -> weight for composite objective.
-                               Default: {'thrust': -1.0} (maximise thrust).
-                               Example: {'thrust': -1.0, 'Isp': -100.0}
+                               Default: {'tpr': -1.0} (maximise TPR).
         """
         self.space = design_space
         self.base_config = base_config
         self.rom = rom_evaluator
 
         if objective_weights is None:
-            # default: maximise thrust (negate for minimisation)
-            self.obj_weights = {'thrust': -1.0}
+            self.obj_weights = {'tpr': -1.0}
         else:
             self.obj_weights = objective_weights
 
@@ -344,12 +342,21 @@ class BayesianOptimizer:
         self.rom_time = 0.0
         self.n_full = 0
         self.n_rom = 0
+        self.n_full_optimizer = 0
+        self.n_full_rom_training = 0
+        self.rom_training_time = 0.0
+        self.n_prescreen_rounds = 0
+        self.prescreen_history = []
+        self.cost_report = {}
+        self.best_full_verified = False
 
     def _objective(self, qoi):
         """Compute scalar objective from QoI dict."""
         obj = 0.0
         for key, weight in self.obj_weights.items():
-            obj += weight * qoi.get(key, 0.0)
+            if key not in qoi or not np.isfinite(qoi[key]):
+                raise ValueError(f"objective QoI {key!r} is missing or non-finite")
+            obj += weight * qoi[key]
         return obj
 
     def _evaluate_full(self, params):
@@ -366,6 +373,7 @@ class BayesianOptimizer:
 
         self.full_solver_time += wall
         self.n_full += 1
+        self.n_full_optimizer += 1
 
         if np.any(np.isnan(solver.state.U)):
             return None
@@ -381,17 +389,16 @@ class BayesianOptimizer:
         self.n_rom += 1
         return qoi
 
-    def run(self, n_init=10, n_iter=40, uncertainty_threshold=0.3,
-            n_candidates=500, rebuild_rom_every=0, verbose=True):
+    def run(self, n_init=10, n_iter=40, n_candidates=500,
+            rom_top_m=5, verbose=True):
         """
         Execute the Bayesian optimization loop.
 
         Args:
             n_init:                 number of LHS initial evaluations (full solver)
             n_iter:                 number of BO iterations after init
-            uncertainty_threshold:  GP std/|mean| ratio above which full solver is used
             n_candidates:           number of candidate points for EI maximisation
-            rebuild_rom_every:      rebuild ROM every k iterations (0 = never)
+            rom_top_m:               EI-ranked candidates screened by the ROM
             verbose:                print progress
 
         Returns:
@@ -434,7 +441,7 @@ class BayesianOptimizer:
                 self.best_qoi = qoi.copy()
 
             if verbose:
-                print(f"    obj={obj:.4f}, thrust={qoi['thrust']:.2f}")
+                print(f"    obj={obj:.6f}, TPR={qoi['tpr']:.5f}")
 
         # build ROM from initial evaluations if not pre-built
         if self.rom is None:
@@ -443,9 +450,21 @@ class BayesianOptimizer:
             param_list = [self.space.to_params(x) for x in self.X_eval]
             self.rom.build(param_list)
 
+        self.n_full_rom_training = len(
+            getattr(getattr(self.rom, "collector", None), "snapshots", [])
+        )
+        self.rom_training_time = float(getattr(self.rom, "build_time", 0.0))
+
+        rom_keys = set(getattr(self.rom.reduced_solver, "param_keys", []))
+        if rom_keys != set(self.space.names):
+            raise ValueError(
+                "ROM training parameters must exactly match the BO design "
+                f"space; ROM={sorted(rom_keys)}, BO={sorted(self.space.names)}"
+            )
+
         # --- Phase 2: BO iterations ---
         if verbose:
-            print(f"\n--- BO iterations (ROM + selective full solver) ---")
+            print(f"\n--- Adaptive-sampling iterations (ROM prescreen + full confirmation) ---")
 
         for it in range(n_iter):
             # fit GP on all evaluations so far
@@ -461,24 +480,30 @@ class BayesianOptimizer:
 
             ei = AcquisitionFunction.expected_improvement(mu, var, self.best_y)
 
-            # select candidate with highest EI
-            best_idx = np.argmax(ei)
-            x_next = X_cand[best_idx]
-            params_next = self.space.to_params(x_next)
+            top_count = min(max(int(rom_top_m), 1), len(X_cand))
+            top_idx = np.argsort(ei)[-top_count:][::-1]
+            screened = []
+            for candidate_idx in top_idx:
+                x_screen = X_cand[candidate_idx]
+                params_screen = self.space.to_params(x_screen)
+                qoi_screen = self._evaluate_rom(params_screen)
+                screened.append((
+                    self._objective(qoi_screen), candidate_idx,
+                    x_screen, params_screen, qoi_screen,
+                ))
+            screened.sort(key=lambda item: item[0])
+            rom_obj, best_idx, x_next, params_next, qoi_rom = screened[0]
+            self.n_prescreen_rounds += 1
+            self.prescreen_history.append({
+                "iteration": int(it + 1),
+                "n_screened": int(top_count),
+                "selected_params": params_next.copy(),
+                "rom_objective": float(rom_obj),
+                "ei": float(ei[best_idx]),
+            })
 
-            # decide: ROM or full solver?
-            mu_next = mu[best_idx]
-            std_next = np.sqrt(var[best_idx])
-            rel_uncertainty = std_next / max(abs(mu_next), 1e-30)
-
-            use_full = rel_uncertainty > uncertainty_threshold
-
-            if use_full:
-                qoi = self._evaluate_full(params_next)
-                source = 'full'
-            else:
-                qoi = self._evaluate_rom(params_next)
-                source = 'rom'
+            qoi = self._evaluate_full(params_next)
+            source = 'full'
 
             if qoi is None:
                 continue
@@ -496,43 +521,71 @@ class BayesianOptimizer:
 
             if verbose and (it % 5 == 0 or it == n_iter - 1):
                 print(f"  Iter {it+1}/{n_iter}: obj={obj:.4f} "
-                      f"thrust={qoi['thrust']:.2f} "
-                      f"[{source}] EI={ei[best_idx]:.4e} "
-                      f"unc={rel_uncertainty:.3f}")
-
-            # optionally rebuild ROM
-            if rebuild_rom_every > 0 and (it + 1) % rebuild_rom_every == 0:
-                full_params = [
-                    self.space.to_params(self.X_eval[j])
-                    for j in range(len(self.X_eval))
-                    if self.source_eval[j] == 'full'
-                ]
-                if len(full_params) > 3:
-                    self.rom.build(full_params)
+                      f"TPR={qoi['tpr']:.5f} [full-confirmed] "
+                      f"EI={ei[best_idx]:.4e} ROM obj={rom_obj:.4f}")
 
         # --- Summary ---
-        total_time = self.full_solver_time + self.rom_time
+        total_time = (self.full_solver_time + self.rom_time
+                      + self.rom_training_time)
         pct_rom = self.n_rom / max(self.n_rom + self.n_full, 1) * 100
 
         print(f"\n{'='*60}")
         print("OPTIMIZATION COMPLETE")
         print(f"{'='*60}")
-        print(f"  Total evaluations: {len(self.X_eval)}")
-        print(f"    Full solver: {self.n_full} ({self.full_solver_time:.1f} s)")
-        print(f"    ROM:         {self.n_rom} ({self.rom_time:.3f} s)")
+        print(f"  Full optimizer evaluations: {self.n_full_optimizer} "
+              f"({self.full_solver_time:.1f} s)")
+        print(f"  Full ROM-training evaluations: {self.n_full_rom_training} "
+              f"(included in {self.rom_training_time:.1f} s build)")
+        print(f"  ROM prescreen evaluations: {self.n_rom} ({self.rom_time:.3f} s)")
         print(f"  ROM fraction:  {pct_rom:.1f}%")
         print(f"  Total time:    {total_time:.1f} s")
 
         best_params = self.space.to_params(self.best_x)
+        self.best_full_verified = True
         print(f"\n  Best design: {best_params}")
         print(f"  Best objective: {self.best_y:.4f}")
         print(f"  Best QoI: {self.best_qoi}")
 
-        # wall-time savings estimate
-        if self.n_full > 0:
-            t_full_only = (self.n_full + self.n_rom) * (self.full_solver_time / self.n_full)
-            savings = (1.0 - total_time / t_full_only) * 100
-            print(f"\n  Estimated wall-time savings vs full-solver-only: {savings:.0f}%")
+        full_times = []
+        if self.n_full_optimizer:
+            full_times.extend([
+                self.full_solver_time / self.n_full_optimizer
+            ] * self.n_full_optimizer)
+        collector = getattr(self.rom, "collector", None)
+        if collector is not None:
+            full_times.extend(float(v) for v in collector.wall_times)
+        mean_full_cost = float(np.mean(full_times)) if full_times else 0.0
+        standard_bo_cost = self.n_full_optimizer * mean_full_cost
+        equivalent_screen_count = (
+            max(self.n_full_optimizer - self.n_prescreen_rounds, 0)
+            + self.n_prescreen_rounds * max(int(rom_top_m), 1)
+        )
+        full_screen_cost = equivalent_screen_count * mean_full_cost
+        self.cost_report = {
+            "n_full_optimizer": int(self.n_full_optimizer),
+            "n_full_rom_training": int(self.n_full_rom_training),
+            "n_rom_prescreen": int(self.n_rom),
+            "full_optimizer_wall_s": float(self.full_solver_time),
+            "rom_training_wall_s": float(self.rom_training_time),
+            "rom_prescreen_wall_s": float(self.rom_time),
+            "total_including_training_wall_s": float(total_time),
+            "standard_bo_same_full_budget_wall_s": float(standard_bo_cost),
+            "overhead_vs_standard_bo_pct": (
+                float((total_time / standard_bo_cost - 1.0) * 100.0)
+                if standard_bo_cost > 0.0 else None
+            ),
+            "equivalent_top_m_full_screen_wall_s": float(full_screen_cost),
+            "saving_vs_equivalent_top_m_full_screen_pct": (
+                float((1.0 - total_time / full_screen_cost) * 100.0)
+                if full_screen_cost > 0.0 else None
+            ),
+            "comparison_note": (
+                "ROM prescreening adds overhead versus standard one-full-"
+                "candidate BO; savings apply only versus evaluating every "
+                "top-m shortlist candidate at full fidelity."
+            ),
+        }
+        print(f"\n  Cost accounting (training included): {self.cost_report}")
 
         return best_params, self.best_qoi
 
@@ -620,7 +673,7 @@ class PerformanceSweep:
         from rom import _clone_config, _apply_params, _compute_qoi
 
         if objective_weights is None:
-            objective_weights = {'thrust': -1.0}
+            objective_weights = {'tpr': -1.0}
 
         # build grid
         grids = [np.linspace(lo, hi, n_per_dim)
@@ -675,7 +728,7 @@ if __name__ == "__main__":
     cfg.n_steps = 80
     cfg.print_interval = 200
 
-    # design space: vary nozzle exit area and combustor length
+    # design space: vary the same parameters used to train the ROM
     space = DesignSpace([
         ('A_exit', 0.10, 0.20),
         ('L_nozzle', 0.25, 0.55),
@@ -709,6 +762,6 @@ if __name__ == "__main__":
     )
 
     print(f"\n  Best design: {best_params}")
-    print(f"  Best thrust: {best_qoi['thrust']:.2f} N")
+    print(f"  Best TPR: {best_qoi['tpr']:.5f}")
 
     print("\nOptimization standalone test complete.")

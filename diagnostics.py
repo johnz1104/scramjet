@@ -10,6 +10,56 @@ import numpy as np
 from physics import TransportProperties
 
 
+def physical_exit_index(mesh):
+    """Index of the last physical station (the final column is a BC image)."""
+    return mesh.nx - 2 if mesh.nx > 2 else mesh.nx - 1
+
+
+def transverse_average(values, mesh, weights=None):
+    """Wall-normal average with cell-width quadrature on stretched meshes."""
+    values = np.asarray(values, dtype=float)
+    quadrature = np.asarray(mesh.dy, dtype=float)
+    if weights is not None:
+        quadrature = quadrature * np.asarray(weights, dtype=float)
+    denominator = float(np.sum(quadrature))
+    if denominator <= 0.0:
+        return float(np.mean(values))
+    return float(np.sum(values * quadrature) / denominator)
+
+
+def primitives_from_state(U, gamma=1.4, R_gas=287.0):
+    """Extract primitive arrays from a conservative state tensor."""
+    rho = np.maximum(np.asarray(U[0], dtype=float), 1.0e-30)
+    u = np.asarray(U[1], dtype=float) / rho
+    v = np.asarray(U[2], dtype=float) / rho
+    E = np.asarray(U[3], dtype=float) / rho
+    Yf = np.asarray(U[4], dtype=float) / rho
+    p = (gamma - 1.0) * rho * (E - 0.5 * (u**2 + v**2))
+    p = np.maximum(p, 1.0e-30)
+    T = p / (rho * R_gas)
+    M = np.sqrt(u**2 + v**2) / np.sqrt(gamma * p / rho)
+    return rho, u, v, p, T, Yf, M
+
+
+def total_pressure_recovery_from_state(U, mesh, cfg):
+    """State-array implementation shared by full and reconstructed states."""
+    gamma = cfg.inlet.gamma
+    rho, u, v, p, T, Yf, M = primitives_from_state(
+        U, gamma=gamma, R_gas=cfg.inlet.R_gas,
+    )
+    i_exit = physical_exit_index(mesh)
+    factor = 1.0 + 0.5 * (gamma - 1.0) * M[i_exit, :]**2
+    p0_exit = p[i_exit, :] * factor ** (gamma / (gamma - 1.0))
+    mass_flux = np.maximum(rho[i_exit, :] * u[i_exit, :], 0.0)
+    p0_exit_avg = transverse_average(
+        p0_exit, mesh, weights=mass_flux,
+    )
+    inlet = cfg.inlet
+    f_inf = 1.0 + 0.5 * (gamma - 1.0) * inlet.mach**2
+    p0_inf = inlet.p_inf * f_inf ** (gamma / (gamma - 1.0))
+    return p0_exit_avg / max(p0_inf, 1.0e-30)
+
+
 def total_pressure_recovery(solver):
     """
     Total-pressure recovery: mass-flux-weighted exit p0 over freestream p0.
@@ -19,24 +69,19 @@ def total_pressure_recovery(solver):
     station is the last physical column (nx-2); column nx-1 is the outlet
     boundary-condition image.
     """
-    rho, u, v, p, T, Yf = solver.state.primitives()
-    M = solver.state.mach()
-    gamma = solver.cfg.inlet.gamma
+    return total_pressure_recovery_from_state(
+        solver.state.U, solver.mesh, solver.cfg,
+    )
 
-    i_exit = -2 if solver.mesh.nx > 2 else -1
-    factor = 1.0 + 0.5 * (gamma - 1.0) * M[i_exit, :]**2
-    p0_exit = p[i_exit, :] * factor ** (gamma / (gamma - 1.0))
 
-    w = np.maximum(rho[i_exit, :] * u[i_exit, :], 0.0)  # mass-flux weights
-    if np.sum(w) <= 0.0:
-        p0_exit_avg = float(np.mean(p0_exit))
-    else:
-        p0_exit_avg = float(np.sum(p0_exit * w) / np.sum(w))
-
-    inlet = solver.cfg.inlet
-    f_inf = 1.0 + 0.5 * (gamma - 1.0) * inlet.mach**2
-    p0_inf = inlet.p_inf * f_inf ** (gamma / (gamma - 1.0))
-    return p0_exit_avg / max(p0_inf, 1e-30)
+def shock_diagnostics_from_state(U, mesh, cfg, p0_loss_threshold=0.03):
+    """State-array shock detector shared by FOM and POD reconstructions."""
+    rho, u, v, p, T, Yf, M = primitives_from_state(
+        U, gamma=cfg.inlet.gamma, R_gas=cfg.inlet.R_gas,
+    )
+    return _shock_diagnostics_arrays(
+        p, M, mesh, cfg.inlet.gamma, p0_loss_threshold,
+    )
 
 
 def shock_diagnostics(solver, p0_loss_threshold=0.03):
@@ -58,10 +103,16 @@ def shock_diagnostics(solver, p0_loss_threshold=0.03):
     """
     rho, u, v, p, T, Yf = solver.state.primitives()
     M = solver.state.mach()
-    gamma = solver.cfg.inlet.gamma
-    j_mid = solver.mesh.ny // 2
-    x = solver.mesh.xc
-    nx = solver.mesh.nx
+    return _shock_diagnostics_arrays(
+        p, M, solver.mesh, solver.cfg.inlet.gamma, p0_loss_threshold,
+    )
+
+
+def _shock_diagnostics_arrays(p, M, mesh, gamma, p0_loss_threshold):
+    """Implementation for :func:`shock_diagnostics_from_state`."""
+    j_mid = mesh.ny // 2
+    x = mesh.xc
+    nx = mesh.nx
 
     M_line = M[:, j_mid]
     p0_line = (p[:, j_mid]

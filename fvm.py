@@ -719,7 +719,8 @@ class FVMResidual:
     the area-weighted conservative form
 
         d(A U)/dt + d(A F)/dx + A dG/dy = S_geo,
-        S_geo = [0, p dA/dx, 0, 0, 0] (+ the -U dA/dt term for breathing walls),
+        S_geo = [0, p dA/dx, 0, 0, 0]
+                - (dA/dt) [rho, rho*u, rho*v, rho*E + p, rho*Yf],
 
     discretised so that (i) rho*u*A telescopes exactly at steady state
     (discrete mass conservation) and (ii) a stagnant uniform-pressure state
@@ -732,7 +733,8 @@ class FVMResidual:
     to the domain extent in the reconstruction direction.
     """
 
-    def __init__(self, mesh, gamma=1.4, eps2_scale=1.0, geometry=None):
+    def __init__(self, mesh, gamma=1.4, eps2_scale=1.0, geometry=None,
+                 legacy_breathing_energy=False):
         """
         Args:
             mesh:       StructuredMesh2D instance
@@ -741,11 +743,16 @@ class FVMResidual:
             geometry:   optional area-law object with area(x)/area_gradient(x)
                         (GeometryProfile-compatible). Enables the quasi-1D
                         variable-area coupling.
+            legacy_breathing_energy: reproduce the historically incorrect
+                        energy source ``-(A_t/A) rhoE`` instead of the
+                        moving-wall work source ``-(A_t/A) (rhoE+p)``.
+                        This exists only for before/after research audits.
         """
         self.mesh = mesh
         self.gamma = gamma
         self.n_vars = StateVector.N_VARS
         self.eps2_scale = float(eps2_scale)
+        self.legacy_breathing_energy = bool(legacy_breathing_energy)
 
         # relative grid spacings for the limiter smoothing
         Lx = float(mesh.x_nodes[-1] - mesh.x_nodes[0])
@@ -825,10 +832,14 @@ class FVMResidual:
             coeff = (self.A_face[1:] - self.A_face[:-1]) / (self.A_cell * self.mesh.dx)
             dUdt[1] += coeff[:, np.newaxis] * p
 
-            # breathing-wall volume term: d(AU)/dt = A dU/dt + U dA/dt
+            # Moving-control-volume source.  The pressure-work contribution
+            # in energy is essential: a uniform static gas then follows the
+            # isentropic law p*A**gamma = const under prescribed breathing.
             if np.any(self.dAdt_cell != 0.0):
                 rate = (self.dAdt_cell / self.A_cell)[:, np.newaxis]
                 dUdt -= rate * U
+                if not self.legacy_breathing_energy:
+                    dUdt[3] -= rate * p
 
         return dUdt
 

@@ -5,3 +5,7 @@ runs/
 reports/
 CLAUDE.md
 debug_log.md
+*.msh
+processor*/
+**/constant/polyMesh/
+log.*

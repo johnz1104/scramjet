@@ -1,70 +1,62 @@
+"""Time-aligned response estimators for periodic effective-area studies.
+
+Each signal is fitted against its own timestamps.  The phase convention is
+
+    phase_lag = wrap(forcing_phase - response_phase),
+
+so a response delayed in time has a positive phase lag.  Periodic amplitude
+and phase are reported only when the same cycle, sample-count, sampling-density
+and flat-signal guards are satisfied; raw fit values remain available for
+diagnosis but must not enter surrogates.
 """
-Response metric extraction for unsteady effective-area forcing runs.
-
-This is a reduced-fidelity workflow helper. Given time histories of the
-sinusoidal forcing q(t) and selected QoI time series, it returns scalar
-metrics (mean, amplitude, phase lag) for trend studies and surrogate
-fitting. It does not claim to be a frequency-resolved system-identification
-tool, and it deliberately reports null/NaN for phase lag when the data are
-too short, too noisy, or have zero forcing amplitude.
-
-The extractor is reused by:
-    experiments/run_unsteady_area_breathing.py
-    experiments/run_parametric_unsteady_doe.py
-"""
-from __future__ import annotations
-
 import math
 from typing import Iterable, List, Optional
 
 import numpy as np
 
 
-DEFAULT_QOI_KEYS = ("exit_mach", "max_mach", "pressure_recovery", "tpr",
-                    "shock_x", "mdot", "thrust")
-DEFAULT_PROBE_FIELDS = ("pressure",)
+DEFAULT_QOI_KEYS = (
+    "exit_mach", "max_mach", "pressure_recovery", "tpr", "shock_x",
+    "mdot_prescribed", "mdot_exit", "mass_defect", "thrust",
+)
 
 
 def wrap_phase(angle_rad: float) -> float:
     """Wrap an angle to (-pi, pi]."""
     wrapped = (float(angle_rad) + math.pi) % (2.0 * math.pi) - math.pi
-    if wrapped == -math.pi:
-        return math.pi
-    return wrapped
+    return math.pi if wrapped == -math.pi else wrapped
 
 
 def _rows_to_array(rows: Iterable[dict], key: str) -> np.ndarray:
-    """Pull `key` from each dict; return float array."""
-    return np.array([float(r[key]) for r in rows], dtype=float)
+    return np.asarray([float(row[key]) for row in rows], dtype=float)
 
 
-def _drop_transient(rows: List[dict], discard_fraction: float) -> List[dict]:
-    """Return rows after dropping the first ``discard_fraction`` of them."""
-    if discard_fraction <= 0.0:
-        return list(rows)
+def _drop_transient_by_time(rows: List[dict], discard_fraction: float) -> List[dict]:
+    """Drop a leading fraction of physical duration, not row count."""
+    rows = list(rows)
+    if not rows or discard_fraction <= 0.0:
+        return rows
     if discard_fraction >= 1.0:
         return []
-    start = int(len(rows) * float(discard_fraction))
-    return list(rows[start:])
+    times = _rows_to_array(rows, "time")
+    if not np.all(np.isfinite(times)) or np.any(np.diff(times) < 0.0):
+        return []
+    cutoff = times[0] + float(discard_fraction) * (times[-1] - times[0])
+    return [row for row in rows if float(row["time"]) >= cutoff]
 
 
 def _safe_lstsq(basis: np.ndarray, y: np.ndarray):
-    """Solve least squares without crashing on rank-deficient inputs."""
     coeff, _, _, _ = np.linalg.lstsq(basis, y, rcond=None)
     return coeff
 
 
 def _amplitude_phase_from_coeffs(coeff_sin: float, coeff_cos: float):
-    """Convert sin/cos fit to amplitude and phase angle."""
     amplitude = float(math.hypot(coeff_sin, coeff_cos))
-    if amplitude == 0.0:
-        return 0.0, 0.0
-    phase = float(math.atan2(coeff_cos, coeff_sin))
+    phase = 0.0 if amplitude == 0.0 else float(math.atan2(coeff_cos, coeff_sin))
     return amplitude, phase
 
 
 def _is_flat(values: np.ndarray, rel_tol: float = 1.0e-9) -> bool:
-    """Detect a numerically constant signal."""
     if values.size == 0:
         return True
     spread = float(np.max(values) - np.min(values))
@@ -72,11 +64,9 @@ def _is_flat(values: np.ndarray, rel_tol: float = 1.0e-9) -> bool:
     return spread <= rel_tol * scale
 
 
-def _phase_lag_is_supported(forcing_amplitude: float, n_cycles: float,
-                            n_samples: int, min_cycles: float, min_samples: int,
-                            forcing_flat: bool, response_flat: bool,
-                            min_samples_per_cycle: float = 4.0):
-    """Return (supported, reason)."""
+def _support_check(forcing_amplitude, n_cycles, n_samples, min_cycles,
+                   min_samples, forcing_flat, response_flat,
+                   min_samples_per_cycle=4.0):
     if forcing_flat or forcing_amplitude <= 1.0e-12:
         return False, "epsilon=0 or numerically flat forcing"
     if response_flat:
@@ -86,234 +76,237 @@ def _phase_lag_is_supported(forcing_amplitude: float, n_cycles: float,
     if n_samples < min_samples:
         return False, f"insufficient samples: {n_samples} < {min_samples}"
     if n_cycles > 0.0 and n_samples / n_cycles < min_samples_per_cycle:
-        return False, (f"insufficient sampling density: "
-                       f"{n_samples / n_cycles:.1f} samples/cycle < "
-                       f"{min_samples_per_cycle} (aliasing risk)")
+        density = n_samples / n_cycles
+        return False, (
+            f"insufficient sampling density: {density:.1f} samples/cycle < "
+            f"{min_samples_per_cycle} (aliasing risk)"
+        )
     return True, ""
 
 
-def _phase_lag_metric(t: np.ndarray, y: np.ndarray, omega: float,
-                      forcing_phase: float, forcing_amplitude: float,
-                      forcing_is_flat: bool, n_cycles: float,
-                      min_cycles: float, min_samples: int):
-    """Estimate phase lag of y(t) relative to q(t).
-
-    Returns (amplitude, mean, phase_lag_rad, warning_or_empty).
-    Phase lag is wrapped to (-pi, pi] and None when not supported.
-    """
-    basis = np.column_stack([np.sin(omega * t), np.cos(omega * t), np.ones_like(t)])
+def _periodic_fit(t, y, omega):
+    """Fit sin/cos + intercept + centered linear drift and report quality."""
+    t = np.asarray(t, dtype=float)
+    y = np.asarray(y, dtype=float)
+    t_center = float(np.mean(t))
+    tau = t - t_center
+    basis = np.column_stack([
+        np.sin(omega * t), np.cos(omega * t), np.ones_like(t), tau,
+    ])
     coeff = _safe_lstsq(basis, y)
-    amplitude, phase = _amplitude_phase_from_coeffs(float(coeff[0]), float(coeff[1]))
-    mean = float(coeff[2])
-    response_flat = _is_flat(y) or amplitude <= 1.0e-14 * max(abs(mean), 1.0)
-    supported, reason = _phase_lag_is_supported(
-        forcing_amplitude=forcing_amplitude,
-        n_cycles=n_cycles, n_samples=len(t),
-        min_cycles=min_cycles, min_samples=min_samples,
-        forcing_flat=forcing_is_flat, response_flat=response_flat,
+    fitted = basis @ coeff
+    residual = y - fitted
+    amplitude, phase = _amplitude_phase_from_coeffs(coeff[0], coeff[1])
+    residual_rms = float(np.sqrt(np.mean(residual**2)))
+    centered = y - np.mean(y)
+    ss_total = float(np.sum(centered**2))
+    ss_residual = float(np.sum(residual**2))
+    r_squared = (1.0 - ss_residual / ss_total
+                 if ss_total > 1.0e-30 else float(ss_residual <= 1.0e-30))
+    duration = float(t[-1] - t[0]) if len(t) >= 2 else 0.0
+    drift_span = abs(float(coeff[3]) * duration)
+    drift_fraction = drift_span / max(amplitude, 1.0e-30)
+    snr = amplitude / max(residual_rms, 1.0e-30)
+    return {
+        "mean": float(coeff[2]),
+        "raw_amplitude": amplitude,
+        "phase_rad": phase,
+        "slope_per_s": float(coeff[3]),
+        "quality": {
+            "r_squared": float(r_squared),
+            "residual_rms": residual_rms,
+            "drift_fraction": float(drift_fraction),
+            "snr": float(snr),
+        },
+    }
+
+
+def _fit_response(rows, field, omega, frequency_hz, forcing_fit,
+                  min_cycles, min_samples):
+    t = _rows_to_array(rows, "time")
+    y = _rows_to_array(rows, field)
+    fit = _periodic_fit(t, y, omega)
+    duration = float(t[-1] - t[0]) if len(t) >= 2 else 0.0
+    cycles = float(frequency_hz) * duration
+    response_flat = (_is_flat(y) or fit["raw_amplitude"]
+                     <= 1.0e-14 * max(abs(fit["mean"]), 1.0))
+    supported, reason = _support_check(
+        forcing_fit["raw_amplitude"], cycles, len(t), min_cycles,
+        min_samples, forcing_fit["flat"], response_flat,
     )
-    if not supported:
-        return amplitude, mean, None, reason
-    # wrap so surrogates trained on phase lag never see spurious 2*pi jumps
-    return amplitude, mean, wrap_phase(phase - forcing_phase), ""
+    fit["quality"].update({
+        "supported": bool(supported),
+        "reason": reason,
+        "n_samples": int(len(t)),
+        "n_cycles": cycles,
+        "duration": duration,
+    })
+    fit["amplitude"] = fit["raw_amplitude"] if supported else None
+    fit["phase_lag_vs_q_rad"] = (
+        wrap_phase(forcing_fit["phase_rad"] - fit["phase_rad"])
+        if supported else None
+    )
+    fit["warning"] = reason
+    return fit
 
 
-def _probe_pressure_field_names(probe_rows: List[dict]) -> List[str]:
-    """Return all field names ending with ``_pressure``."""
-    if not probe_rows:
+def _probe_pressure_field_names(rows):
+    if not rows:
         return []
-    return [k for k in probe_rows[0].keys() if k.endswith("_pressure")]
+    return [key for key in rows[0] if key.endswith("_pressure")]
 
 
 def extract_response_metrics(qoi_rows: List[dict],
-                              forcing_rows: List[dict],
-                              probe_rows: Optional[List[dict]] = None,
-                              frequency_hz: float = 0.0,
-                              discard_fraction: float = 0.25,
-                              qoi_keys: Iterable[str] = DEFAULT_QOI_KEYS,
-                              min_cycles: float = 1.0,
-                              min_samples: int = 8) -> dict:
-    """Extract mean/amplitude/phase-lag metrics from unsteady histories.
+                             forcing_rows: List[dict],
+                             probe_rows: Optional[List[dict]] = None,
+                             frequency_hz: float = 0.0,
+                             discard_fraction: float = 0.25,
+                             qoi_keys: Iterable[str] = DEFAULT_QOI_KEYS,
+                             min_cycles: float = 1.0,
+                             min_samples: int = 8) -> dict:
+    """Extract drift-aware periodic metrics using each series' own times.
 
-    Args:
-        qoi_rows: list of dicts with keys "time" + QoI fields.
-        forcing_rows: list of dicts with keys "time" and "q".
-        probe_rows: optional list with "*_pressure" entries.
-        frequency_hz: forcing frequency [Hz]; <=0 disables sinusoidal fitting.
-        discard_fraction: fraction of leading samples treated as transient.
-        qoi_keys: QoI field names to extract from ``qoi_rows``.
-        min_cycles: minimum number of forcing cycles required for phase lag.
-        min_samples: minimum post-transient sample count for phase lag.
-
-    Returns:
-        dict with structure:
-            {
-              "transient_discard_fraction": float,
-              "n_samples_after_transient": int,
-              "n_cycles_after_transient": float,
-              "forcing": {"mean": ..., "amplitude": ..., "phase_rad": ...},
-              "qoi": {<key>: {"mean", "amplitude", "phase_lag_vs_q_rad", "warning"}},
-              "probes": {<name>: {"pressure_mean", "pressure_amplitude",
-                                  "pressure_phase_lag_vs_q_rad", "warning"}},
-              "warnings": [...],
-              "notes": [...],
-              "stability": {"qoi_finite": bool, "forcing_finite": bool}
-            }
-        Phase-lag entries are None when not robustly supported.
+    A positive ``phase_lag_vs_q_rad`` means the response is delayed relative
+    to the forcing.  Unsupported periodic amplitudes and phases are ``None``;
+    ``raw_amplitude`` and the quality block remain for diagnostics.
     """
     qoi_keys = list(qoi_keys)
-    warnings: List[str] = []
-    notes: List[str] = []
-
+    warnings = []
+    notes = []
     base = {
         "transient_discard_fraction": float(discard_fraction),
+        "transient_cut_method": "physical_time",
         "n_samples_after_transient": 0,
         "n_cycles_after_transient": 0.0,
-        "forcing": {"mean": None, "amplitude": None, "phase_rad": None},
-        "qoi": {key: {"mean": None, "amplitude": None,
-                      "phase_lag_vs_q_rad": None, "warning": ""}
-                for key in qoi_keys},
+        "forcing": {
+            "mean": None, "amplitude": None, "raw_amplitude": None,
+            "phase_rad": None, "quality": {"supported": False},
+        },
+        "qoi": {
+            key: {
+                "mean": None, "amplitude": None, "raw_amplitude": None,
+                "phase_lag_vs_q_rad": None, "warning": "",
+                "quality": {"supported": False},
+            } for key in qoi_keys
+        },
         "probes": {},
         "warnings": warnings,
         "notes": notes,
         "stability": {"qoi_finite": True, "forcing_finite": True},
     }
-
     if not qoi_rows or not forcing_rows:
         warnings.append("no time-history samples provided")
         return base
 
-    n_total = min(len(qoi_rows), len(forcing_rows))
-    qoi_trim = _drop_transient(qoi_rows[:n_total], discard_fraction)
-    force_trim = _drop_transient(forcing_rows[:n_total], discard_fraction)
-    probe_trim = _drop_transient((probe_rows or [])[:n_total], discard_fraction) if probe_rows else []
+    qoi_trim = _drop_transient_by_time(qoi_rows, discard_fraction)
+    forcing_trim = _drop_transient_by_time(forcing_rows, discard_fraction)
+    probe_trim = _drop_transient_by_time(probe_rows or [], discard_fraction)
     base["n_samples_after_transient"] = len(qoi_trim)
-
-    if len(qoi_trim) < 2 or len(force_trim) < 2:
-        warnings.append("post-transient window is too short for any fitting")
+    if len(qoi_trim) >= 2 and frequency_hz > 0.0:
+        t_q = _rows_to_array(qoi_trim, "time")
+        base["n_cycles_after_transient"] = float(frequency_hz) * (t_q[-1] - t_q[0])
+    if len(qoi_trim) < 2 or len(forcing_trim) < 2:
+        warnings.append("post-transient window is too short for fitting")
         return base
 
-    t = _rows_to_array(qoi_trim, "time")
-    q = _rows_to_array(force_trim, "q")
-    duration = float(t[-1] - t[0]) if len(t) >= 2 else 0.0
-    n_cycles = float(frequency_hz) * duration if frequency_hz > 0.0 else 0.0
-    base["n_cycles_after_transient"] = n_cycles
-
-    if not np.all(np.isfinite(q)):
-        warnings.append("forcing history contains non-finite values")
+    t_force = _rows_to_array(forcing_trim, "time")
+    q = _rows_to_array(forcing_trim, "q")
+    if not np.all(np.isfinite(q)) or not np.all(np.isfinite(t_force)):
         base["stability"]["forcing_finite"] = False
-    forcing_mean = float(np.mean(q))
+        warnings.append("forcing history contains non-finite values")
+        return base
 
     if frequency_hz <= 0.0:
-        notes.append("frequency_hz <= 0: skipping sinusoidal fit, mean only")
-        base["forcing"] = {"mean": forcing_mean,
-                           "amplitude": 0.0, "phase_rad": None}
+        base["forcing"] = {
+            "mean": float(np.mean(q)), "amplitude": None,
+            "raw_amplitude": float(np.std(q)), "phase_rad": None,
+            "quality": {"supported": False,
+                        "reason": "frequency_hz <= 0"},
+        }
+        notes.append("frequency_hz <= 0: periodic amplitude/phase undefined")
         for key in qoi_keys:
             if key not in qoi_trim[0]:
                 continue
             y = _rows_to_array(qoi_trim, key)
-            if not np.all(np.isfinite(y)):
-                warnings.append(f"qoi.{key} contains non-finite values")
-                base["stability"]["qoi_finite"] = False
-                base["qoi"][key]["warning"] = "non-finite values present"
-                continue
-            base["qoi"][key] = {
-                "mean": float(np.mean(y)),
-                "amplitude": float(np.std(y)),
-                "phase_lag_vs_q_rad": None,
-                "warning": "phase lag undefined for non-periodic forcing",
-            }
-        for field in _probe_pressure_field_names(probe_trim):
-            y = _rows_to_array(probe_trim, field)
-            base["probes"][_strip_pressure(field)] = {
-                "pressure_mean": float(np.mean(y)) if y.size else None,
-                "pressure_amplitude": float(np.std(y)) if y.size else None,
-                "pressure_phase_lag_vs_q_rad": None,
-                "warning": "phase lag undefined for non-periodic forcing",
-            }
+            base["qoi"][key].update({
+                "mean": float(np.mean(y)), "raw_amplitude": float(np.std(y)),
+                "warning": "periodic response undefined for non-periodic forcing",
+                "quality": {"supported": False,
+                            "reason": "frequency_hz <= 0"},
+            })
         return base
 
     omega = 2.0 * math.pi * float(frequency_hz)
-    basis = np.column_stack([np.sin(omega * t), np.cos(omega * t), np.ones_like(t)])
-    q_coeff = _safe_lstsq(basis, q)
-    forcing_amplitude, forcing_phase = _amplitude_phase_from_coeffs(
-        float(q_coeff[0]), float(q_coeff[1]),
+    forcing_fit = _periodic_fit(t_force, q, omega)
+    force_duration = float(t_force[-1] - t_force[0])
+    force_cycles = float(frequency_hz) * force_duration
+    forcing_flat = _is_flat(q)
+    forcing_supported, forcing_reason = _support_check(
+        forcing_fit["raw_amplitude"], force_cycles, len(t_force), min_cycles,
+        min_samples, forcing_flat, False,
     )
-    forcing_is_flat = _is_flat(q)
-    base["forcing"] = {
-        "mean": float(q_coeff[2]),
-        "amplitude": forcing_amplitude,
-        "phase_rad": float(forcing_phase),
-    }
-
-    if forcing_is_flat or forcing_amplitude <= 1.0e-12:
-        notes.append("epsilon=0 detected (flat or numerically zero forcing); phase lag is null")
+    forcing_fit["flat"] = forcing_flat
+    forcing_fit["amplitude"] = forcing_fit["raw_amplitude"]
+    forcing_fit["quality"].update({
+        "supported": bool(forcing_supported), "reason": forcing_reason,
+        "n_samples": int(len(t_force)), "n_cycles": force_cycles,
+        "duration": force_duration,
+    })
+    base["forcing"] = {key: value for key, value in forcing_fit.items()
+                       if key != "flat"}
+    if forcing_flat:
+        notes.append("epsilon=0 detected; periodic response metrics are unsupported")
 
     for key in qoi_keys:
-        if not qoi_trim or key not in qoi_trim[0]:
+        if key not in qoi_trim[0]:
             continue
         y = _rows_to_array(qoi_trim, key)
-        if not np.all(np.isfinite(y)):
-            warnings.append(f"qoi.{key} contains non-finite values")
+        t = _rows_to_array(qoi_trim, "time")
+        if not np.all(np.isfinite(y)) or not np.all(np.isfinite(t)):
             base["stability"]["qoi_finite"] = False
             base["qoi"][key]["warning"] = "non-finite values present"
+            warnings.append(f"qoi.{key} contains non-finite values")
             continue
-        amplitude, mean, phase_lag, reason = _phase_lag_metric(
-            t=t, y=y, omega=omega, forcing_phase=forcing_phase,
-            forcing_amplitude=forcing_amplitude,
-            forcing_is_flat=forcing_is_flat,
-            n_cycles=n_cycles, min_cycles=min_cycles, min_samples=min_samples,
+        entry = _fit_response(
+            qoi_trim, key, omega, frequency_hz, forcing_fit,
+            min_cycles, min_samples,
         )
-        entry = {
-            "mean": mean,
-            "amplitude": amplitude,
-            "phase_lag_vs_q_rad": phase_lag,
-            "warning": reason,
-        }
-        if phase_lag is None and reason:
-            warnings.append(f"qoi.{key}: phase lag unavailable ({reason})")
         base["qoi"][key] = entry
+        if not entry["quality"]["supported"]:
+            warnings.append(f"qoi.{key}: response unavailable ({entry['warning']})")
 
     for field in _probe_pressure_field_names(probe_trim):
         y = _rows_to_array(probe_trim, field)
-        if not np.all(np.isfinite(y)):
+        t = _rows_to_array(probe_trim, "time")
+        if not np.all(np.isfinite(y)) or not np.all(np.isfinite(t)):
             warnings.append(f"probe.{field} contains non-finite values")
             continue
-        amplitude, mean, phase_lag, reason = _phase_lag_metric(
-            t=t, y=y, omega=omega, forcing_phase=forcing_phase,
-            forcing_amplitude=forcing_amplitude,
-            forcing_is_flat=forcing_is_flat,
-            n_cycles=n_cycles, min_cycles=min_cycles, min_samples=min_samples,
+        entry = _fit_response(
+            probe_trim, field, omega, frequency_hz, forcing_fit,
+            min_cycles, min_samples,
         )
-        probe_name = _strip_pressure(field)
-        base["probes"][probe_name] = {
-            "pressure_mean": mean,
-            "pressure_amplitude": amplitude,
-            "pressure_phase_lag_vs_q_rad": phase_lag,
-            "warning": reason,
+        name = _strip_pressure(field)
+        base["probes"][name] = {
+            "pressure_mean": entry["mean"],
+            "pressure_amplitude": entry["amplitude"],
+            "pressure_raw_amplitude": entry["raw_amplitude"],
+            "pressure_phase_lag_vs_q_rad": entry["phase_lag_vs_q_rad"],
+            "slope_per_s": entry["slope_per_s"],
+            "quality": entry["quality"],
+            "warning": entry["warning"],
         }
-        if phase_lag is None and reason:
-            warnings.append(f"probe.{probe_name}: phase lag unavailable ({reason})")
-
+        if not entry["quality"]["supported"]:
+            warnings.append(f"probe.{name}: response unavailable ({entry['warning']})")
     return base
 
 
 def _strip_pressure(field: str) -> str:
-    """``inlet_side_pressure`` -> ``inlet_side``."""
-    if field.endswith("_pressure"):
-        return field[: -len("_pressure")]
-    return field
+    return field[:-len("_pressure")] if field.endswith("_pressure") else field
 
 
 def fit_sinusoid(t: np.ndarray, y: np.ndarray, frequency_hz: float):
-    """Convenience utility for the unit tests.
-
-    Returns (mean, amplitude, phase_rad).
-    """
+    """Return (mean, amplitude, phase) from the drift-aware periodic fit."""
     t = np.asarray(t, dtype=float)
     y = np.asarray(y, dtype=float)
-    omega = 2.0 * math.pi * float(frequency_hz)
-    basis = np.column_stack([np.sin(omega * t), np.cos(omega * t), np.ones_like(t)])
-    coeff = _safe_lstsq(basis, y)
-    amplitude, phase = _amplitude_phase_from_coeffs(float(coeff[0]), float(coeff[1]))
-    return float(coeff[2]), amplitude, float(phase)
+    fit = _periodic_fit(t, y, 2.0 * math.pi * float(frequency_hz))
+    return fit["mean"], fit["raw_amplitude"], fit["phase_rad"]

@@ -2,6 +2,10 @@
 
 ## Overview
 
+The implementation decisions, quantified old/new reassessment, hypothesis
+positioning, and remaining Paper-1 critical path are recorded in
+[`RESEARCH_REPORT.md`](RESEARCH_REPORT.md).
+
 A **scramjet** (supersonic combustion ramjet) is an air-breathing engine for
 sustained flight above roughly Mach 5. It carries no rotating compressor: at
 hypersonic speed the inlet geometry alone compresses and decelerates the
@@ -24,8 +28,9 @@ inlet unstart at angle of attack) and Bhattrai et al. [2] (aeroelastic response
 of a compression-ramp intake), as well as general parametrized geometries:
 sweeping the static wall position spans a family of inlet contractions, and
 varying the oscillatory wall motion spans a family of unsteady regimes.
-High-fidelity, body-fitted simulations are run in OpenFOAM; the model in this
-repository resolves the quasi-1D compressible dynamics and the geometry and
+High-fidelity, body-fitted simulations are planned in OpenFOAM; no exported
+case has yet been meshed, run, and postprocessed in this repository. The model
+here resolves the quasi-1D compressible dynamics and the geometry and
 forcing parameter space that frame those simulations.
 
 ## Research direction
@@ -51,8 +56,8 @@ Two coupled questions drive the work.
 
 Mapping a wide parameter space with the full model would be expensive, so two
 reduced representations carry most of the load: a proper-orthogonal-
-decomposition (POD) model [5], and a multi-fidelity Bayesian optimizer with a
-response surrogate [6], reframed here as **adaptive sampling**: they
+decomposition (POD) reconstruction [5], a full-fidelity GP with ROM
+prescreening, and a response surrogate [6], framed as **adaptive sampling**: they
 concentrate the costly, body-fitted OpenFOAM cases on the configurations the
 study flags as significant.
 
@@ -112,7 +117,7 @@ with a quasi-1D variable-area coupling, written for the conservative state
 
 ```math
 S_{\text{geo}} = p\,\partial_x A\,[0,\,1,\,0,\,0,\,0]^\top
-\;-\; \partial_t A \, U .
+\;-\; \partial_t A\,[\rho,\,\rho u,\,\rho v,\,\rho E+p,\,\rho Y_f]^\top .
 ```
 
 The pressure–area force `p ∂A/∂x` is the only geometric source the
@@ -121,10 +126,12 @@ equivalent plain-state form carries geometric sources in **every** equation,
 `S = -(A'/A)\,u\,[\rho,\ \rho u,\ \rho v,\ \rho E + p,\ \rho Y_f]`. Both forms
 are implemented (the conservative form is the solver's primary path; the
 source-vector form is kept as an independent cross-check, and a validation test
-holds the two in agreement). The `∂A/∂t` term is the quasi-1D counterpart of
-the mesh-motion (geometric-conservation) term: for a breathing wall it is
-leading-order at the studied frequencies and represents the volume change the
-moving surface imposes on the flow.
+holds the two in agreement). The `∂A/∂t` term is the quasi-1D moving-control-
+volume source. Its energy row contains wall-pressure work `-p A_t/A`: a
+uniform static gas therefore follows `rho ∝ A^-1`, `p ∝ A^-gamma`, and
+`T ∝ A^-(gamma-1)`. Omitting that work gives the wrong isothermal-like
+`p ∝ A^-1` response. The `legacy_breathing_energy` switch exists only for
+before/after audits and must not be used for research results.
 
 For a supersonic stream this coupling reproduces the area–Mach behavior that
 governs the inlet: a decreasing area (`dA/dx < 0`) **decelerates and
@@ -178,7 +185,17 @@ experiments measure:
   destruction (smooth isentropic compression conserves `p0`; shocks do not)
   and refined by the sonic crossing;
 - wall/probe pressures, response amplitude, and phase lag (wrapped to
-  `(-pi, pi]`) from `response_metrics.py`.
+  `(-pi, pi]`) from `response_metrics.py`. Positive lag means the response is
+  delayed relative to the forcing. Each signal is fitted against its own
+  timestamps with a drift term; amplitude and phase are admitted only when
+  cycle/sample/aliasing guards pass. R², residual RMS, drift fraction, and
+  signal-to-residual ratio are recorded.
+
+The supersonic inlet is Dirichlet, so inlet flow is named
+`mdot_prescribed`; it cannot reproduce spillage or mass-capture collapse.
+`mdot_exit` and `mass_defect` diagnose conservation. Unstart is observable at
+trend level through shock expulsion toward the inlet and TPR collapse. A
+spillage-capable inlet boundary or external-flow coupling remains future work.
 
 **Extended capabilities** kept compiled-in but outside the paper scope:
 thrust/Isp engine QoIs (the legacy `pressure_recovery` output is the *static*
@@ -206,15 +223,19 @@ record probe histories at the inlet, throat, combustor, and exit.
 
 The compressible model is paired with two reduced representations:
 
-- A **POD reduced-order model** over the geometry axis. Converged snapshots at
+- A **coefficient-interpolated POD reduced-order model** over the geometry axis. Converged snapshots at
   several `q` (and, optionally, exit area, nozzle length, and combustor length)
   are assembled into a snapshot matrix, truncated by SVD at a cumulative-energy
-  threshold, and interpolated in coefficient space.
-- A **multi-fidelity Bayesian optimizer and response surrogate**. A Gaussian
-  process with an ARD-RBF kernel and Expected-Improvement acquisition searches
-  the geometry space, routing most evaluations through the reduced-order model
-  and falling back to the full solver when the predictive uncertainty is high
-  [6]. The unsteady design of experiments over `(q_offset, eps, f, phase)` is
+  threshold, and interpolated in coefficient space. Primary QoIs are computed
+  from the reconstructed conservative state; direct IDW interpolation of the
+  training QoIs is retained only as a comparison baseline. This is not a
+  Galerkin/DEIM or time-accurate ROM.
+- A **GP adaptive-sampling loop with ROM prescreening**, plus a response
+  surrogate. The GP is trained on full-solver evaluations only. Expected
+  Improvement ranks a candidate pool, the POD ROM screens the top `m`, and one
+  selected point is confirmed by the full solver; the returned best point is
+  full-verified by construction. The unsteady design of experiments over
+  `(q_offset, eps, f, phase)` is
   summarized by a scalar response surrogate, with ridge-regression and
   inverse-distance fallbacks when samples are scarce.
 
@@ -224,8 +245,11 @@ for OpenFOAM and FUN3D as an area profile, a wall contour, freestream and
 derived stagnation conditions, shared quantity-of-interest definitions, a
 structured **Gmsh** mesh definition (`.geo`, transfinite quads, named physical
 groups), and an **OpenFOAM case template** (`rhoCentralFoam`-style `0/`,
-`constant/`, `system/`, and an `Allrun.sh` driver) — review the emitted
-dictionaries against your pinned OpenFOAM version before production runs.
+`constant/`, `system/`, and a `pipefail`-safe `Allrun.sh` driver), sampling
+function objects, and an executable `postprocess_qoi.py` that writes the shared
+schema-v2 TPR/shock QoIs. This is designed for apples-to-apples comparison;
+the loop is not yet closed. Review the dictionaries against the pinned
+OpenFOAM version before production runs.
 
 **Scope.** The model resolves inviscid, quasi-1D compressible duct dynamics
 with the variable-area coupling, plus optional molecular diffusion and
@@ -233,7 +257,7 @@ reduced-order heat sources. Effects that require a body-fitted, turbulent, or
 moving-mesh treatment — resolved boundary layers and shock/boundary-layer
 interaction, turbulent separation, wall heat transfer, body-fitted moving-wall
 kinematics, angle-of-attack three-dimensionality, and finite-rate chemistry —
-are computed in the high-fidelity OpenFOAM cases. The reduced-order results
+will be computed in high-fidelity OpenFOAM cases. The reduced-order results
 are read as trends and as a guide to where those cases are needed.
 
 ## Validation
@@ -247,7 +271,14 @@ are read as trends and as a guide to where those cases are needed.
 > against exact solutions. Parameter-study outputs generated before this
 > correction are not physically meaningful and have been regenerated.
 
-Five canonical cases pin down the numerics, all non-reacting with exact
+> **Breathing-energy correction (2026-07-12).** A second audit found that the
+> time-dependent area source used `-(A_t/A) rhoE` instead of
+> `-(A_t/A)(rhoE+p)`. All unsteady artifacts from before schema version 2 are
+> invalid. The breathing test now distinguishes the corrected isentropic law
+> from the legacy result, while a bitwise `A_t=0` check proves the forced-shock
+> path is unaffected.
+
+The validation groups pin down the numerics with exact or analytic
 references (`python3 tests.py`):
 
 | Test | Measured | Threshold | Reference |
@@ -258,6 +289,10 @@ references (`python3 tests.py`):
 | Shock position under back pressure | within 1 cell | 3 cells | exact normal-shock-in-duct solution |
 | Shock total-pressure ratio | 0.5170 | ±0.02 | 0.5168 exact |
 | Couette flow, `u(y)` (L2, `FEMViscous` operator) | <0.1% | 5% of U_wall | analytic linear profile |
+| Transient Couette start-up | 0.06% L2 | 2% | Fourier-series solution |
+| Density/diffusion timescale scaling | machine agreement | 0.02% | timescale ∝ rho/mu |
+| Breathing static-gas law | ~1e-15 relative | 2e-9 | `rho∝A^-1`, `p∝A^-gamma` |
+| Combustion energy closure | 1674 K final | 2% | `T_i + Q Y_f/c_v` |
 | Busemann generator (Mach conoid / mass balance) | ~1e-11 deg / ~1e-12 | 1e-6 / 1e-8 | Taylor–Maccoll self-consistency |
 
 ![Sod shock tube](test_sod.png)
@@ -289,16 +324,18 @@ is effectively frozen, as expected physically).
 ### Representative baseline run (Mach 6, 25 km, inviscid with variable area)
 
 Freestream: T_inf = 216.65 K, p_inf = 2487 Pa, rho_inf = 0.0400 kg/m^3,
-u_inf = 1770 m/s. Mesh 80 x 16, 1500 steps at CFL 0.4 (~2 s wall time).
+u_inf = 1770 m/s. The schema-v2 verification uses a 64 x 12 mesh and stops
+on two consecutive dimensionless residual checks below `1e-6` (550 steps,
+final residual `6.1e-9`, about 2.3 s on the recorded machine).
 
 | Quantity | Value |
 |---|---|
-| Throat Mach (min) | 5.07 (isentropic: 5.10) |
-| Exit Mach | 6.53 (isentropic: 6.54) |
-| Total-pressure recovery (TPR) | 0.992 (isentropic: 1.0) |
-| Pressure range | 1453 to 6793 Pa (peak at the throat) |
-| Temperature range | 186 to 289 K |
-| Duct mass flow | 7.08 kg/s per unit depth, conserved |
+| Minimum contraction-region Mach | 5.066 |
+| Exit Mach (`i = nx-2`) | 6.518 |
+| Total-pressure recovery (TPR) | 0.9883 |
+| Temperature range | 187.0 to 289.7 K |
+| Prescribed inlet mass flow | 7.077 kg/s per unit depth |
+| Exit mass flow / mass defect | 6.933 kg/s / -2.03% |
 
 ![Mach field](verification/verify_mach.png)
 ![Centerline profiles](verification/verify_centerline.png)
@@ -313,32 +350,39 @@ within a fraction of a percent.
 `experiments/run_forced_shock_benchmark.py` modulates the back pressure of a
 shock-holding diffuser and extracts the shock-position amplitude and phase lag
 per forcing frequency through the same `response_metrics.py` path used by the
-wall-motion studies. The quasi-steady limit is exact and built in: at 20 Hz
-the measured amplitude is 1.004x the analytic quasi-steady value, rolling off
-to 0.68x at 100 Hz and 0.17x at 400 Hz with growing phase lag — the expected
-low-pass character of shock response, and a verification anchor for the
-unsteady pipeline before any wall-motion claim rests on it.
+wall-motion studies. The quasi-steady limit is exact and built in: in the
+regenerated schema-v2 demo the amplitude ratio is 1.038 at 20 Hz, 0.954 at
+50 Hz, 0.666 at 100 Hz, 0.249 at 200 Hz, and 0.163 at 400 Hz. On the
+gain-aligned shock coordinate the unwrapped lag grows from 0.455 to 6.068 rad.
+This is the expected low-pass shock response and an unsteady-pipeline anchor.
+Because this geometry has `A_t = 0`, corrected and legacy breathing-energy
+paths are bitwise identical for the benchmark.
 
 ### Reduced-order model and adaptive sampling
 
-A snapshot POD model trained on 9 full-solver evaluations and truncated at
-99.9% cumulative energy (4 modes) reproduces held-out quantities of interest
-to 0.5% (exit Mach) and ~4% (thrust, static pressure ratio) at roughly
-3600x lower per-evaluation cost, which gives an 80% reduction in wall time at
-the 80%-reduced-order-fraction operating point.
+A snapshot POD model trained on six converged full-solver evaluations and
+truncated at 99.9% cumulative energy (four modes) gives a 1.21% held-out TPR
+error from reconstructed-state QoIs; direct QoI IDW gives 0.25% and is retained
+as the comparison baseline. State-derived mass-defect and legacy thrust errors
+are much larger, which is precisely why validation reports both error sets
+rather than calling coefficient interpolation a Galerkin solver.
 
 ![POD energy spectrum](verification/verify_pod_energy.png)
 *POD singular-value spectrum and cumulative energy. The truncation at 4 modes
 (99.9% energy) sets the size of the reduced model.*
 
-A three-variable Bayesian optimizer (Gaussian process with Expected
-Improvement, reduced-order and full-solver routing) explores an exit-area,
-nozzle-length, and combustor-length space in a few seconds of wall time with
-70% of evaluations routed through the reduced-order model.
+The adaptive-sampling verification uses the same two parameters as ROM
+training (`A_exit`, `L_nozzle`). Its GP contains nine full-solver observations;
+20 ROM calls prescreen five shortlists and every selected point is then run at
+full fidelity. Including the six ROM-training solves, this costs about 70%
+more than standard one-candidate BO at the same full-evaluation budget, but
+about 36% less than evaluating every top-four shortlist point in full. These
+are screening-breadth savings, not a claim that ROM prescreening beats standard
+BO on wall time.
 
 ![BO convergence](verification/verify_bo_convergence.png)
-*Multi-fidelity Bayesian-optimization convergence. Blue points are full-solver
-evaluations, red points are reduced-order evaluations.*
+*Full-fidelity GP adaptive-sampling convergence. Plotted observations are full
+solver results; ROM prescreen calls are not inserted into the GP.*
 
 The unsteady design of experiments feeds a scalar response surrogate over the
 post-transient quantities of interest, including TPR and shock position.
@@ -366,21 +410,21 @@ balance to integration accuracy.*
 | `physics.py` | Sutherland transport, quasi-1D source-vector reference form, single-step Arrhenius, prescribed heat release, implicit FEM diffusion (moving-wall capable). |
 | `solver.py` | Configuration containers (atmosphere or explicit tunnel freestream) and the Strang-split `Solver`. |
 | `busemann.py` | Taylor–Maccoll Busemann-inlet generator: contour, area law, design summary, self-checks. |
-| `rom.py` | Snapshot collection, `PODBasis`, `ReducedSolver`, `ROMEvaluator`; QoI extraction (TPR, shock position, legacy engine metrics). |
-| `optimization.py` | `DesignSpace`, `GPSurrogate`, Expected-Improvement acquisition, multi-fidelity `BayesianOptimizer`. |
-| `response_metrics.py` | Amplitude, wrapped phase lag, and transient extraction with undersampling/aliasing guards. |
+| `rom.py` | Snapshot collection, coefficient-interpolated POD reconstruction, state-derived QoIs, and the direct-QoI IDW baseline. |
+| `optimization.py` | `DesignSpace`, full-only `GPSurrogate`, Expected Improvement, and ROM-prescreen/full-confirm adaptive sampling. |
+| `response_metrics.py` | Own-time-array, drift-aware amplitude/positive-lag estimation with support and fit-quality guards. |
 | `diagnostics.py` | TPR, shock detection (total-pressure destruction), scalar-boundedness and flow diagnostics. |
-| `configs/` | Experiment-condition presets: `tusq_m585.json` (Config A), `ncsu_m40.json` (Config B; placeholders flagged in-file). |
+| `configs/` | Experiment-condition presets: `tusq_m585.json` (Config A), `ncsu_m37.json` (Config B; review-note transcription flagged in-file). |
 | `experiments/` | Static sweep, unsteady runs, DoE, surrogate and ROM builders, candidate ranking, forced-shock benchmark, presets loader, and the OpenFOAM/FUN3D + Gmsh exporter. |
 | `figures/make_geometry_figure.py` | Regenerates the parameterization figure above. |
-| `tests.py` | Sod, nozzle-vs-isentropic, analytic shock position, Couette, Busemann, geometry, response-metric, and ignition tests. |
-| `verification/verify_all.py` | End-to-end harness writing `verify_results.json` and `verify_*.png`. |
+| `tests.py` | Twelve validation groups; exits 1 on failure and 2 for an unknown group. |
+| `verification/verify_all.py` | Assertion-bearing end-to-end harness writing `verify_results.json` and `verify_*.png`. |
 
 ## Quick start
 
 ```bash
-pip install numpy scipy matplotlib numba    # numba strongly recommended (JIT hot loops)
-python3 tests.py                            # validation suite, 9 groups (~10-40 s incl. JIT)
+python3 -m pip install -r requirements.txt
+python3 tests.py                            # validation suite, 12 groups
 python3 verification/verify_all.py          # baseline, ROM, optimization (~1 min)
 python3 figures/make_geometry_figure.py     # regenerate the geometry figure
 python3 busemann.py                         # Busemann generator demo
@@ -403,8 +447,10 @@ Experiment-condition presets replace the generic atmosphere baseline
 (`--preset configs/tusq_m585.json` on the sweep and DoE runners). The exporter
 writes geometry, area, and wall-contour files, freestream and stagnation
 conditions, shared QoI definitions, mesh and turbulence notes, a structured
-Gmsh `.geo`, and an OpenFOAM case template per selected case. Demo budgets are
-deliberately small; for reportable response maps use converged baselines,
+Gmsh `.geo`, an OpenFOAM case template, sampling objects, and an executable QoI
+bridge per selected case. Schema-v2 gates prevent older, pre-energy-fix runs
+from entering the ROM/surrogate/ranking/export stages. Demo runs use three
+cycles with a 25% time discard; for reportable response maps use converged baselines,
 5–10 post-transient forcing cycles, and a transient discard tied to the
 flow-through time.
 

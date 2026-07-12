@@ -4,7 +4,7 @@ rom.py — Proper Orthogonal Decomposition (POD) Reduced-Order Model.
 Contains:
     SnapshotCollector    — runs the full solver at sampled parameter points, stores state fields
     PODBasis             — SVD decomposition, mode truncation, energy diagnostics
-    ReducedSolver        — Galerkin-projected online evaluation (r x r system)
+    ReducedSolver        — coefficient-interpolated POD state reconstruction
     ROMEvaluator         — end-to-end: basis + online solve + QoI extraction
 
 The ROM operates in **parametric** mode: POD is taken over snapshots at
@@ -13,12 +13,18 @@ maps the steady-state QoI landscape cheaply for the optimizer.
 
 Dependency: solver.py (full-order model), numpy, scipy
 """
+import copy
 import time
 import numpy as np
 from scipy.linalg import svd
 import matplotlib.pyplot as plt
 
-from mesh import GeometryProfile, LocalizedAreaPerturbation, PerturbedGeometryProfile
+from mesh import (
+    GeometryProfile,
+    LocalizedAreaPerturbation,
+    PerturbedGeometryProfile,
+    StructuredMesh2D,
+)
 from solver import SolverConfig, Solver
 
 
@@ -68,12 +74,16 @@ class SnapshotCollector:
 
             solver = Solver(cfg)
             t0 = time.time()
-            solver.run()
+            run_status = solver.run()
             wall = time.time() - t0
 
             # check for NaN blowup
             if np.any(np.isnan(solver.state.U)):
                 print(f"    SKIPPED (NaN blowup)")
+                continue
+            if (run_status.get("steady_detection_enabled")
+                    and not run_status.get("converged")):
+                print("    SKIPPED (steady solve did not converge)")
                 continue
 
             # store snapshot (flattened conservative state)
@@ -86,8 +96,8 @@ class SnapshotCollector:
             self.qoi.append(qoi)
             n_collected += 1
 
-            print(f"    thrust={qoi['thrust']:.2f} N, "
-                  f"Isp={qoi['Isp']:.1f} s, wall={wall:.2f} s")
+            print(f"    TPR={qoi['tpr']:.5f}, "
+                  f"shock_x={qoi['shock_x']:.4g} m, wall={wall:.2f} s")
 
         return n_collected
 
@@ -239,7 +249,7 @@ class PODBasis:
 
 class ReducedSolver:
     """
-    Galerkin-projected reduced-order solver.
+    Coefficient-interpolated POD reduced-order solver.
 
     Given the POD basis Psi_r and the training snapshot coefficients,
     the online evaluation for a new parameter point mu_new uses
@@ -251,13 +261,14 @@ class ReducedSolver:
     points. This avoids re-deriving the projected ODE (which requires
     DEIM for nonlinear terms) and gives O(r) online cost.
 
-    For this scramjet application — where the solver runs to steady state
-    and we only need QoI (thrust, Isp) — coefficient interpolation is
-    the pragmatic choice. Full Galerkin projection + DEIM would be needed
-    for unsteady time-accurate ROM, which is a Phase 4 extension.
+    QoIs are extracted from the reconstructed conservative state.  Direct
+    inverse-distance interpolation of training QoIs is returned separately
+    as ``qoi_idw`` so the paper can compare the two honestly.  This is not a
+    Galerkin or time-accurate ROM; projection/DEIM remains future work.
     """
 
-    def __init__(self, pod_basis, train_params, train_coeffs, train_qoi):
+    def __init__(self, pod_basis, train_params, train_coeffs, train_qoi,
+                 base_config):
         """
         Args:
             pod_basis:    PODBasis instance (with mean_state and basis)
@@ -269,6 +280,7 @@ class ReducedSolver:
         self.train_params = train_params
         self.train_coeffs = train_coeffs
         self.train_qoi = train_qoi
+        self.base_config = base_config
 
         # build parameter matrix for distance computation
         # extract a consistent ordered feature vector from each param dict
@@ -286,17 +298,25 @@ class ReducedSolver:
         """
         Fast ROM evaluation at a new parameter point.
 
-        Uses inverse-distance weighted interpolation in both the
-        coefficient space (for state reconstruction) and the QoI space
-        (for direct thrust/Isp prediction).
+        Uses inverse-distance interpolation in coefficient space and derives
+        the primary QoIs from the resulting POD state reconstruction.
 
         Args:
             params: dict of design parameters (same keys as training)
 
         Returns:
-            qoi_pred: dict with predicted thrust, Isp, etc.
+            qoi_pred: state-derived QoI dict with an additional ``qoi_idw``
+                      comparison-baseline block
             state_flat: reconstructed full-order state (n_dof,)
         """
+        if set(params) != set(self.param_keys):
+            missing = sorted(set(self.param_keys) - set(params))
+            extra = sorted(set(params) - set(self.param_keys))
+            raise ValueError(
+                "ROM query keys must exactly match training keys; "
+                f"missing={missing}, extra={extra}"
+            )
+
         # normalize query point
         x_new = np.array([params[k] for k in self.param_keys])
         x_norm = (x_new - self.X_min) / self.X_range
@@ -316,11 +336,28 @@ class ReducedSolver:
         # reconstruct full state
         state_flat = self.pod.reconstruct(a_pred)
 
-        # interpolate QoI directly (more accurate than extracting from reconstruction)
-        qoi_pred = {}
+        cfg = _clone_config(self.base_config)
+        _apply_params(cfg, params)
+        mesh = _mesh_from_config(cfg)
+        U_reconstructed = state_flat.reshape(5, mesh.nx, mesh.ny)
+        qoi_pred = compute_qoi_from_state(U_reconstructed, mesh, cfg)
+
+        qoi_idw = {}
         for key in self.train_qoi[0].keys():
-            vals = np.array([q[key] for q in self.train_qoi])
-            qoi_pred[key] = float(weights @ vals)
+            values = [q.get(key) for q in self.train_qoi]
+            if not all(isinstance(v, (int, float, np.number))
+                       and not isinstance(v, (bool, np.bool_))
+                       for v in values):
+                continue
+            vals = np.asarray(values, dtype=float)
+            finite = np.isfinite(vals)
+            if not np.any(finite):
+                qoi_idw[key] = float("nan")
+                continue
+            finite_weights = weights[finite]
+            finite_weights /= np.sum(finite_weights)
+            qoi_idw[key] = float(finite_weights @ vals[finite])
+        qoi_pred["qoi_idw"] = qoi_idw
 
         return qoi_pred, state_flat
 
@@ -387,6 +424,7 @@ class ROMEvaluator:
         self.reduced_solver = ReducedSolver(
             self.pod, self.collector.params,
             train_coeffs, self.collector.qoi,
+            self.base_config,
         )
 
         self.build_time = time.time() - t0
@@ -407,7 +445,7 @@ class ROMEvaluator:
             params: dict of design parameters
 
         Returns:
-            qoi: dict with thrust, Isp, etc.
+            qoi: state-derived QoIs plus the ``qoi_idw`` baseline
         """
         qoi, _ = self.reduced_solver.evaluate(params)
         return qoi
@@ -424,7 +462,7 @@ class ROMEvaluator:
             test_params: list of parameter dicts
 
         Returns:
-            errors: dict of relative errors per QoI
+        errors: dict with ``pod_state`` and ``idw`` relative-error blocks
         """
         print("\n--- ROM VALIDATION ---")
         rom_qois = []
@@ -451,30 +489,51 @@ class ROMEvaluator:
             rom_qois.append(qoi_rom)
             full_qois.append(qoi_full)
 
-            print(f"  Test {idx+1}: thrust ROM={qoi_rom['thrust']:.2f} "
-                  f"full={qoi_full['thrust']:.2f} | "
-                  f"Isp ROM={qoi_rom['Isp']:.1f} full={qoi_full['Isp']:.1f}")
+            print(f"  Test {idx+1}: TPR POD={qoi_rom['tpr']:.5f} "
+                  f"IDW={qoi_rom['qoi_idw'].get('tpr', float('nan')):.5f} "
+                  f"full={qoi_full['tpr']:.5f} | "
+                  f"shock_x POD={qoi_rom['shock_x']:.4g} "
+                  f"full={qoi_full['shock_x']:.4g}")
 
         # compute relative errors
-        errors = {}
-        for key in rom_qois[0].keys():
-            rom_vals = np.array([q[key] for q in rom_qois])
-            full_vals = np.array([q[key] for q in full_qois])
-            denom = np.maximum(np.abs(full_vals), 1e-30)
-            errors[key] = np.mean(np.abs(rom_vals - full_vals) / denom)
+        errors = {"pod_state": {}, "idw": {}}
+        numeric_keys = [
+            key for key, value in full_qois[0].items()
+            if isinstance(value, (int, float, np.number))
+            and not isinstance(value, (bool, np.bool_))
+        ]
+        for key in numeric_keys:
+            full_vals = np.asarray([q[key] for q in full_qois], dtype=float)
+            finite_full = np.isfinite(full_vals)
+            for label, getter in (
+                ("pod_state", lambda q, k=key: q.get(k)),
+                ("idw", lambda q, k=key: q.get("qoi_idw", {}).get(k)),
+            ):
+                vals = np.asarray([getter(q) for q in rom_qois], dtype=float)
+                mask = finite_full & np.isfinite(vals)
+                if not np.any(mask):
+                    errors[label][key] = None
+                    continue
+                denom = np.maximum(np.abs(full_vals[mask]), 1.0e-30)
+                errors[label][key] = float(np.mean(
+                    np.abs(vals[mask] - full_vals[mask]) / denom,
+                ))
 
         speedup = np.mean(full_times) / max(np.mean(rom_times), 1e-30)
 
         print(f"\n  Mean relative errors:")
-        for key, err in errors.items():
-            print(f"    {key}: {err*100:.2f}%")
+        for label, block in errors.items():
+            print(f"    {label}:")
+            for key, err in block.items():
+                if err is not None:
+                    print(f"      {key}: {err*100:.2f}%")
         print(f"  Speedup: {speedup:.0f}x")
 
         return errors
 
 
 def _clone_config(cfg):
-    """Deep-copy a SolverConfig by rebuilding it."""
+    """Deep-copy a SolverConfig while preserving every current scalar flag."""
     new = SolverConfig()
     explicit = getattr(cfg.inlet, "explicit_conditions", False)
     new.inlet = InletConfig(
@@ -504,44 +563,65 @@ def _clone_config(cfg):
         enabled=cc.enabled, A_pre=cc.A_pre, Ea=cc.Ea,
         Q_heat=cc.Q_heat, nf=cc.nf, no=cc.no, W_f=cc.W_f,
     )
-    new.cfl = cfg.cfl
-    new.n_steps = cfg.n_steps
-    new.t_final = cfg.t_final
-    new.print_interval = cfg.print_interval
-    new.viscous = cfg.viscous
-    new.wall_type = cfg.wall_type
-    new.passive_scalar_enabled = getattr(cfg, "passive_scalar_enabled", False)
-    new.heat_release_model = getattr(cfg, "heat_release_model", "none")
-    new.simple_heat_release_rate = getattr(cfg, "simple_heat_release_rate", 0.0)
-    new.simple_heat_release_fuel_coupled = getattr(
-        cfg, "simple_heat_release_fuel_coupled", True,
-    )
-    new.turbulence_model = getattr(cfg, "turbulence_model", "none")
-    new.area_source = cfg.area_source
+    # Constructor-rebuild the structured members above, then copy every
+    # top-level field (including all outlet controls and future additions).
+    for name, value in vars(cfg).items():
+        if name in {"inlet", "mesh", "geometry", "combustion"}:
+            continue
+        setattr(new, name, copy.deepcopy(value))
     return new
 
 
 def _apply_params(cfg, params):
-    """Override config fields from a parameter dict."""
+    """Apply a validated parameter dict without changing geometry identity."""
+    params = dict(params)
+    geom_keys = {
+        'L_inlet', 'L_combustor', 'L_nozzle',
+        'A_inlet', 'A_throat', 'A_comb_exit', 'A_exit',
+    }
+    perturbation_keys = {
+        'q_throat', 'area_amplitude', 'area_enabled', 'area_mode',
+        'area_x_center', 'area_width', 'min_area',
+    }
+    inlet_keys = {'mach', 'altitude'}
+    unknown = set(params) - geom_keys - perturbation_keys - inlet_keys
+    if unknown:
+        raise ValueError(f"Unknown parameter keys: {sorted(unknown)}")
+
     geom_existing = cfg.geometry
     perturbation_existing = getattr(geom_existing, "perturbation", None)
     min_area_existing = getattr(geom_existing, "min_area", 1.0e-6)
     base_existing = getattr(geom_existing, "base_geometry", geom_existing)
 
-    # geometry parameters
-    geom_keys = ['L_inlet', 'L_combustor', 'L_nozzle',
-                 'A_inlet', 'A_throat', 'A_comb_exit', 'A_exit']
-    geom_vals = {}
-    for k in geom_keys:
-        geom_vals[k] = params.get(k, getattr(base_existing, k))
+    requested_geom = set(params) & geom_keys
+    requested_perturbation = set(params) & perturbation_keys
+    if requested_geom:
+        if type(base_existing) is not GeometryProfile:
+            raise ValueError(
+                "Three-section geometry parameters cannot be applied to "
+                f"{type(base_existing).__name__}; preserve/calibrate that "
+                "geometry or use perturbation parameters instead."
+            )
+        geom_vals = {
+            key: params.get(key, getattr(base_existing, key))
+            for key in geom_keys
+        }
+        base_geometry = GeometryProfile(**geom_vals)
+    else:
+        base_geometry = base_existing.copy()
 
-    base_geometry = GeometryProfile(**geom_vals)
-
-    perturbation_keys = {
-        'q_throat', 'area_amplitude', 'area_enabled', 'area_mode',
-        'area_x_center', 'area_width', 'min_area',
-    }
-    use_perturbation = perturbation_existing is not None or any(k in params for k in perturbation_keys)
+    if requested_geom or requested_perturbation:
+        if (getattr(geom_existing, "is_time_dependent", False)
+                and requested_perturbation):
+            raise ValueError(
+                "Applying steady perturbation parameters to a time-dependent "
+                "geometry is ambiguous"
+            )
+        use_perturbation = (
+            perturbation_existing is not None or bool(requested_perturbation)
+        )
+    else:
+        use_perturbation = False
 
     if use_perturbation:
         if perturbation_existing is not None:
@@ -575,7 +655,7 @@ def _apply_params(cfg, params):
         min_area = float(params.get('min_area', min_area_existing))
         perturbation.min_area = min_area
         cfg.geometry = PerturbedGeometryProfile(base_geometry, perturbation)
-    else:
+    elif requested_geom:
         cfg.geometry = base_geometry
 
     # inlet parameters. Explicit tunnel conditions (presets) survive a Mach
@@ -599,39 +679,77 @@ def _apply_params(cfg, params):
         )
 
 
-def _compute_qoi(solver):
+def _mesh_from_config(cfg):
+    """Build the structured mesh associated with a query configuration."""
+    geom = cfg.geometry
+    if cfg.mesh.y_stretch > 1.001:
+        return StructuredMesh2D.stretched(
+            0.0, geom.L_total, 0.0, geom.A_exit,
+            cfg.mesh.nx, cfg.mesh.ny, y_ratio=cfg.mesh.y_stretch,
+        )
+    return StructuredMesh2D.uniform(
+        0.0, geom.L_total, 0.0, geom.A_exit,
+        cfg.mesh.nx, cfg.mesh.ny,
+    )
+
+
+def compute_qoi_from_state(U, mesh, cfg):
     """
-    Extract quantities of interest from a converged solver.
+    Extract shared QoIs from a conservative state tensor.
 
     Research QoIs (experiment-matched, see research plan §3.1):
         tpr         — mass-flux-weighted total-pressure recovery p0_exit/p0_inf
         shock_x     — dominant shock location on the centerline [m] (NaN if none)
 
-    Extended/legacy QoIs (kept for continuity; thrust/Isp are out of the
-    paper scope and pressure_recovery is the legacy *static* ratio):
-        thrust, Isp, exit_mach, pressure_recovery, mdot
+    ``mdot_prescribed`` is deliberately named: the first column is fixed by
+    the supersonic Dirichlet inlet and therefore cannot represent spillage or
+    mass-capture collapse.  ``mdot_exit`` and ``mass_defect`` diagnose
+    numerical conservation.  Unstart is observable only through shock
+    expulsion/TPR collapse in this boundary model.
     """
-    from diagnostics import total_pressure_recovery, shock_diagnostics
+    from diagnostics import (
+        physical_exit_index,
+        primitives_from_state,
+        shock_diagnostics_from_state,
+        total_pressure_recovery_from_state,
+        transverse_average,
+    )
 
-    rho, u, v, p, T, Yf = solver.state.primitives()
-    cfg = solver.cfg
+    gamma = cfg.inlet.gamma
+    R_gas = cfg.inlet.R_gas
+    U = np.asarray(U, dtype=float)
+    rho_raw = U[0]
+    rho_safe = np.maximum(rho_raw, 1.0e-30)
+    u_raw = U[1] / rho_safe
+    v_raw = U[2] / rho_safe
+    p_raw = (gamma - 1.0) * (
+        U[3] - 0.5 * (U[1]**2 + U[2]**2) / rho_safe
+    )
+    state_admissible = bool(
+        np.all(np.isfinite(U)) and np.all(rho_raw > 0.0) and np.all(p_raw > 0.0)
+    )
+    rho, u, v, p, T, Yf, M = primitives_from_state(
+        U, gamma=gamma, R_gas=R_gas,
+    )
     g0 = 9.80665
 
-    # inlet conditions (first column of cells)
-    rho_in = np.mean(rho[0, :])
-    u_in = np.mean(u[0, :])
-    p_in = np.mean(p[0, :])
-    A_in = cfg.geometry.A_inlet
-
-    # exit conditions (last column)
-    rho_ex = np.mean(rho[-1, :])
-    u_ex = np.mean(u[-1, :])
-    p_ex = np.mean(p[-1, :])
-    A_ex = cfg.geometry.A_exit
+    i_in = 0
+    i_exit = physical_exit_index(mesh)
+    rho_in = transverse_average(rho[i_in, :], mesh)
+    u_in = transverse_average(u[i_in, :], mesh)
+    p_in = transverse_average(p[i_in, :], mesh)
+    rho_ex = transverse_average(rho[i_exit, :], mesh)
+    u_ex = transverse_average(u[i_exit, :], mesh)
+    v_ex = transverse_average(v[i_exit, :], mesh)
+    p_ex = transverse_average(p[i_exit, :], mesh)
+    M_ex = transverse_average(M[i_exit, :], mesh)
+    A_in = float(cfg.geometry.area(np.array([mesh.xc[i_in]]))[0])
+    A_ex = float(cfg.geometry.area(np.array([mesh.xc[i_exit]]))[0])
 
     # mass flow rates [kg/s per unit depth]
-    mdot_in = rho_in * u_in * A_in
-    mdot_ex = rho_ex * u_ex * A_ex
+    mdot_in = transverse_average(rho[i_in, :] * u[i_in, :], mesh) * A_in
+    mdot_ex = transverse_average(rho[i_exit, :] * u[i_exit, :], mesh) * A_ex
+    mass_defect = (mdot_ex - mdot_in) / max(abs(mdot_in), 1.0e-30)
 
     # momentum thrust
     F_momentum = mdot_ex * u_ex - mdot_in * u_in
@@ -646,27 +764,44 @@ def _compute_qoi(solver):
     # this gives the "airbreathing Isp" or specific thrust
     Isp = thrust / max(mdot_in * g0, 1e-30)
 
-    # exit Mach
-    c_ex = np.sqrt(cfg.inlet.gamma * max(p_ex, 1e-30) / max(rho_ex, 1e-30))
-    M_ex = np.sqrt(u_ex**2 + np.mean(v[-1, :])**2) / max(c_ex, 1e-30)
-
     # legacy static pressure ratio (NOT total-pressure recovery)
-    p_recovery = np.mean(p[-1, :]) / max(cfg.inlet.p_inf, 1e-30)
+    p_recovery = p_ex / max(cfg.inlet.p_inf, 1e-30)
 
     # experiment-matched QoIs
-    tpr = total_pressure_recovery(solver)
-    shock = shock_diagnostics(solver)
+    tpr = total_pressure_recovery_from_state(U, mesh, cfg)
+    shock = shock_diagnostics_from_state(U, mesh, cfg)
+    j_mid = mesh.ny // 2
+    i_throat = int(np.argmin(np.abs(mesh.xc - cfg.geometry.x_throat)))
+    contraction_hi = max(min(i_throat + 1, mesh.nx), 1)
+    min_mach_contraction = float(np.min(M[:contraction_hi, j_mid]))
+    inlet_shock_limit = max(2, int(np.ceil(0.1 * mesh.nx)))
+    shock_at_inlet = bool(
+        shock["shock_detected"] and shock["shock_index"] <= inlet_shock_limit
+    )
+    started = not shock_at_inlet
 
     return {
-        'thrust': thrust,
-        'Isp': Isp,
-        'exit_mach': M_ex,
-        'pressure_recovery': p_recovery,
-        'tpr': tpr,
-        'shock_x': shock['shock_x'],
-        'shock_detected': shock['shock_detected'],
-        'mdot': mdot_in,
+        'tpr': float(tpr),
+        'shock_x': float(shock['shock_x']),
+        'shock_detected': bool(shock['shock_detected']),
+        'shock_at_inlet': shock_at_inlet,
+        'started': bool(started),
+        'unstart_classification': 'started' if started else 'unstarted',
+        'min_centerline_mach_contraction': min_mach_contraction,
+        'exit_mach': float(M_ex),
+        'mdot_prescribed': float(mdot_in),
+        'mdot_exit': float(mdot_ex),
+        'mass_defect': float(mass_defect),
+        'pressure_recovery': float(p_recovery),
+        'thrust': float(thrust),
+        'Isp': float(Isp),
+        'state_admissible': state_admissible,
     }
+
+
+def _compute_qoi(solver):
+    """Solver wrapper around :func:`compute_qoi_from_state`."""
+    return compute_qoi_from_state(solver.state.U, solver.mesh, solver.cfg)
 
 
 # need these imports for _clone_config

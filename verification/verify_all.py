@@ -1,271 +1,210 @@
-"""
-verify_all.py — end-to-end validation harness.
-
-Runs every subsystem of the scramjet project and writes the numbers we need
-for the report: a converged clean scramjet run (Mach 6, 25 km, inviscid
-with variable-area source), a separate low-intensity combustion run to
-exercise the heat-release model in flowing conditions, a POD ROM build +
-held-out validation, and a Bayesian-optimization loop that uses the ROM.
-Results are dumped to verify_results.json.
-"""
+"""Assertion-bearing end-to-end verification for the research workflow."""
 import json
 import os
 import sys
 import time
-import numpy as np
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from solver import SolverConfig, Solver, InletConfig, MeshConfig, CombustionConfig
+from solver import SolverConfig, Solver, InletConfig, CombustionConfig
 from rom import ROMEvaluator, _compute_qoi
 from optimization import DesignSpace, BayesianOptimizer
 
-results = {}
 
-# 1) clean scramjet run (Mach 6, 25 km, inviscid, variable-area on)
-print("\n[1] Clean scramjet run: Mach 6, h=25km, inviscid + variable-area")
-cfg = SolverConfig()
+SCHEMA_VERSION = 2
+results = {"schema_version": SCHEMA_VERSION}
+
+
+def converged_config(nx, ny, n_steps=1800):
+    cfg = SolverConfig()
+    cfg.mesh.nx, cfg.mesh.ny = nx, ny
+    cfg.n_steps = n_steps
+    cfg.print_interval = 0
+    cfg.residual_interval = 50
+    cfg.steady_check_interval = 50
+    cfg.steady_rtol = 1.0e-6
+    cfg.cfl = 0.35
+    return cfg
+
+
+def finite_or_none(value):
+    """Recursively make strict JSON while retaining absent-shock semantics."""
+    if isinstance(value, dict):
+        return {key: finite_or_none(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [finite_or_none(item) for item in value]
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating, float)):
+        return float(value) if np.isfinite(value) else None
+    return value
+
+
+print("\n[1] Converged clean cold-flow run")
+cfg = converged_config(64, 12, n_steps=2200)
 cfg.inlet = InletConfig(mach=6.0, altitude=25000.0)
-cfg.mesh.nx = 80
-cfg.mesh.ny = 16
-cfg.n_steps = 1500
-cfg.print_interval = 300
-cfg.cfl = 0.4
-cfg.viscous = False
 cfg.combustion = CombustionConfig(enabled=False)
-cfg.area_source = True
-
 t0 = time.time()
 solver = Solver(cfg)
-solver.run()
-wall_full = time.time() - t0
-
+run_status = solver.run()
+clean_wall = time.time() - t0
 qoi = _compute_qoi(solver)
 rho, u, v, p, T, Yf = solver.state.primitives()
 M = solver.state.mach()
-
-results['scramjet_clean'] = {
-    'mach_freestream': 6.0,
-    'altitude_m': 25000.0,
-    'T_inf_K': float(cfg.inlet.T_inf),
-    'p_inf_Pa': float(cfg.inlet.p_inf),
-    'rho_inf_kg_m3': float(cfg.inlet.rho_inf),
-    'u_inf_m_s': float(cfg.inlet.u_inf),
-    'wall_time_s': wall_full,
-    'n_cells': int(cfg.mesh.nx * cfg.mesh.ny),
-    'n_steps': cfg.n_steps,
-    'final_time_s': float(solver.time),
-    'M_exit': float(qoi['exit_mach']),
-    'M_max': float(M.max()),
-    'M_min': float(M.min()),
-    'p_max_Pa': float(p.max()),
-    'p_min_Pa': float(p.min()),
-    'T_max_K': float(T.max()),
-    'T_min_K': float(T.min()),
-    'thrust_N_per_m': float(qoi['thrust']),
-    'Isp_s': float(qoi['Isp']),
-    'pressure_recovery_static_legacy': float(qoi['pressure_recovery']),
-    'tpr': float(qoi['tpr']),
-    'shock_detected': bool(qoi['shock_detected']),
-    'mdot_kg_s_per_m': float(qoi['mdot']),
+results["scramjet_clean"] = {
+    "scope": "paper-1 cold-flow baseline",
+    "wall_time_s": clean_wall,
+    "n_cells": cfg.mesh.nx * cfg.mesh.ny,
+    "run_status": run_status,
+    "qoi": qoi,
+    "mach_range": [float(M.min()), float(M.max())],
+    "temperature_range_K": [float(T.min()), float(T.max())],
 }
-print(f"  wall={wall_full:.2f}s  thrust={qoi['thrust']:.1f}  Isp={qoi['Isp']:.1f}")
-print(f"  M range=[{M.min():.3f},{M.max():.3f}]  T range=[{T.min():.0f},{T.max():.0f}]K")
-
 fig = solver.plot_mach()
-fig.savefig(os.path.join(_HERE, "verify_mach.png"), dpi=140); plt.close(fig)
+fig.savefig(os.path.join(_HERE, "verify_mach.png"), dpi=140)
+plt.close(fig)
 fig = solver.plot_centerline()
-fig.savefig(os.path.join(_HERE, "verify_centerline.png"), dpi=140); plt.close(fig)
+fig.savefig(os.path.join(_HERE, "verify_centerline.png"), dpi=140)
+plt.close(fig)
 
-# 2) combustion-coupled run (mild heat release for stability)
-print("\n[2] Combustion-coupled run (mild Arrhenius)")
-cfg2 = SolverConfig()
+
+print("\n[2] Extended capability (combustion; out of paper scope)")
+cfg2 = converged_config(48, 8, n_steps=500)
+cfg2.steady_rtol = None
 cfg2.inlet = InletConfig(mach=6.0, altitude=25000.0, Yf_inlet=0.02)
-cfg2.mesh.nx = 60
-cfg2.mesh.ny = 12
-cfg2.n_steps = 600
-cfg2.print_interval = 300
-cfg2.cfl = 0.3
-cfg2.viscous = False
 cfg2.combustion = CombustionConfig(
-    enabled=True,
-    A_pre=1.0e6, Ea=65000.0, Q_heat=1.5e6,
+    enabled=True, A_pre=1.0e6, Ea=65000.0, Q_heat=1.5e6,
 )
-cfg2.area_source = True
-
 t0 = time.time()
 solver2 = Solver(cfg2)
 solver2.run()
-wall_comb = time.time() - t0
-
-qoi2 = _compute_qoi(solver2)
+comb_wall = time.time() - t0
 rho2, u2, v2, p2, T2, Yf2 = solver2.state.primitives()
-# centerline Yf depletion
-j_mid = solver2.mesh.ny // 2
-Yf_inlet_mean = float(np.mean(Yf2[0, :]))
-Yf_exit_mean = float(np.mean(Yf2[-1, :]))
-T_exit_mean = float(np.mean(T2[-1, :]))
-T_inlet_mean = float(np.mean(T2[0, :]))
-
-results['scramjet_combustion'] = {
-    'mach_freestream': 6.0,
-    'altitude_m': 25000.0,
-    'Yf_inlet': 0.02,
-    'Arrhenius_A_pre': 1.0e6,
-    'Arrhenius_Ea_J_mol': 65000.0,
-    'Arrhenius_Q_heat_J_kg': 1.5e6,
-    'wall_time_s': wall_comb,
-    'n_cells': int(cfg2.mesh.nx * cfg2.mesh.ny),
-    'n_steps': cfg2.n_steps,
-    'Yf_inlet_mean': Yf_inlet_mean,
-    'Yf_exit_mean': Yf_exit_mean,
-    'Yf_consumed_frac': float(1.0 - Yf_exit_mean / max(Yf_inlet_mean, 1e-30)),
-    'T_inlet_mean_K': T_inlet_mean,
-    'T_exit_mean_K': T_exit_mean,
-    'delta_T_K': T_exit_mean - T_inlet_mean,
-    'thrust_N_per_m': float(qoi2['thrust']),
-    'Isp_s': float(qoi2['Isp']),
+results["extended_combustion_capability"] = {
+    "paper_scope": False,
+    "decision": "parked; revisit after cold-flow multi-fidelity loop closes",
+    "wall_time_s": comb_wall,
+    "fuel_range": [float(Yf2.min()), float(Yf2.max())],
+    "temperature_range_K": [float(T2.min()), float(T2.max())],
+    "qoi": _compute_qoi(solver2),
 }
-print(f"  wall={wall_comb:.2f}s")
-print(f"  Yf inlet={Yf_inlet_mean:.4f} -> exit={Yf_exit_mean:.4f} "
-      f"({results['scramjet_combustion']['Yf_consumed_frac']*100:.1f}% consumed)")
-print(f"  T inlet={T_inlet_mean:.1f}K -> exit={T_exit_mean:.1f}K  "
-      f"(dT={results['scramjet_combustion']['delta_T_K']:.1f}K)")
-
 fig = solver2.plot_field("temperature")
-fig.savefig(os.path.join(_HERE, "verify_combustion_T.png"), dpi=140); plt.close(fig)
+fig.savefig(os.path.join(_HERE, "verify_combustion_T.png"), dpi=140)
+plt.close(fig)
 fig = solver2.plot_field("fuel_fraction")
-fig.savefig(os.path.join(_HERE, "verify_combustion_Yf.png"), dpi=140); plt.close(fig)
+fig.savefig(os.path.join(_HERE, "verify_combustion_Yf.png"), dpi=140)
+plt.close(fig)
 
-# 3) POD ROM build + held-out validation
-print("\n[3] POD ROM build")
-rom_cfg = SolverConfig()
-rom_cfg.mesh.nx = 40
-rom_cfg.mesh.ny = 10
-rom_cfg.n_steps = 400
-rom_cfg.print_interval = 500
-rom_cfg.cfl = 0.35
 
+print("\n[3] Coefficient-interpolated POD with state-derived QoIs")
+rom_cfg = converged_config(32, 6, n_steps=1400)
 train_params = [
-    {'A_exit': 0.12, 'L_nozzle': 0.35},
-    {'A_exit': 0.14, 'L_nozzle': 0.40},
-    {'A_exit': 0.16, 'L_nozzle': 0.45},
-    {'A_exit': 0.18, 'L_nozzle': 0.50},
-    {'A_exit': 0.13, 'L_nozzle': 0.45},
-    {'A_exit': 0.15, 'L_nozzle': 0.35},
-    {'A_exit': 0.17, 'L_nozzle': 0.40},
-    {'A_exit': 0.19, 'L_nozzle': 0.50},
-    {'A_exit': 0.20, 'L_nozzle': 0.55},
+    {"A_exit": 0.12, "L_nozzle": 0.34},
+    {"A_exit": 0.14, "L_nozzle": 0.40},
+    {"A_exit": 0.16, "L_nozzle": 0.46},
+    {"A_exit": 0.18, "L_nozzle": 0.52},
+    {"A_exit": 0.13, "L_nozzle": 0.49},
+    {"A_exit": 0.19, "L_nozzle": 0.37},
+]
+test_params = [
+    {"A_exit": 0.145, "L_nozzle": 0.43},
+    {"A_exit": 0.172, "L_nozzle": 0.48},
 ]
 rom = ROMEvaluator(rom_cfg, energy_threshold=0.999)
-r = rom.build(train_params)
-
-test_params = [
-    {'A_exit': 0.135, 'L_nozzle': 0.42},
-    {'A_exit': 0.155, 'L_nozzle': 0.38},
-    {'A_exit': 0.175, 'L_nozzle': 0.47},
-]
+n_modes = rom.build(train_params)
 errors = rom.validate(test_params)
-
-t0 = time.time()
-for p in test_params:
-    rom.evaluate(p)
-rom_eval_time = (time.time() - t0) / len(test_params)
-
-mean_full = rom.collector.mean_wall_time()
-speedup = mean_full / max(rom_eval_time, 1e-9)
-# wall-time reduction when 80% of optimization evaluations use ROM
-wall_saving_pct = (1.0 - (0.2 * mean_full + 0.8 * rom_eval_time) / mean_full) * 100.0
-
-results['rom'] = {
-    'n_training_snapshots': len(train_params),
-    'n_modes': int(r),
-    'energy_threshold': 0.999,
-    'mean_full_solver_s': float(mean_full),
-    'mean_rom_eval_s': float(rom_eval_time),
-    'speedup': float(speedup),
-    'wall_saving_pct_at_80pct_rom': float(wall_saving_pct),
-    'mean_rel_err_thrust': float(errors.get('thrust', 0.0)),
-    'mean_rel_err_Isp': float(errors.get('Isp', 0.0)),
-    'mean_rel_err_exit_mach': float(errors.get('exit_mach', 0.0)),
-    'mean_rel_err_pressure_recovery': float(errors.get('pressure_recovery', 0.0)),
+results["rom"] = {
+    "identity": "coefficient-interpolated POD state reconstruction",
+    "comparison_baseline": "direct QoI IDW",
+    "training_parameters": ["A_exit", "L_nozzle"],
+    "n_training_snapshots": len(train_params),
+    "n_modes": n_modes,
+    "build_time_s": rom.build_time,
+    "mean_full_solver_s": rom.mean_full_time,
+    "validation_mean_relative_errors": errors,
 }
-
 fig = rom.pod.plot_energy()
-fig.savefig(os.path.join(_HERE, "verify_pod_energy.png"), dpi=140); plt.close(fig)
+fig.savefig(os.path.join(_HERE, "verify_pod_energy.png"), dpi=140)
+plt.close(fig)
 
-# 4) Bayesian optimization with ROM acceleration
-print("\n[4] Bayesian optimization with ROM acceleration")
-bo_cfg = SolverConfig()
-bo_cfg.mesh.nx = 40
-bo_cfg.mesh.ny = 10
-bo_cfg.n_steps = 400
-bo_cfg.print_interval = 500
-bo_cfg.cfl = 0.35
 
+print("\n[4] GP adaptive sampling with ROM prescreen/full confirmation")
 space = DesignSpace([
-    ('A_exit', 0.10, 0.20),
-    ('L_nozzle', 0.30, 0.55),
-    ('L_combustor', 0.35, 0.60),
+    ("A_exit", 0.12, 0.19),
+    ("L_nozzle", 0.34, 0.52),
 ])
-
 optimizer = BayesianOptimizer(
-    space, bo_cfg, rom_evaluator=rom,
-    objective_weights={'thrust': -1.0, 'Isp': -0.5},
+    space, rom_cfg, rom_evaluator=rom,
+    objective_weights={"tpr": -1.0},
 )
-
 t0 = time.time()
 best_params, best_qoi = optimizer.run(
-    n_init=6, n_iter=14,
-    uncertainty_threshold=0.25,
-    n_candidates=200,
-    verbose=True,
+    n_init=4, n_iter=5, n_candidates=120, rom_top_m=4, verbose=True,
 )
 bo_wall = time.time() - t0
-
-results['bayes_opt'] = {
-    'total_wall_s': float(bo_wall),
-    'n_total_evals': int(len(optimizer.X_eval)),
-    'n_full_evals': int(optimizer.n_full),
-    'n_rom_evals': int(optimizer.n_rom),
-    'full_solver_wall_s': float(optimizer.full_solver_time),
-    'rom_wall_s': float(optimizer.rom_time),
-    'pct_rom_evals': float(
-        100.0 * optimizer.n_rom / max(optimizer.n_full + optimizer.n_rom, 1)
+results["adaptive_sampling"] = {
+    "total_session_wall_s": bo_wall,
+    "objective": "maximize tpr",
+    "best_params": best_params,
+    "best_qoi": best_qoi,
+    "best_full_verified": optimizer.best_full_verified,
+    "all_gp_observations_full": all(
+        source == "full" for source in optimizer.source_eval
     ),
-    'best_params': {k: float(v) for k, v in best_params.items()},
-    'best_thrust': float(best_qoi['thrust']),
-    'best_Isp': float(best_qoi['Isp']),
-    'best_objective': float(optimizer.best_y),
+    "cost_report": optimizer.cost_report,
 }
-if optimizer.n_full > 0:
-    t_full_only = (optimizer.n_full + optimizer.n_rom) * (optimizer.full_solver_time / optimizer.n_full)
-    savings = (1.0 - (optimizer.full_solver_time + optimizer.rom_time) / t_full_only) * 100.0
-    results['bayes_opt']['estimated_wall_saving_pct'] = float(savings)
-
 fig = optimizer.plot_convergence()
-fig.savefig(os.path.join(_HERE, "verify_bo_convergence.png"), dpi=140); plt.close(fig)
+fig.savefig(os.path.join(_HERE, "verify_bo_convergence.png"), dpi=140)
+plt.close(fig)
 
-with open(os.path.join(_HERE, "verify_results.json"), "w") as f:
-    json.dump(results, f, indent=2)
+
+pod_tpr_error = errors.get("pod_state", {}).get("tpr")
+idw_tpr_error = errors.get("idw", {}).get("tpr")
+assertions = {
+    "clean_run_converged": bool(run_status["converged"]),
+    "clean_mass_balance_within_8pct": abs(qoi["mass_defect"]) < 0.08,
+    "clean_tpr_physical": 0.0 < qoi["tpr"] <= 1.0 + 1.0e-8,
+    "clean_state_admissible": bool(qoi["state_admissible"]),
+    "rom_has_modes": n_modes >= 1,
+    "pod_tpr_error_below_loose_bound": (
+        pod_tpr_error is not None and pod_tpr_error < 0.35
+    ),
+    "idw_tpr_error_below_loose_bound": (
+        idw_tpr_error is not None and idw_tpr_error < 0.35
+    ),
+    "bo_best_is_full_verified": bool(optimizer.best_full_verified),
+    "gp_trained_on_full_only": all(
+        source == "full" for source in optimizer.source_eval
+    ),
+    "bo_best_tpr_finite": bool(np.isfinite(best_qoi["tpr"])),
+    "combustion_fuel_bounded": bool(Yf2.min() >= -1.0e-10 and Yf2.max() <= 1.0 + 1.0e-10),
+}
+results["assertions"] = {
+    "passed": all(assertions.values()),
+    "checks": assertions,
+}
+
+strict_results = finite_or_none(results)
+with open(os.path.join(_HERE, "verify_results.json"), "w") as handle:
+    json.dump(strict_results, handle, indent=2, allow_nan=False)
+    handle.write("\n")
 
 print("\n" + "=" * 60)
-print("SUMMARY")
+print("VERIFICATION ASSERTIONS")
 print("=" * 60)
-for section, data in results.items():
-    print(f"\n[{section}]")
-    for k, v in data.items():
-        if isinstance(v, dict):
-            print(f"  {k}:")
-            for kk, vv in v.items():
-                print(f"    {kk}: {vv}")
-        else:
-            print(f"  {k}: {v}")
-
-print("\nAll end-to-end runs completed. Results written to verify_results.json")
+for name, passed in assertions.items():
+    print(f"  {name}: {'PASS' if passed else 'FAIL'}")
+if not all(assertions.values()):
+    print("Verification failed; see verification/verify_results.json")
+    sys.exit(1)
+print("All end-to-end assertions passed.")

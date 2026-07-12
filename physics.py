@@ -68,7 +68,7 @@ class VariableAreaSource:
     geometric source in EVERY equation:
 
         S = -(1/A) (dA/dx) * u * [rho, rho u, rho v, rho E + p, rho Yf]
-          (- (1/A) (dA/dt) * U for a breathing wall)
+            -(1/A) (dA/dt) * [rho, rho u, rho v, rho E + p, rho Yf]
 
     which yields the correct area-Mach behavior du/u = (dA/A)/(M^2 - 1):
     a converging duct compresses and decelerates a supersonic stream.
@@ -84,7 +84,7 @@ class VariableAreaSource:
     through contractions, and rho*u*A drifted ~2x along the duct).
     """
 
-    def __init__(self, mesh, geometry):
+    def __init__(self, mesh, geometry, legacy_breathing_energy=False):
         """
         Args:
             mesh:     StructuredMesh2D instance
@@ -92,6 +92,7 @@ class VariableAreaSource:
         """
         self.mesh = mesh
         self.geometry = geometry
+        self.legacy_breathing_energy = bool(legacy_breathing_energy)
 
         # precompute area and gradient at cell centroids
         # A(x_c[i]) and dA/dx(x_c[i]) for each column i
@@ -142,6 +143,8 @@ class VariableAreaSource:
         if np.any(self.dAdt_cell != 0.0):
             rate = (self.dAdt_cell / np.maximum(self.A_cell, 1e-30))[:, np.newaxis]
             S -= rate * U
+            if not self.legacy_breathing_energy:
+                S[3] -= rate * p
 
         return S
 
@@ -154,10 +157,11 @@ class SingleStepArrhenius:
 
     Rate:
         omega_dot = A_pre * rho^(nf + no) * Yf^nf * Yo^no * exp(-Ea / (Ru * T))
+                    [mol/(m^3 s)]
 
     Source terms:
         S_Yf  = -W_f * omega_dot        (fuel depletion)
-        S_E   =  Q_heat * omega_dot      (heat release)
+        S_E   =  Q_heat * W_f * omega_dot  (heat release)
 
     The oxidiser mass fraction Yo = 1 - Yf (binary mixture assumption).
     """
@@ -166,7 +170,8 @@ class SingleStepArrhenius:
                  nf=1.0, no=1.0, W_f=0.002, Ru=8.314, gamma=1.4, R_gas=287.0):
         """
         Args:
-            A_pre:  pre-exponential factor [1/s * (kg/m^3)^(1-nf-no)]
+            A_pre:  pre-exponential factor with units chosen so omega_dot is
+                    mol/(m^3 s) for the stated density/reaction orders
             Ea:     activation energy [J/mol]
             Q_heat: heat of reaction per unit mass of fuel [J/kg]
             nf, no: fuel and oxidiser reaction orders
@@ -183,12 +188,16 @@ class SingleStepArrhenius:
         self.gamma = gamma
         self.R_gas = R_gas
 
-    def compute(self, U):
+    def compute(self, U, dt=None):
         """
         Evaluate combustion source terms.
 
         Args:
-            U: conservative state, shape (5, nx, ny)
+            U:  conservative state, shape (5, nx, ny)
+            dt: current integration step [s].  When supplied, the reaction
+                rate is limited so one step cannot consume more fuel than
+                is locally available.  No arbitrary limiter is used when
+                the caller does not know the time step.
 
         Returns:
             S: source array, shape (5, nx, ny)
@@ -223,13 +232,20 @@ class SingleStepArrhenius:
                  * np.power(np.maximum(Yo, 0.0), self.no)
                  * np.exp(-self.Ea / (self.Ru * T)))
 
-        # clamp reaction rate to prevent numerical blowup
-        # max depletion: can't consume more fuel than exists in one step
-        omega = np.minimum(omega, rho_safe * Yf / (self.W_f * 1e-6 + 1e-30))
+        # Maximum depletion: one numerical step cannot consume more fuel
+        # than is locally available.  The old hard-coded 1 microsecond
+        # limiter made chemistry depend on an unrelated hidden time scale.
+        if dt is not None:
+            dt = float(dt)
+            if dt <= 0.0:
+                raise ValueError("combustion dt must be positive")
+            omega = np.minimum(
+                omega, rho_safe * Yf / (self.W_f * dt + 1e-30),
+            )
 
         # source terms
-        S[3] = self.Q_heat * omega       # energy release
-        S[4] = -self.W_f * omega          # fuel consumption
+        S[3] = self.Q_heat * self.W_f * omega  # energy release [J/(m^3 s)]
+        S[4] = -self.W_f * omega               # fuel consumption [kg/(m^3 s)]
 
         return S
 
@@ -302,11 +318,13 @@ class FEMViscous:
 
         Modifies U in-place.
 
-        The diffusion equation for a generic scalar phi with diffusivity alpha:
-            d(rho*phi)/dt = div(alpha * grad(phi))
+        The diffusion equation for a generic scalar phi is written with a
+        mass coefficient m and dynamic flux coefficient Gamma:
+            m d(phi)/dt = div(Gamma * grad(phi))
 
         Discretised on the structured mesh as:
-            (rho*phi^{n+1} - rho*phi^n) / dt = sum_faces alpha * (phi_nb - phi_P) * S_f / d_f / V_P
+            m (phi^{n+1} - phi^n) / dt =
+                sum_faces Gamma * (phi_nb - phi_P) * S_f / d_f / V_P
 
         Rearranged into a linear system A * phi^{n+1} = b.
         """
@@ -331,19 +349,21 @@ class FEMViscous:
         # transport coefficients at cell centers
         mu = self.transport.viscosity(T)          # (nx, ny)
         k_th = self.transport.thermal_conductivity(T)
-        D_sp = self.transport.species_diffusivity(T, rho)
+        D_sp = self.transport.species_diffusivity(T, rho_safe)
 
         def _flat(i, j):
             """Map (i,j) to flat index."""
             return i * ny + j
 
-        def _build_diffusion_system(alpha, phi, bc_type="neumann",
+        def _build_diffusion_system(flux_coeff, phi, mass_coeff,
+                                    bc_type="neumann",
                                     wall_bot_val=0.0, wall_top_val=0.0):
             """
             Build the implicit diffusion linear system for scalar phi.
 
             Args:
-                alpha:        diffusivity field, shape (nx, ny)
+                flux_coeff:   dynamic diffusion coefficient Gamma
+                mass_coeff:   transient coefficient m
                 phi:          scalar field to diffuse, shape (nx, ny)
                 bc_type:      "neumann" (zero-gradient) or "dirichlet"
                 wall_bot_val: Dirichlet value at j=0 wall (used if bc_type="dirichlet")
@@ -361,12 +381,12 @@ class FEMViscous:
                 for j in range(ny):
                     idx = _flat(i, j)
                     V = vol[i, j]
-                    diag_coeff = rho_safe[i, j] * V / dt
-                    rhs[idx] = rho_safe[i, j] * phi[i, j] * V / dt
+                    diag_coeff = mass_coeff[i, j] * V / dt
+                    rhs[idx] = mass_coeff[i, j] * phi[i, j] * V / dt
 
                     # east face (i+1)
                     if i < nx - 1:
-                        alpha_f = 2.0 * alpha[i, j] * alpha[i + 1, j] / max(alpha[i, j] + alpha[i + 1, j], 1e-30)
+                        alpha_f = 2.0 * flux_coeff[i, j] * flux_coeff[i + 1, j] / max(flux_coeff[i, j] + flux_coeff[i + 1, j], 1e-30)
                         d_f = 0.5 * (dx[i] + dx[i + 1])
                         S_f = dy[j]
                         coeff = alpha_f * S_f / d_f
@@ -376,7 +396,7 @@ class FEMViscous:
                         vals.append(-coeff)
                     # west face (i-1)
                     if i > 0:
-                        alpha_f = 2.0 * alpha[i, j] * alpha[i - 1, j] / max(alpha[i, j] + alpha[i - 1, j], 1e-30)
+                        alpha_f = 2.0 * flux_coeff[i, j] * flux_coeff[i - 1, j] / max(flux_coeff[i, j] + flux_coeff[i - 1, j], 1e-30)
                         d_f = 0.5 * (dx[i] + dx[i - 1])
                         S_f = dy[j]
                         coeff = alpha_f * S_f / d_f
@@ -387,7 +407,7 @@ class FEMViscous:
 
                     # north face (j+1)
                     if j < ny - 1:
-                        alpha_f = 2.0 * alpha[i, j] * alpha[i, j + 1] / max(alpha[i, j] + alpha[i, j + 1], 1e-30)
+                        alpha_f = 2.0 * flux_coeff[i, j] * flux_coeff[i, j + 1] / max(flux_coeff[i, j] + flux_coeff[i, j + 1], 1e-30)
                         d_f = 0.5 * (dy[j] + dy[j + 1])
                         S_f = dx[i]
                         coeff = alpha_f * S_f / d_f
@@ -397,7 +417,7 @@ class FEMViscous:
                         vals.append(-coeff)
                     # south face (j-1)
                     if j > 0:
-                        alpha_f = 2.0 * alpha[i, j] * alpha[i, j - 1] / max(alpha[i, j] + alpha[i, j - 1], 1e-30)
+                        alpha_f = 2.0 * flux_coeff[i, j] * flux_coeff[i, j - 1] / max(flux_coeff[i, j] + flux_coeff[i, j - 1], 1e-30)
                         d_f = 0.5 * (dy[j] + dy[j - 1])
                         S_f = dx[i]
                         coeff = alpha_f * S_f / d_f
@@ -411,7 +431,7 @@ class FEMViscous:
                             # ghost: phi_ghost = 2*wall_val - phi_P
                             # flux = alpha * (phi_ghost - phi_P) * S / d
                             #      = alpha * (2*wall_val - 2*phi_P) * S / dy
-                            alpha_f = alpha[i, j]
+                            alpha_f = flux_coeff[i, j]
                             d_f = 0.5 * dy[j]
                             S_f = dx[i]
                             coeff = alpha_f * S_f / d_f
@@ -421,7 +441,7 @@ class FEMViscous:
                     if j == ny - 1:
                         # wall BC at j=ny-1
                         if bc_type == "dirichlet":
-                            alpha_f = alpha[i, j]
+                            alpha_f = flux_coeff[i, j]
                             d_f = 0.5 * dy[j]
                             S_f = dx[i]
                             coeff = alpha_f * S_f / d_f
@@ -438,22 +458,26 @@ class FEMViscous:
             return phi_flat.reshape(nx, ny)
 
         # --- diffuse u-velocity (tangential wall speed as Dirichlet value) ---
-        # kinematic viscosity nu = mu / rho
-        nu = mu / rho_safe
-        u_new = _build_diffusion_system(nu, u_vel, bc_type="dirichlet",
+        u_new = _build_diffusion_system(mu, u_vel, rho_safe,
+                                        bc_type="dirichlet",
                                         wall_bot_val=self.wall_u_bottom,
                                         wall_top_val=self.wall_u_top)
 
         # --- diffuse v-velocity ---
-        v_new = _build_diffusion_system(nu, v_vel, bc_type="dirichlet")
+        v_new = _build_diffusion_system(
+            mu, v_vel, rho_safe, bc_type="dirichlet",
+        )
 
-        # --- diffuse temperature (thermal diffusivity alpha_T = k / (rho * cp)) ---
-        alpha_T = k_th / (rho_safe * self.transport.cp)
-        T_new = _build_diffusion_system(alpha_T, T, bc_type="neumann")
+        # --- diffuse temperature: rho*cp dT/dt = div(k grad(T)) ---
+        T_new = _build_diffusion_system(
+            k_th, T, rho_safe * self.transport.cp, bc_type="neumann",
+        )
         T_new = np.maximum(T_new, 50.0)
 
         # --- diffuse species ---
-        Yf_new = _build_diffusion_system(D_sp, Yf, bc_type="neumann")
+        Yf_new = _build_diffusion_system(
+            rho_safe * D_sp, Yf, rho_safe, bc_type="neumann",
+        )
         Yf_new = np.clip(Yf_new, 0.0, 1.0)
 
         # reconstruct conservative variables from updated primitives

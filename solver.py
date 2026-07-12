@@ -140,6 +140,12 @@ class SolverConfig:
         self.n_steps = 2000
         self.t_final = None
         self.print_interval = 200
+        # Optional steady convergence gate.  ``None`` preserves a pure
+        # step/time-driven run; experiment drivers enable it explicitly.
+        self.steady_rtol = None
+        self.steady_check_interval = 50
+        self.steady_required_checks = 2
+        self.residual_interval = 50
 
         # physics toggles
         self.viscous = False
@@ -152,6 +158,9 @@ class SolverConfig:
 
         # variable-area (quasi-1D duct) coupling
         self.area_source = True
+        # Audit-only switch reproducing the pre-fix missing wall-pressure
+        # work in breathing geometries.  Never enable for research results.
+        self.legacy_breathing_energy = False
 
         # outlet boundary condition
         self.outlet_type = "supersonic"   # "supersonic" or "back_pressure"
@@ -228,6 +237,9 @@ class Solver:
         self.fvm_residual = FVMResidual(
             self.mesh, gamma=inlet.gamma,
             geometry=config.geometry if config.area_source else None,
+            legacy_breathing_energy=getattr(
+                config, "legacy_breathing_energy", False,
+            ),
         )
 
         self.combustion = None
@@ -261,6 +273,12 @@ class Solver:
         self.step_count = 0
         self.dt_history = []
         self.residual_history = []
+        self.residual_steps = []
+        self.residual_times = []
+        self.converged = False
+        self.final_residual = float("nan")
+        self.run_status = None
+        self._current_dt = None
 
     def _validate_model_flags(self):
         """Validate reduced-fidelity feature flags."""
@@ -291,7 +309,7 @@ class Solver:
         dUdt = self.fvm_residual.compute(U, time=self.time if time is None else time)
 
         if self.combustion is not None:
-            dUdt += self.combustion.compute(U)
+            dUdt += self.combustion.compute(U, dt=self._current_dt)
 
         if self.simple_heat_release is not None:
             dUdt += self.simple_heat_release.compute(U)
@@ -334,6 +352,7 @@ class Solver:
             return 0.0
 
         self.dt_history.append(dt)
+        self._current_dt = float(dt)
 
         # --- Strang splitting ---
         if self.fem_viscous is not None:
@@ -349,15 +368,62 @@ class Solver:
 
         self.time += dt
         self.step_count += 1
+        self._current_dt = None
         return dt
 
-    def run(self, n_steps=None, t_final=None, step_callback=None):
-        """Execute the time-marching loop."""
+    def _normalized_residual(self):
+        """Dimensionless RMS RHS using freestream scales and flow time."""
+        inlet = self.cfg.inlet
+        rho_ref = max(float(inlet.rho_inf), 1.0e-30)
+        u_ref = max(abs(float(inlet.u_inf)), float(inlet.c_inf), 1.0e-30)
+        e_ref = (float(inlet.p_inf) / ((inlet.gamma - 1.0) * rho_ref)
+                 + 0.5 * float(inlet.u_inf)**2)
+        scales = np.array([
+            rho_ref,
+            rho_ref * u_ref,
+            rho_ref * u_ref,
+            rho_ref * max(e_ref, 1.0e-30),
+            rho_ref,
+        ])[:, np.newaxis, np.newaxis]
+        flow_time = float(self.cfg.geometry.L_total) / u_ref
+        rhs = self._rhs(self.state.U) * flow_time / scales
+        # The outermost x columns are boundary-condition image cells whose
+        # raw RHS need not vanish because they are overwritten at every RK
+        # stage.  Convergence is therefore measured on physical cells only.
+        if self.mesh.nx > 2:
+            rhs = rhs[:, 1:-1, :]
+        return float(np.sqrt(np.mean(rhs**2)))
+
+    def run(self, n_steps=None, t_final=None, step_callback=None,
+            steady_rtol=None, steady_check_interval=None,
+            steady_required_checks=None, residual_interval=None,
+            steady_qoi_fn=None):
+        """Execute the time-marching loop and return completion metadata.
+
+        Steady detection is optional.  When enabled, the dimensionless RHS is
+        checked at a regular cadence independent of console printing and the
+        run stops after ``steady_required_checks`` consecutive checks below
+        ``steady_rtol``.
+        """
         cfg = self.cfg
         if n_steps is None:
             n_steps = cfg.n_steps
         if t_final is None:
             t_final = cfg.t_final
+        if steady_rtol is None:
+            steady_rtol = getattr(cfg, "steady_rtol", None)
+        if steady_check_interval is None:
+            steady_check_interval = getattr(cfg, "steady_check_interval", 50)
+        if steady_required_checks is None:
+            steady_required_checks = getattr(cfg, "steady_required_checks", 2)
+        if residual_interval is None:
+            residual_interval = getattr(cfg, "residual_interval", 50)
+        steady_check_interval = max(int(steady_check_interval), 1)
+        steady_required_checks = max(int(steady_required_checks), 1)
+        residual_interval = max(int(residual_interval), 1)
+        self.converged = False
+        consecutive_converged = 0
+        steady_qoi_history = []
 
         print(f"Scramjet CFD Solver")
         print(f"  Mach = {cfg.inlet.mach:.1f}, alt = {cfg.inlet.altitude:.0f} m")
@@ -377,22 +443,83 @@ class Solver:
             if dt <= 0.0:
                 break
 
-            # residual monitoring
-            if cfg.print_interval and n % cfg.print_interval == 0:
+            check_residual = (
+                self.step_count == 1
+                or self.step_count % residual_interval == 0
+                or (steady_rtol is not None
+                    and self.step_count % steady_check_interval == 0)
+            )
+            res = None
+            if check_residual:
+                res = self._normalized_residual()
+                self.residual_history.append(res)
+                self.residual_steps.append(int(self.step_count))
+                self.residual_times.append(float(self.time))
+                self.final_residual = res
+
+            # Console diagnostics are independent of residual sampling.
+            if cfg.print_interval and (
+                    self.step_count == 1
+                    or self.step_count % cfg.print_interval == 0):
                 rho, u, v, p, T, Yf = self.state.primitives()
                 M = self.state.mach()
-                res = np.sqrt(np.mean(self._rhs(self.state.U)**2))
-                self.residual_history.append(res)
+                if res is None:
+                    res = self._normalized_residual()
 
-                print(f"  step {n:5d} | t = {self.time:.4e} s | dt = {dt:.3e} s "
+                print(f"  step {self.step_count:5d} | t = {self.time:.4e} s | dt = {dt:.3e} s "
                       f"| M_max = {M.max():.3f} | p_max = {p.max():.1f} Pa "
                       f"| res = {res:.3e}")
 
             if step_callback is not None:
                 step_callback(self)
 
+            if (steady_rtol is not None
+                    and self.step_count % steady_check_interval == 0):
+                if res is None:
+                    res = self._normalized_residual()
+                    self.residual_history.append(res)
+                    self.residual_steps.append(int(self.step_count))
+                    self.residual_times.append(float(self.time))
+                    self.final_residual = res
+                if steady_qoi_fn is not None:
+                    steady_qoi_history.append({
+                        "step": int(self.step_count),
+                        "time": float(self.time),
+                        "qoi": steady_qoi_fn(self),
+                    })
+                    steady_qoi_history = steady_qoi_history[-2:]
+                if np.isfinite(res) and res < float(steady_rtol):
+                    consecutive_converged += 1
+                else:
+                    consecutive_converged = 0
+                if consecutive_converged >= steady_required_checks:
+                    self.converged = True
+                    break
+
         print("-" * 60)
         print(f"Done. {self.step_count} steps, t_final = {self.time:.4e} s")
+        completed_time = bool(t_final is not None and self.time >= t_final)
+        self.run_status = {
+            "converged": bool(self.converged),
+            "steady_detection_enabled": steady_rtol is not None,
+            "steady_rtol": float(steady_rtol) if steady_rtol is not None else None,
+            "final_residual": (
+                float(self.final_residual)
+                if np.isfinite(self.final_residual) else None
+            ),
+            "residual_history": [float(v) for v in self.residual_history],
+            "residual_steps": list(self.residual_steps),
+            "residual_times": list(self.residual_times),
+            "steady_qoi_history": steady_qoi_history,
+            "completed_time": completed_time,
+            "reached_step_cap": bool(
+                not self.converged and not completed_time
+                and self.step_count >= int(n_steps)
+            ),
+            "steps": int(self.step_count),
+            "time": float(self.time),
+        }
+        return self.run_status
 
     def plot_mach(self):
         """2D contour plot of Mach number."""
@@ -463,9 +590,10 @@ class Solver:
     def plot_residual(self):
         """Plot residual history."""
         fig, ax = plt.subplots(figsize=(8, 5))
-        ax.semilogy(range(len(self.residual_history)), self.residual_history, "b-o", ms=3)
-        ax.set_xlabel("Print interval")
-        ax.set_ylabel("L2 residual")
+        x = self.residual_steps or list(range(len(self.residual_history)))
+        ax.semilogy(x, self.residual_history, "b-o", ms=3)
+        ax.set_xlabel("Solver step")
+        ax.set_ylabel("Dimensionless RMS residual")
         ax.set_title("Convergence history")
         ax.grid(True, alpha=0.3)
         plt.tight_layout()

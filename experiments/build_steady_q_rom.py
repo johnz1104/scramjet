@@ -35,7 +35,12 @@ from mesh import (
 )
 from solver import CombustionConfig, InletConfig, Solver, SolverConfig
 from rom import ROMEvaluator
-from experiments.run_static_wall_sweep import write_csv, write_json
+from experiments.run_static_wall_sweep import (
+    ARTIFACT_SCHEMA_VERSION,
+    require_schema_v2,
+    write_csv,
+    write_json,
+)
 
 
 def load_q_values_from_sweep(sweep_root):
@@ -50,8 +55,9 @@ def load_q_values_from_sweep(sweep_root):
     return [float(q) for q in q_values]
 
 
-def make_base_config(nx=30, ny=6, n_steps=120, cfl=0.35,
-                     mach=6.0, altitude=25000.0, min_area=1.0e-4):
+def make_base_config(nx=30, ny=6, n_steps=1400, cfl=0.35,
+                     mach=6.0, altitude=25000.0, min_area=1.0e-4,
+                     source_case_config=None):
     """Build a cold-flow base config that owns a PerturbedGeometryProfile."""
     cfg = SolverConfig()
     cfg.inlet = InletConfig(mach=mach, altitude=altitude, Yf_inlet=0.0)
@@ -59,21 +65,39 @@ def make_base_config(nx=30, ny=6, n_steps=120, cfl=0.35,
     cfg.mesh.ny = ny
     cfg.n_steps = n_steps
     cfg.cfl = cfl
-    cfg.print_interval = max(n_steps + 1, 1)
+    cfg.print_interval = 0
+    cfg.steady_rtol = 1.0e-6
+    cfg.steady_check_interval = 50
+    cfg.residual_interval = 50
     cfg.viscous = False
     cfg.wall_type = "slip"
     cfg.combustion = CombustionConfig(enabled=False)
     cfg.area_source = True
 
-    base = cfg.geometry
-    perturbation = LocalizedAreaPerturbation(
-        enabled=True,
-        mode="throat_gaussian",
-        amplitude=0.0,
-        x_center=base.x_throat,
-        width=0.05 * base.L_total,
-        min_area=min_area,
-    )
+    perturbation = None
+    if source_case_config is not None:
+        from experiments.export_high_fidelity_scaffold import geometry_from_dict
+        inlet = source_case_config["inlet"]
+        cfg.inlet = InletConfig(
+            mach=float(inlet["mach"]), altitude=float(inlet["altitude"]),
+            gamma=float(inlet["gamma"]), R_gas=float(inlet["R_gas"]),
+            Yf_inlet=0.0, T_inf=float(inlet["T_inf"]),
+            p_inf=float(inlet["p_inf"]),
+        )
+        source_geometry = geometry_from_dict(source_case_config["geometry"])
+        base = getattr(source_geometry, "base_geometry", source_geometry).copy()
+        source_perturbation = getattr(source_geometry, "perturbation", None)
+        if source_perturbation is not None:
+            perturbation = source_perturbation.copy()
+            perturbation.amplitude = 0.0
+    else:
+        base = cfg.geometry
+    if perturbation is None:
+        perturbation = LocalizedAreaPerturbation(
+            enabled=True, mode="throat_gaussian", amplitude=0.0,
+            x_center=base.x_throat, width=0.05 * base.L_total,
+            min_area=min_area,
+        )
     cfg.geometry = PerturbedGeometryProfile(base, perturbation)
     return cfg
 
@@ -94,7 +118,9 @@ def plot_q_vs_qoi(q_train, qoi_train, q_test, qoi_test_full, qoi_test_rom, key, 
         ax.plot(q_test, [q[key] for q in qoi_test_full], "bs", ms=8,
                 label="held-out (full)")
         ax.plot(q_test, [q[key] for q in qoi_test_rom], "r^", ms=8,
-                label="held-out (ROM)")
+                label="held-out (POD state QoI)")
+        idw = [q.get("qoi_idw", {}).get(key, np.nan) for q in qoi_test_rom]
+        ax.plot(q_test, idw, "gx", ms=8, label="held-out (direct QoI IDW)")
     ax.set_xlabel("q_throat [m^2]")
     ax.set_ylabel(key)
     ax.set_title(f"{key} vs q_throat")
@@ -106,7 +132,7 @@ def plot_q_vs_qoi(q_train, qoi_train, q_test, qoi_test_full, qoi_test_rom, key, 
     plt.close(fig)
 
 
-def build_rom(sweep_root=None, output_root=None, nx=30, ny=6, n_steps=120,
+def build_rom(sweep_root=None, output_root=None, nx=30, ny=6, n_steps=1400,
               cfl=0.35, mach=6.0, altitude=25000.0, min_area=1.0e-4,
               q_values=None, energy_threshold=0.999, holdout_fraction=0.25,
               seed=42):
@@ -115,6 +141,18 @@ def build_rom(sweep_root=None, output_root=None, nx=30, ny=6, n_steps=120,
         if sweep_root is None:
             raise ValueError("Provide either --sweep-root or --q-values")
         q_values = load_q_values_from_sweep(sweep_root)
+    source_case_config = None
+    if sweep_root is not None:
+        sweep_root = Path(sweep_root)
+        if not sweep_root.is_absolute():
+            sweep_root = REPO_ROOT / sweep_root
+        require_schema_v2(sweep_root, "static sweep")
+        case_configs = []
+        for path in (sweep_root / "cases").glob("*/config.json"):
+            data = json.loads(path.read_text())
+            case_configs.append((abs(float(data.get("q", 0.0))), data["config"]))
+        if case_configs:
+            source_case_config = min(case_configs, key=lambda item: item[0])[1]
 
     q_values = [float(q) for q in q_values]
     if len(q_values) < 3:
@@ -134,7 +172,8 @@ def build_rom(sweep_root=None, output_root=None, nx=30, ny=6, n_steps=120,
     plots_dir.mkdir(parents=True, exist_ok=True)
 
     base_cfg = make_base_config(nx=nx, ny=ny, n_steps=n_steps, cfl=cfl,
-                                mach=mach, altitude=altitude, min_area=min_area)
+                                mach=mach, altitude=altitude, min_area=min_area,
+                                source_case_config=source_case_config)
 
     rng = np.random.default_rng(seed)
     q_sorted = sorted(q_values)
@@ -173,7 +212,7 @@ def build_rom(sweep_root=None, output_root=None, nx=30, ny=6, n_steps=120,
     qoi_test_rom = []
     if test_params:
         errors = rom.validate(test_params)
-        validation["errors"] = {k: float(v) for k, v in errors.items()}
+        validation["errors"] = errors
         for params in test_params:
             qoi_test_rom.append(rom.evaluate(params))
 
@@ -186,11 +225,12 @@ def build_rom(sweep_root=None, output_root=None, nx=30, ny=6, n_steps=120,
             qoi_test_full.append(_compute_qoi(solver))
 
     plot_pod_energy(rom.pod, plots_dir / "pod_energy.png")
-    for key in ("thrust", "exit_mach", "pressure_recovery"):
+    for key in ("tpr", "exit_mach", "mass_defect"):
         plot_q_vs_qoi(train_q, qoi_train, test_q, qoi_test_full, qoi_test_rom, key,
                        plots_dir / f"{key}_vs_q.png")
 
     write_json(output_root / "manifest.json", {
+        "schema_version": ARTIFACT_SCHEMA_VERSION,
         "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "study": "steady_q_rom",
         "source_sweep_root": str(sweep_root) if sweep_root else None,
@@ -269,7 +309,7 @@ def main(argv=None):
     parser.add_argument("--output-root", default=None)
     parser.add_argument("--nx", type=int, default=30)
     parser.add_argument("--ny", type=int, default=6)
-    parser.add_argument("--n-steps", type=int, default=120)
+    parser.add_argument("--n-steps", type=int, default=1400)
     parser.add_argument("--cfl", type=float, default=0.35)
     parser.add_argument("--mach", type=float, default=6.0)
     parser.add_argument("--altitude", type=float, default=25000.0)

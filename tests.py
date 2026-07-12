@@ -14,6 +14,9 @@ Validation cases, each targeting a different solver component:
     4. Couette flow         — validates the FEMViscous implicit diffusion
                               operator (the actual class, moving top wall)
     5. Ignition delay       — validates Arrhenius combustion model
+    6. Breathing energy     — validates moving-wall pressure work and the
+                              isentropic compression law
+    7. Transient diffusion  — validates the dynamic-coefficient scaling
 
 Usage:
     python tests.py              # run all tests
@@ -23,6 +26,9 @@ Usage:
     python tests.py shock        # analytic shock position only
     python tests.py couette      # Couette flow only
     python tests.py ignition     # ignition delay only
+    python tests.py breathing    # moving-wall energy source only
+    python tests.py diffusion    # transient diffusion only
+    python tests.py config       # config clone/application invariants
 
 Dependency: mesh.py, fvm.py, physics.py, solver.py, diagnostics.py
 """
@@ -40,6 +46,7 @@ from mesh import (
     SinusoidalAreaForcing,
     TabulatedAreaProfile,
     TimeDependentPerturbedGeometryProfile,
+    geometry_to_dict,
 )
 from fvm import StateVector, BoundaryConditions, FVMResidual, TimeIntegrator
 from physics import (
@@ -52,6 +59,7 @@ from physics import (
 from solver import SolverConfig, Solver, InletConfig, CombustionConfig
 from diagnostics import scalar_diagnostics, shock_diagnostics
 from response_metrics import extract_response_metrics, fit_sinusoid
+from rom import PODBasis, ReducedSolver, _apply_params, _clone_config
 
 
 # Exact gas-dynamics references live in gasdynamics.py (shared with the
@@ -398,11 +406,15 @@ def test_response_metrics():
     qoi_amp = 1.5
     qoi_mean = 5.0
     expected_lag = 0.7  # rad
-    response = qoi_mean + qoi_amp * np.sin(omega * t_clean + forcing_phase + expected_lag)
+    # Delayed response: the estimator convention must return +expected_lag.
+    response = qoi_mean + qoi_amp * np.sin(
+        omega * t_clean + forcing_phase - expected_lag,
+    )
     flat_series = np.full_like(t_clean, 4.2)
     forcing_rows, qoi_rows, probe_rows = build_rows(
         t_clean, q_clean,
-        {"exit_mach": response, "mdot": flat_series, "pressure_recovery": response,
+        {"exit_mach": response, "mdot_prescribed": flat_series,
+         "pressure_recovery": response,
          "max_mach": response, "thrust": response},
         probe_pressures={"inlet_side": response * 100.0, "throat": flat_series},
     )
@@ -422,8 +434,8 @@ def test_response_metrics():
                        - qoi_amp * 100.0) < 1e-4
 
     # Flat QoI must report null phase lag with a warning.
-    flat_qoi_warning = metrics_clean["qoi"]["mdot"]["warning"]
-    flat_qoi_null = metrics_clean["qoi"]["mdot"]["phase_lag_vs_q_rad"] is None
+    flat_qoi_warning = metrics_clean["qoi"]["mdot_prescribed"]["warning"]
+    flat_qoi_null = metrics_clean["qoi"]["mdot_prescribed"]["phase_lag_vs_q_rad"] is None
     flat_qoi_ok = flat_qoi_null and "flat" in flat_qoi_warning.lower()
 
     flat_probe_warning = metrics_clean["probes"]["throat"]["warning"]
@@ -463,6 +475,9 @@ def test_response_metrics():
     insufficient_cycle_null = (
         metrics_short["qoi"]["exit_mach"]["phase_lag_vs_q_rad"] is None
     )
+    insufficient_amplitude_null = (
+        metrics_short["qoi"]["exit_mach"]["amplitude"] is None
+    )
     insufficient_cycle_warning_ok = any(
         "insufficient cycles" in w.lower() for w in metrics_short["warnings"]
     )
@@ -488,7 +503,28 @@ def test_response_metrics():
     mean_fit, amp_fit, phase_fit = fit_sinusoid(t_clean, response, freq)
     fit_ok = (abs(mean_fit - qoi_mean) < 1e-6
               and abs(amp_fit - qoi_amp) < 1e-6
-              and abs(phase_fit - (forcing_phase + expected_lag)) < 1e-3)
+              and abs(phase_fit - (forcing_phase - expected_lag)) < 1e-3)
+
+    # 6. Different timestamp arrays and lengths are fit independently.
+    t_force_sparse = np.linspace(0.0, 4.0 / freq, 337)
+    forcing_sparse = [
+        {"time": float(ti),
+         "q": float(forcing_mean + forcing_amp * np.sin(omega * ti))}
+        for ti in t_force_sparse
+    ]
+    metrics_mismatch = extract_response_metrics(
+        qoi_rows=qoi_rows, forcing_rows=forcing_sparse,
+        frequency_hz=freq, discard_fraction=0.25,
+        qoi_keys=("exit_mach",),
+    )
+    own_time_alignment_ok = (
+        abs(metrics_mismatch["qoi"]["exit_mach"]["phase_lag_vs_q_rad"]
+            - expected_lag) < 1.0e-3
+    )
+    quality_ok = (
+        metrics_clean["qoi"]["exit_mach"]["quality"]["supported"]
+        and metrics_clean["qoi"]["exit_mach"]["quality"]["r_squared"] > 0.999
+    )
 
     checks = {
         "clean signal recovers forcing amplitude": forcing_amp_ok,
@@ -502,11 +538,14 @@ def test_response_metrics():
         "transient is removed: amplitude still correct": transient_amp_ok,
         "transient is removed: phase still correct": transient_phase_ok,
         "insufficient cycles yields null phase lag": insufficient_cycle_null,
+        "insufficient cycles also gates amplitude": insufficient_amplitude_null,
         "insufficient cycles emits warning": insufficient_cycle_warning_ok,
         "epsilon=0 mean preserved": zero_mean_ok,
         "epsilon=0 amplitude is ~zero": zero_amp_small,
         "epsilon=0 phase lag is null": zero_phase_null,
         "fit_sinusoid utility round-trips": fit_ok,
+        "mismatched histories use their own timestamps": own_time_alignment_ok,
+        "fit quality block is populated": quality_ok,
     }
     for name, ok in checks.items():
         print(f"  {name}: {'PASS' if ok else 'FAIL'}")
@@ -1025,6 +1064,340 @@ def test_busemann_generator():
     return passed
 
 
+class _UniformBreathingGeometry:
+    """Spatially uniform A(t) used to isolate moving-volume physics."""
+
+    is_time_dependent = True
+
+    def __init__(self, area0=1.0, area_rate=-0.2):
+        self.area0 = float(area0)
+        self.area_rate = float(area_rate)
+        self.time = 0.0
+
+    def set_time(self, time):
+        self.time = float(time)
+
+    def area(self, x):
+        x = np.asarray(x, dtype=float)
+        return np.full_like(x, self.area0 + self.area_rate * self.time)
+
+    def area_gradient(self, x):
+        return np.zeros_like(np.asarray(x, dtype=float))
+
+    def area_time_derivative(self, x):
+        return np.full_like(np.asarray(x, dtype=float), self.area_rate)
+
+
+def test_breathing_energy(legacy_breathing_energy=False):
+    """Moving-control-volume pressure work and isentropic compression.
+
+    The first check evaluates the production FVM residual in interior cells.
+    The second integrates the standalone source ODE for a uniform static gas;
+    this cleanly excludes boundary waves and verifies rho*A, p*A**gamma, and
+    T*A**(gamma-1) invariants.
+    """
+    print("\n" + "=" * 60)
+    print("TEST 6: Breathing-Wall Energy Source")
+    print("=" * 60)
+
+    gamma = 1.4
+    mesh = StructuredMesh2D.uniform(0.0, 1.0, 0.0, 0.1, 8, 2)
+    geom = _UniformBreathingGeometry(area0=1.0, area_rate=-0.2)
+    state = StateVector(mesh.nx, mesh.ny, gamma=gamma, R_gas=287.0)
+    rho0, p0 = 1.1, 1.0
+    fill = np.ones((mesh.nx, mesh.ny))
+    state.set_primitive(rho0 * fill, 0.0 * fill, 0.0 * fill, p0 * fill)
+
+    residual = FVMResidual(
+        mesh, gamma=gamma, geometry=geom,
+        legacy_breathing_energy=legacy_breathing_energy,
+    )
+    rhs = residual.compute(state.U, time=0.0)
+    rate = geom.area_rate / geom.area0
+    expected = -rate * state.U
+    expected[3] -= rate * p0
+    interior = (slice(None), slice(2, -2), slice(None))
+    discrete_err = float(np.max(np.abs(rhs[interior] - expected[interior])))
+
+    static_geom = GeometryProfile.default()
+    corrected_static = FVMResidual(mesh, gamma=gamma, geometry=static_geom)
+    legacy_static = FVMResidual(
+        mesh, gamma=gamma, geometry=static_geom,
+        legacy_breathing_energy=True,
+    )
+    static_invariance = np.array_equal(
+        corrected_static.compute(state.U), legacy_static.compute(state.U),
+    )
+
+    # Integrate only the spatially uniform source.  A short compression keeps
+    # explicit-RK error negligible while strongly discriminating p~A^-gamma
+    # from the legacy p~A^-1 law.
+    geom_ode = _UniformBreathingGeometry(area0=1.0, area_rate=-0.4)
+    src = VariableAreaSource(
+        mesh, geom_ode,
+        legacy_breathing_energy=legacy_breathing_energy,
+    )
+    U = state.U.copy()
+    t_end = 0.5
+    n_steps = 5000
+    dt = t_end / n_steps
+    for n in range(n_steps):
+        t = n * dt
+
+        def ode(U_stage, stage_time):
+            return src.compute(U_stage, gamma, time=stage_time)
+
+        k1 = ode(U, t)
+        k2 = ode(U + 0.5 * dt * k1, t + 0.5 * dt)
+        k3 = ode(U + 0.5 * dt * k2, t + 0.5 * dt)
+        k4 = ode(U + dt * k3, t + dt)
+        U += (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+
+    A_ratio = geom_ode.area(np.array([0.0]))[0] / geom_ode.area0
+    rho = float(U[0, 3, 0])
+    p = float((gamma - 1.0) * U[3, 3, 0])
+    T_ratio = (p / rho) / (p0 / rho0)
+    rho_exact = rho0 * A_ratio**-1.0
+    p_exact = p0 * A_ratio**-gamma
+    T_exact_ratio = A_ratio**(-(gamma - 1.0))
+    rho_err = abs(rho / rho_exact - 1.0)
+    p_err = abs(p / p_exact - 1.0)
+    T_err = abs(T_ratio / T_exact_ratio - 1.0)
+
+    checks = {
+        "discrete full source near machine precision": discrete_err < 2.0e-13,
+        "dA/dt=0 path is bitwise invariant": static_invariance,
+        "rho follows A^-1": rho_err < 2.0e-9,
+        "p follows A^-gamma": p_err < 2.0e-9,
+        "T follows A^-(gamma-1)": T_err < 2.0e-9,
+    }
+    print(f"  discrete max error: {discrete_err:.3e}")
+    print(f"  integrated relative errors: rho={rho_err:.3e}, "
+          f"p={p_err:.3e}, T={T_err:.3e}")
+    for name, ok in checks.items():
+        print(f"  {name}: {'PASS' if ok else 'FAIL'}")
+    return all(checks.values())
+
+
+def test_config_integrity():
+    """Config cloning/application must preserve BCs and geometry identity."""
+    print("\n" + "=" * 60)
+    print("TEST 6B: Config Clone and Parameter Validation")
+    print("=" * 60)
+    x = np.linspace(0.0, 0.4, 12)
+    area = 0.05 - 0.01 * np.sin(np.pi * x / x[-1])
+    cfg = SolverConfig()
+    cfg.geometry = TabulatedAreaProfile(x, area, name="roundtrip_table")
+    cfg.mesh.nx, cfg.mesh.ny, cfg.mesh.y_stretch = 24, 5, 1.08
+    cfg.outlet_type = "back_pressure"
+    cfg.outlet_p_back = 42000.0
+    cfg.outlet_p_back_amplitude = 0.12
+    cfg.outlet_p_back_frequency_hz = 321.0
+    cfg.outlet_p_back_phase = 0.7
+    cfg.legacy_breathing_energy = False
+    cfg.steady_rtol = 2.0e-7
+
+    cloned = _clone_config(cfg)
+    top_level_equal = all(
+        getattr(cloned, key) == getattr(cfg, key)
+        for key in (
+            "outlet_type", "outlet_p_back", "outlet_p_back_amplitude",
+            "outlet_p_back_frequency_hz", "outlet_p_back_phase",
+            "legacy_breathing_energy", "steady_rtol",
+        )
+    )
+    geometry_equal = geometry_to_dict(cloned.geometry) == geometry_to_dict(cfg.geometry)
+    independent = cloned.geometry is not cfg.geometry
+    from experiments.export_high_fidelity_scaffold import (
+        geometry_from_dict,
+        match_static_case,
+    )
+    exported_table = geometry_from_dict(geometry_to_dict(cfg.geometry))
+    exporter_table_roundtrip = np.array_equal(
+        exported_table.A_samples, cfg.geometry.A_samples,
+    )
+
+    forcing = SinusoidalAreaForcing(
+        amplitude=0.002, frequency_hz=500.0, phase=0.4, mean=0.001,
+    )
+    dynamic = TimeDependentPerturbedGeometryProfile(
+        cfg.geometry,
+        LocalizedAreaPerturbation(
+            amplitude=0.0, x_center=cfg.geometry.x_throat,
+            width=0.03, min_area=1.0e-4,
+        ),
+        forcing,
+    )
+    exported_mean = geometry_from_dict(geometry_to_dict(dynamic))
+    x_probe = np.linspace(0.0, cfg.geometry.L_total, 30)
+    expected_mean = (cfg.geometry.area(x_probe)
+                     + forcing.mean * dynamic.perturbation.shape(
+                         x_probe, cfg.geometry,
+                     ))
+    exporter_dynamic_mean = np.allclose(
+        exported_mean.area(x_probe), expected_mean, rtol=0.0, atol=1.0e-14,
+    ) and exported_mean.exported_forcing_spec["amplitude"] == forcing.amplitude
+    q_mismatch_rejected = False
+    try:
+        match_static_case({"q0": 0.0, "q1": 0.01}, 0.025,
+                          q_match_tol=1.0e-4)
+    except ValueError as exc:
+        q_mismatch_rejected = "available static q values" in str(exc)
+
+    inlet_only = _clone_config(cfg)
+    _apply_params(inlet_only, {"mach": 3.8})
+    inlet_preserves_type = isinstance(inlet_only.geometry, TabulatedAreaProfile)
+    inlet_preserves_samples = np.array_equal(
+        inlet_only.geometry.A_samples, cfg.geometry.A_samples,
+    )
+
+    perturbed = _clone_config(cfg)
+    _apply_params(perturbed, {"q_throat": 5.0e-4})
+    perturb_wraps_table = (
+        isinstance(perturbed.geometry, PerturbedGeometryProfile)
+        and isinstance(perturbed.geometry.base_geometry, TabulatedAreaProfile)
+    )
+
+    section_rejected = False
+    try:
+        bad = _clone_config(cfg)
+        _apply_params(bad, {"A_exit": 0.2})
+    except ValueError:
+        section_rejected = True
+
+    unknown_rejected = False
+    try:
+        _apply_params(_clone_config(cfg), {"L_combustor_typo": 0.5})
+    except ValueError:
+        unknown_rejected = True
+
+    pod = PODBasis()
+    reduced = ReducedSolver(
+        pod, [{"q_throat": 0.0}], np.zeros((1, 1)), [{"tpr": 1.0}], cfg,
+    )
+    query_rejected = False
+    try:
+        reduced.evaluate({"q_throat": 0.0, "A_exit": 0.2})
+    except ValueError:
+        query_rejected = True
+
+    from diagnostics import physical_exit_index, transverse_average
+    stretched = StructuredMesh2D.stretched(0.0, 1.0, 0.0, 1.0, 4, 4,
+                                           y_ratio=1.7)
+    values = np.array([1.0, 2.0, 4.0, 8.0])
+    dy_average_ok = abs(
+        transverse_average(values, stretched)
+        - float(np.sum(values * stretched.dy) / np.sum(stretched.dy))
+    ) < 1.0e-15
+    exit_convention_ok = physical_exit_index(stretched) == stretched.nx - 2
+
+    checks = {
+        "all outlet/convergence fields round-trip": top_level_equal,
+        "tabulated geometry round-trips exactly": geometry_equal,
+        "clone geometry is independent": independent,
+        "exporter round-trips tabulated samples": exporter_table_roundtrip,
+        "exporter emits time-dependent mean + forcing metadata": exporter_dynamic_mean,
+        "exporter rejects out-of-tolerance q match": q_mismatch_rejected,
+        "inlet-only change preserves geometry type": inlet_preserves_type,
+        "inlet-only change preserves samples": inlet_preserves_samples,
+        "perturbation wraps existing tabulated base": perturb_wraps_table,
+        "three-section key rejected for tabulated base": section_rejected,
+        "unknown parameter rejected": unknown_rejected,
+        "ROM query requires exact training keys": query_rejected,
+        "transverse averages include stretched-grid dy": dy_average_ok,
+        "shared exit convention is nx-2": exit_convention_ok,
+    }
+    for name, ok in checks.items():
+        print(f"  {name}: {'PASS' if ok else 'FAIL'}")
+    return all(checks.values())
+
+
+class _ConstantTransport:
+    """Constant dynamic transport coefficients for scaling tests."""
+
+    def __init__(self, mu=1.0e-5, cp=1004.5, pr=0.72, sc=0.9):
+        self.mu = float(mu)
+        self.cp = float(cp)
+        self.pr = float(pr)
+        self.sc = float(sc)
+
+    def viscosity(self, T):
+        return np.full_like(np.asarray(T, dtype=float), self.mu)
+
+    def thermal_conductivity(self, T):
+        return np.full_like(np.asarray(T, dtype=float), self.mu * self.cp / self.pr)
+
+    def species_diffusivity(self, T, rho):
+        return self.mu / (np.asarray(rho, dtype=float) * self.sc)
+
+
+def _couette_startup_state(mesh, rho, T=300.0, gamma=1.4, R_gas=287.0):
+    state = StateVector(mesh.nx, mesh.ny, gamma=gamma, R_gas=R_gas)
+    fill = np.ones((mesh.nx, mesh.ny))
+    state.set_primitive(rho * fill, 0.0 * fill, 0.0 * fill,
+                        rho * R_gas * T * fill)
+    return state
+
+
+def test_transient_diffusion():
+    """Transient Couette solution and linear density-timescale scaling."""
+    print("\n" + "=" * 60)
+    print("TEST 7: Transient Diffusion Scaling")
+    print("=" * 60)
+    gamma, R_gas = 1.4, 287.0
+    nx, ny = 2, 60
+    H, L, U_wall = 0.01, 0.01, 10.0
+    rho1 = 1.0
+    transport = _ConstantTransport(mu=1.0e-5)
+    mesh = StructuredMesh2D.uniform(0.0, L, 0.0, H, nx, ny)
+
+    nu = transport.mu / rho1
+    tau = H**2 / nu
+    t_eval = 0.08 * tau
+    n_steps = 160
+    dt = t_eval / n_steps
+    state = _couette_startup_state(mesh, rho1, gamma=gamma, R_gas=R_gas)
+    fem = FEMViscous(mesh, transport, gamma=gamma, R_gas=R_gas,
+                     wall_u_bottom=0.0, wall_u_top=U_wall)
+    for _ in range(n_steps):
+        fem.step(state.U, dt)
+    u_num = state.primitives()[1][0]
+
+    y = mesh.yc
+    eta = y / H
+    u_exact = U_wall * eta
+    for mode in range(1, 400):
+        u_exact += (2.0 * U_wall / np.pi) * ((-1.0) ** mode / mode) * np.sin(
+            mode * np.pi * eta,
+        ) * np.exp(-(mode * np.pi)**2 * nu * t_eval / H**2)
+    startup_err = float(np.sqrt(np.mean((u_num - u_exact)**2)) / U_wall)
+
+    # At fixed dynamic viscosity, rho=2 at time t must match rho=1 at t/2.
+    def run_density(rho, duration):
+        st = _couette_startup_state(mesh, rho, gamma=gamma, R_gas=R_gas)
+        op = FEMViscous(mesh, transport, gamma=gamma, R_gas=R_gas,
+                        wall_u_bottom=0.0, wall_u_top=U_wall)
+        dt_local = duration / n_steps
+        for _ in range(n_steps):
+            op.step(st.U, dt_local)
+        return st.primitives()[1][0]
+
+    u_rho1_half = run_density(rho1, 0.5 * t_eval)
+    u_rho2_full = run_density(2.0 * rho1, t_eval)
+    scaling_err = float(
+        np.sqrt(np.mean((u_rho2_full - u_rho1_half)**2)) / U_wall
+    )
+    checks = {
+        "startup Fourier-series L2 error < 2%": startup_err < 0.02,
+        "doubling rho doubles timescale": scaling_err < 2.0e-4,
+    }
+    print(f"  startup relative L2 error: {startup_err:.3e}")
+    print(f"  rho-timescale profile mismatch: {scaling_err:.3e}")
+    for name, ok in checks.items():
+        print(f"  {name}: {'PASS' if ok else 'FAIL'}")
+    return all(checks.values())
+
+
 def test_couette_flow():
     """
     Steady-state Couette flow between parallel plates.
@@ -1123,17 +1496,18 @@ def test_ignition_delay():
         - Only the combustion source term is active
 
     Expected behavior:
-        - Temperature and pressure remain nearly constant until ignition
-        - At ignition, rapid temperature rise as fuel is consumed
-        - Final state approaches adiabatic flame temperature
+        - Fuel remains bounded without test-side clipping
+        - Heat release equals Q_heat times the mass of fuel consumed
+        - Final temperature approaches T_init + Q_heat*Yf_init/cv
 
     This tests the SingleStepArrhenius source term implementation
     and the stability of the chemistry coupling.
 
     Pass criteria:
-        - Fuel is consumed (final Yf < 0.01 * initial Yf)
-        - Temperature increases (final T > 1.5 * initial T)
-        - Mass is conserved (|rho_final - rho_initial| / rho_initial < 1e-6)
+        - Fuel is consumed and remains in [0, 1]
+        - Final temperature is within 2% of the caloric exact value
+        - No unphysical high-temperature excursion occurs
+        - Mass is conserved
     """
     print("\n" + "=" * 60)
     print("TEST 3: Ignition Delay (Combustion)")
@@ -1169,7 +1543,7 @@ def test_ignition_delay():
     # time integration with sub-stepping
     # use explicit Euler with small dt for stiff chemistry
     dt = 1.0e-7   # s
-    n_steps = 10000
+    n_steps = 30000
     t_max = dt * n_steps
 
     T_hist = []
@@ -1177,17 +1551,13 @@ def test_ignition_delay():
     t_hist = []
 
     for n in range(n_steps):
-        S = combustion.compute(U)
+        S = combustion.compute(U, dt=dt)
 
         # explicit Euler update (0-D, no spatial terms)
         U += dt * S
 
-        # clamp fuel fraction
         rho_curr = U[0, 0, 0]
         Yf_curr = U[4, 0, 0] / max(rho_curr, 1e-30)
-        if Yf_curr < 0.0:
-            U[4, 0, 0] = 0.0
-            Yf_curr = 0.0
 
         # extract T
         E_curr = U[3, 0, 0] / max(rho_curr, 1e-30)
@@ -1206,19 +1576,28 @@ def test_ignition_delay():
     print(f"  Yf_init = {Yf_init:.4f}, Yf_final = {Yf_final:.6f}")
     print(f"  rho_init = {rho_init:.4f}, rho_final = {rho_final:.4f}")
 
+    cv = R_gas / (gamma - 1.0)
+    T_exact = T_init + combustion.Q_heat * Yf_init / cv
+
     # check criteria
     fuel_consumed = Yf_final < 0.01 * Yf_init
-    temp_increased = T_final > 1.5 * T_init
+    fuel_bounded = min(Yf_hist) >= -1.0e-12 and max(Yf_hist) <= Yf_init + 1.0e-12
+    energy_consistent = abs(T_final / T_exact - 1.0) < 0.02
+    sane_temperature = max(T_hist) < 2500.0
     mass_conserved = abs(rho_final - rho_init) / rho_init < 1e-6
 
     print(f"  Fuel consumed:  {'PASS' if fuel_consumed else 'FAIL'} "
           f"(Yf_final/Yf_init = {Yf_final/Yf_init:.4e})")
-    print(f"  Temp increased: {'PASS' if temp_increased else 'FAIL'} "
-          f"(T_final/T_init = {T_final/T_init:.2f})")
+    print(f"  Fuel bounded:   {'PASS' if fuel_bounded else 'FAIL'}")
+    print(f"  Energy balance: {'PASS' if energy_consistent else 'FAIL'} "
+          f"(T_exact = {T_exact:.1f} K)")
+    print(f"  Temperature sane: {'PASS' if sane_temperature else 'FAIL'} "
+          f"(T_max = {max(T_hist):.1f} K)")
     print(f"  Mass conserved: {'PASS' if mass_conserved else 'FAIL'} "
           f"(delta_rho/rho = {abs(rho_final-rho_init)/rho_init:.2e})")
 
-    passed = fuel_consumed and temp_increased and mass_conserved
+    passed = (fuel_consumed and fuel_bounded and energy_consistent
+              and sane_temperature and mass_conserved)
 
     # save plot
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
@@ -1253,6 +1632,9 @@ if __name__ == "__main__":
         "sod": test_sod_shock_tube,
         "nozzle": test_nozzle_area_mach,
         "shock": test_shock_position,
+        "breathing": test_breathing_energy,
+        "config": test_config_integrity,
+        "diffusion": test_transient_diffusion,
         "couette": test_couette_flow,
         "ignition": test_ignition_delay,
     }
@@ -1260,14 +1642,24 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         name = sys.argv[1].lower()
         if name in tests:
-            result = tests[name]()
+            if name == "breathing":
+                legacy = any(
+                    arg in ("--legacy-breathing-energy",
+                            "legacy_breathing_energy=True")
+                    for arg in sys.argv[2:]
+                )
+                result = tests[name](legacy_breathing_energy=legacy)
+            else:
+                result = tests[name]()
             status = "PASSED" if result else "FAILED"
             print(f"\n{'='*60}")
             print(f"  {name.upper()}: {status}")
             print(f"{'='*60}")
+            sys.exit(0 if result else 1)
         else:
             print(f"Unknown test: {name}")
             print(f"Available: {', '.join(tests.keys())}")
+            sys.exit(2)
     else:
         # run all
         results = {}
@@ -1287,3 +1679,4 @@ if __name__ == "__main__":
         print(f"{'='*60}")
         print(f"  Overall: {'ALL PASSED' if all_passed else 'SOME FAILED'}")
         print(f"{'='*60}")
+        sys.exit(0 if all_passed else 1)

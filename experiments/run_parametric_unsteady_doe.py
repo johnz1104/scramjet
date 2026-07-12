@@ -47,6 +47,7 @@ from mesh import (
 from solver import Solver
 from diagnostics import all_case_diagnostics
 from experiments.run_static_wall_sweep import (
+    ARTIFACT_SCHEMA_VERSION,
     config_to_dict,
     git_metadata,
     residual_rows,
@@ -152,7 +153,8 @@ def select_t_final(frequency_hz, cycles, t_final_static):
 def run_one_case(case_dir, design_row, baseline_state_U, baseline_summary,
                  nx, ny, cfl, mach, altitude, width, x_center, min_area,
                  cycles, t_final_static, unsteady_steps, sample_interval_steps,
-                 discard_fraction, preset=None):
+                 discard_fraction, preset=None,
+                 legacy_breathing_energy=False):
     """Run a single DOE case. Returns a summary row (status PASS/FAIL)."""
     plots_dir = case_dir / "plots"
     case_dir.mkdir(parents=True, exist_ok=True)
@@ -171,11 +173,16 @@ def run_one_case(case_dir, design_row, baseline_state_U, baseline_summary,
     try:
         t_final = select_t_final(design_row["frequency_hz"], cycles, t_final_static)
 
+        dt_est = max(float(baseline_summary.get("dt_estimate", 0.0)), 1.0e-15)
+        auto_step_cap = int(np.ceil(t_final / dt_est) * 1.5) + 2
+        step_cap = auto_step_cap if unsteady_steps is None else int(unsteady_steps)
+
         cfg = make_cold_flow_config(
-            nx=nx, ny=ny, n_steps=unsteady_steps, cfl=cfl,
+            nx=nx, ny=ny, n_steps=step_cap, cfl=cfl,
             mach=mach, altitude=altitude, preset=preset,
         )
         cfg.t_final = t_final
+        cfg.legacy_breathing_energy = bool(legacy_breathing_energy)
         cfg.geometry = build_time_dependent_geometry(
             base_geometry=cfg.geometry,
             q_offset=design_row["q_offset"],
@@ -206,7 +213,7 @@ def run_one_case(case_dir, design_row, baseline_state_U, baseline_summary,
             if current_solver.step_count % sample_interval_steps == 0:
                 sample(current_solver)
 
-        solver.run(n_steps=unsteady_steps, t_final=t_final, step_callback=callback)
+        solver.run(n_steps=step_cap, t_final=t_final, step_callback=callback)
         if forcing_rows[-1]["time"] != solver.time:
             sample(solver)
 
@@ -214,6 +221,7 @@ def run_one_case(case_dir, design_row, baseline_state_U, baseline_summary,
             raise RuntimeError("NaN appeared in conservative state")
 
         write_json(case_dir / "config.json", {
+            "schema_version": ARTIFACT_SCHEMA_VERSION,
             "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "study": "parametric_unsteady_doe",
             "model": "time_dependent_effective_area_forcing_with_offset",
@@ -224,12 +232,15 @@ def run_one_case(case_dir, design_row, baseline_state_U, baseline_summary,
             "probes": probes,
             "cycles_requested": float(cycles),
             "t_final": float(t_final),
+            "auto_step_cap": int(auto_step_cap),
+            "step_cap_used": int(step_cap),
+            "legacy_breathing_energy": bool(legacy_breathing_energy),
         })
         write_csv(case_dir / "forcing_history.csv", forcing_rows)
         write_csv(case_dir / "qoi_history.csv", qoi_rows)
         write_csv(case_dir / "probe_history.csv", probe_rows)
         write_csv(case_dir / "residual.csv", residual_rows(solver),
-                  fieldnames=["sample", "residual_l2"])
+                  fieldnames=["sample", "step", "time", "residual_l2"])
         write_csv(case_dir / "timestep_history.csv", timestep_rows(solver))
         write_json(case_dir / "diagnostics.json", all_case_diagnostics(solver))
 
@@ -244,11 +255,30 @@ def run_one_case(case_dir, design_row, baseline_state_U, baseline_summary,
         plot_qoi(qoi_rows, plots_dir / "qoi_history.png")
         plot_probe_pressure(probe_rows, plots_dir / "probe_pressure_history.png")
 
+        achieved_cycles = (
+            float(design_row["frequency_hz"]) * float(solver.time)
+            if design_row["frequency_hz"] > 0.0 else 0.0
+        )
+        completed = solver.time >= t_final - max(1.0e-12, 1.0e-9 * t_final)
+        baseline_converged = bool(baseline_summary.get("converged", False))
+        status = "ok" if completed and baseline_converged else "incomplete"
+        reason = ""
+        if not baseline_converged:
+            reason = "mean-geometry baseline did not converge"
+        elif not completed:
+            reason = "unsteady step cap reached before requested physical time"
         summary_row.update({
-            "status": "ok",
+            "status": status,
+            "error_message": reason,
             "samples": len(qoi_rows),
             "final_time": float(solver.time),
             "steps": int(solver.step_count),
+            "step_cap": int(step_cap),
+            "auto_step_cap": int(auto_step_cap),
+            "cycles_requested": float(cycles),
+            "achieved_cycles": achieved_cycles,
+            "baseline_converged": baseline_converged,
+            "baseline_final_residual": baseline_summary.get("final_residual"),
             "min_throat_area": float(cfg.geometry.min_area_value(time=solver.time)),
         })
         _merge_metrics_into_summary(summary_row, metrics)
@@ -270,11 +300,19 @@ def _merge_metrics_into_summary(summary_row, metrics):
     for key, sub in qoi_block.items():
         summary_row[f"{key}_mean"] = sub.get("mean")
         summary_row[f"{key}_amplitude"] = sub.get("amplitude")
+        summary_row[f"{key}_raw_amplitude"] = sub.get("raw_amplitude")
         summary_row[f"{key}_phase_lag_rad"] = sub.get("phase_lag_vs_q_rad")
+        quality = sub.get("quality", {})
+        summary_row[f"{key}_supported"] = quality.get("supported", False)
+        summary_row[f"{key}_r_squared"] = quality.get("r_squared")
+        summary_row[f"{key}_drift_fraction"] = quality.get("drift_fraction")
+        summary_row[f"{key}_snr"] = quality.get("snr")
     probe_block = metrics.get("probes", {})
     for probe_name, sub in probe_block.items():
         summary_row[f"probe_{probe_name}_pressure_amplitude"] = sub.get("pressure_amplitude")
+        summary_row[f"probe_{probe_name}_pressure_raw_amplitude"] = sub.get("pressure_raw_amplitude")
         summary_row[f"probe_{probe_name}_pressure_mean"] = sub.get("pressure_mean")
+        summary_row[f"probe_{probe_name}_supported"] = sub.get("quality", {}).get("supported", False)
     warnings = metrics.get("warnings", [])
     summary_row["warnings"] = "; ".join(warnings) if warnings else ""
 
@@ -308,7 +346,7 @@ def plot_response_amplitude_vs_epsilon(summary_rows, path):
 
 
 def plot_mean_qoi_vs_q_offset(summary_rows, path):
-    """Aggregate plot: mean exit Mach and mean pressure recovery vs q_offset."""
+    """Aggregate plot: mean exit Mach and experiment-matched TPR vs q_offset."""
     valid = [r for r in summary_rows if r.get("status") == "ok"
              and r.get("exit_mach_mean") is not None]
     if not valid:
@@ -322,10 +360,10 @@ def plot_mean_qoi_vs_q_offset(summary_rows, path):
     axes[0].grid(True, alpha=0.3)
 
     axes[1].scatter([r["q_offset"] for r in valid],
-                    [r["pressure_recovery_mean"] for r in valid],
+                    [r["tpr_mean"] for r in valid],
                     c=[r["epsilon"] for r in valid], cmap="plasma", s=40)
     axes[1].set_xlabel("q_offset [m^2]")
-    axes[1].set_ylabel("mean pressure recovery")
+    axes[1].set_ylabel("mean TPR")
     axes[1].grid(True, alpha=0.3)
 
     fig.suptitle("Mean QoI vs static q_offset (color = epsilon)")
@@ -368,10 +406,21 @@ def plot_frequency_response(summary_rows, path):
     return True
 
 
-def warm_start_baseline(nx, ny, baseline_steps, cfl, mach, altitude, preset=None):
-    """Run a short cold-flow baseline; supply its state as warm start."""
+def warm_start_baseline(q_offset, nx, ny, baseline_steps, cfl, mach,
+                        altitude, width=None, x_center=None,
+                        min_area=1.0e-4, steady_rtol=1.0e-6,
+                        steady_check_interval=50, preset=None):
+    """Converge the static mean geometry for one unique q_offset."""
     cfg = make_cold_flow_config(nx=nx, ny=ny, n_steps=baseline_steps, cfl=cfl,
                                 mach=mach, altitude=altitude, preset=preset)
+    cfg.geometry = build_time_dependent_geometry(
+        cfg.geometry, q_offset=q_offset, epsilon=0.0,
+        frequency_hz=0.0, phase=0.0, width=width,
+        x_center=x_center, min_area=min_area,
+    )
+    cfg.steady_rtol = float(steady_rtol)
+    cfg.steady_check_interval = int(steady_check_interval)
+    cfg.residual_interval = int(steady_check_interval)
     solver = Solver(cfg)
     solver.run()
     return solver
@@ -379,10 +428,13 @@ def warm_start_baseline(nx, ny, baseline_steps, cfl, mach, altitude, preset=None
 
 def run_doe(output_root=None, q_offsets=None, epsilons=None,
             frequencies_hz=None, phases=None, nx=30, ny=6,
-            unsteady_steps=300, baseline_steps=80, cfl=0.35,
+            unsteady_steps=None, baseline_steps=5000, cfl=0.35,
             mach=6.0, altitude=25000.0, width=None, x_center=None,
-            min_area=1.0e-4, cycles=1.5, t_final_static=2.0e-4,
-            sample_interval_steps=2, discard_fraction=0.25, preset=None):
+            min_area=1.0e-4, cycles=3.0, t_final_static=2.0e-4,
+            sample_interval_steps=2, discard_fraction=0.25,
+            baseline_steady_rtol=1.0e-6,
+            baseline_check_interval=50, preset=None,
+            legacy_breathing_energy=False):
     """Run the DOE and aggregate outputs."""
     q_offsets = list(default_q_offsets() if q_offsets is None else q_offsets)
     epsilons = list(default_epsilons() if epsilons is None else epsilons)
@@ -406,6 +458,7 @@ def run_doe(output_root=None, q_offsets=None, epsilons=None,
     write_csv(output_root / "design_matrix.csv", design_rows)
 
     write_json(output_root / "manifest.json", {
+        "schema_version": ARTIFACT_SCHEMA_VERSION,
         "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "study": "parametric_unsteady_doe",
         "model": "time_dependent_effective_area_forcing_with_offset",
@@ -423,19 +476,42 @@ def run_doe(output_root=None, q_offsets=None, epsilons=None,
             "cycles": cycles, "t_final_static": t_final_static, "min_area": min_area,
             "discard_fraction": discard_fraction,
             "sample_interval_steps": sample_interval_steps,
+            "baseline_steady_rtol": baseline_steady_rtol,
+            "baseline_check_interval": baseline_check_interval,
+            "legacy_breathing_energy": bool(legacy_breathing_energy),
         },
         "git": git_metadata(),
     })
 
-    baseline_solver = warm_start_baseline(
-        nx=nx, ny=ny, baseline_steps=baseline_steps, cfl=cfl,
-        mach=mach, altitude=altitude, preset=preset,
-    )
-    baseline_summary = {
-        "steps": int(baseline_solver.step_count),
-        "final_time": float(baseline_solver.time),
-    }
-    baseline_state_U = baseline_solver.state.U
+    baselines = {}
+    for q_offset in sorted(set(float(q) for q in q_offsets)):
+        print(f"Converging mean-geometry baseline q_offset={q_offset:+.6f}")
+        baseline_solver = warm_start_baseline(
+            q_offset=q_offset, nx=nx, ny=ny,
+            baseline_steps=baseline_steps, cfl=cfl,
+            mach=mach, altitude=altitude, width=width,
+            x_center=x_center, min_area=min_area,
+            steady_rtol=baseline_steady_rtol,
+            steady_check_interval=baseline_check_interval,
+            preset=preset,
+        )
+        recent_dt = baseline_solver.dt_history[-min(50, len(baseline_solver.dt_history)):]
+        baseline_summary = {
+            "q_offset": q_offset,
+            "steps": int(baseline_solver.step_count),
+            "final_time": float(baseline_solver.time),
+            "converged": bool(baseline_solver.converged),
+            "final_residual": (baseline_solver.run_status or {}).get("final_residual"),
+            "dt_estimate": float(np.mean(recent_dt)) if recent_dt else 0.0,
+        }
+        baselines[q_offset] = {
+            "state": baseline_solver.state.U.copy(),
+            "summary": baseline_summary,
+        }
+    write_json(output_root / "baselines.json", {
+        "schema_version": ARTIFACT_SCHEMA_VERSION,
+        "baselines": [entry["summary"] for entry in baselines.values()],
+    })
 
     summary_rows = []
     for idx, design_row in enumerate(design_rows):
@@ -447,8 +523,8 @@ def run_doe(output_root=None, q_offsets=None, epsilons=None,
               f"phase={design_row['phase']:.3f}")
         row = run_one_case(
             case_dir, design_row,
-            baseline_state_U=baseline_state_U,
-            baseline_summary=baseline_summary,
+            baseline_state_U=baselines[float(design_row["q_offset"])]["state"],
+            baseline_summary=baselines[float(design_row["q_offset"])]["summary"],
             nx=nx, ny=ny, cfl=cfl, mach=mach, altitude=altitude,
             width=width, x_center=x_center, min_area=min_area,
             cycles=cycles, t_final_static=t_final_static,
@@ -456,6 +532,7 @@ def run_doe(output_root=None, q_offsets=None, epsilons=None,
             sample_interval_steps=sample_interval_steps,
             discard_fraction=discard_fraction,
             preset=preset,
+            legacy_breathing_energy=legacy_breathing_energy,
         )
         summary_rows.append(row)
         if row["status"] != "ok":
@@ -506,15 +583,18 @@ def main(argv=None):
                         help="Comma-separated forcing phases [rad].")
     parser.add_argument("--nx", type=int, default=30)
     parser.add_argument("--ny", type=int, default=6)
-    parser.add_argument("--unsteady-steps", type=int, default=300)
-    parser.add_argument("--baseline-steps", type=int, default=80)
+    parser.add_argument("--unsteady-steps", type=int, default=None,
+                        help="Optional hard cap; default derives one from t_final/dt.")
+    parser.add_argument("--baseline-steps", type=int, default=5000)
+    parser.add_argument("--baseline-steady-rtol", type=float, default=1.0e-6)
+    parser.add_argument("--baseline-check-interval", type=int, default=50)
     parser.add_argument("--cfl", type=float, default=0.35)
     parser.add_argument("--mach", type=float, default=6.0)
     parser.add_argument("--altitude", type=float, default=25000.0)
     parser.add_argument("--width", type=float, default=None)
     parser.add_argument("--x-center", type=float, default=None)
     parser.add_argument("--min-area", type=float, default=1.0e-4)
-    parser.add_argument("--cycles", type=float, default=1.5,
+    parser.add_argument("--cycles", type=float, default=3.0,
                         help="Number of forcing cycles per case for f > 0.")
     parser.add_argument("--t-final-static", type=float, default=2.0e-4,
                         help="t_final used when frequency_hz == 0.")
@@ -524,6 +604,8 @@ def main(argv=None):
     parser.add_argument("--preset", default=None,
                         help="Experiment-condition preset (e.g. configs/tusq_m585.json); "
                              "overrides --mach/--altitude.")
+    parser.add_argument("--legacy-breathing-energy", action="store_true",
+                        help="Audit only: reproduce the historically wrong energy source.")
     args = parser.parse_args(argv)
 
     run_doe(
@@ -540,7 +622,10 @@ def main(argv=None):
         cycles=args.cycles, t_final_static=args.t_final_static,
         sample_interval_steps=args.sample_interval_steps,
         discard_fraction=args.discard_fraction,
+        baseline_steady_rtol=args.baseline_steady_rtol,
+        baseline_check_interval=args.baseline_check_interval,
         preset=args.preset,
+        legacy_breathing_energy=args.legacy_breathing_energy,
     )
 
 

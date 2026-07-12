@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scramjet-quasi1d"
+version = "0.2.0"
+description = "Quasi-1D scramjet effective-area research prototype"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.26.4,<3",
+  "scipy>=1.12.0,<2",
+  "matplotlib>=3.8.4,<4",
+  "numba>=0.59.1,<1",
+]
+
+[tool.setuptools]
+py-modules = [
+  "busemann",
+  "diagnostics",
+  "fvm",
+  "gasdynamics",
+  "mesh",
+  "optimization",
+  "physics",
+  "response_metrics",
+  "rom",
+  "solver",
+]

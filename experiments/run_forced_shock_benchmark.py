@@ -49,7 +49,12 @@ from mesh import TabulatedAreaProfile
 from solver import CombustionConfig, InletConfig, Solver, SolverConfig
 from diagnostics import shock_diagnostics
 from response_metrics import extract_response_metrics
-from experiments.run_static_wall_sweep import git_metadata, write_csv, write_json
+from experiments.run_static_wall_sweep import (
+    ARTIFACT_SCHEMA_VERSION,
+    git_metadata,
+    write_csv,
+    write_json,
+)
 
 
 # Benchmark duct: linear diffuser, Mach 2 inlet (same as tests.py shock test)
@@ -139,6 +144,8 @@ def run_frequency(freq, amp, cycles, settle_steps, nx, x_target,
 
     t_final = solver.time + cycles / freq
     forcing_rows, qoi_rows = [], []
+    slope = quasi_steady_slope(x_target, A_in, A_ex, L, M1, p1)
+    gain_sign = 1.0 if slope >= 0.0 else -1.0
 
     def sample(s):
         d = shock_diagnostics(s)
@@ -149,6 +156,9 @@ def run_frequency(freq, amp, cycles, settle_steps, nx, x_target,
         qoi_rows.append({
             "time": float(s.time),
             "shock_x": float(d["shock_x"]),
+            # Align the static gain with the forcing before defining lag.
+            # If dp_back/dx_shock < 0, upstream shock motion is positive.
+            "shock_response_aligned": float(gain_sign * d["shock_x"]),
         })
 
     n = 0
@@ -161,11 +171,10 @@ def run_frequency(freq, amp, cycles, settle_steps, nx, x_target,
     metrics = extract_response_metrics(
         qoi_rows=qoi_rows, forcing_rows=forcing_rows,
         frequency_hz=freq, discard_fraction=0.25,
-        qoi_keys=("shock_x",), min_cycles=2.0,
+        qoi_keys=("shock_response_aligned",), min_cycles=2.0,
     )
-    shock_metric = metrics["qoi"]["shock_x"]
+    shock_metric = metrics["qoi"]["shock_response_aligned"]
 
-    slope = quasi_steady_slope(x_target, A_in, A_ex, L, M1, p1)
     qs_amplitude = amp * p_e0 / abs(slope)
 
     amp_meas = shock_metric["amplitude"]
@@ -173,12 +182,15 @@ def run_frequency(freq, amp, cycles, settle_steps, nx, x_target,
         "frequency_hz": freq,
         "forcing_amp_frac": amp,
         "p_back_mean": p_e0,
-        "shock_x_mean": shock_metric["mean"],
+        "shock_x_mean": (gain_sign * shock_metric["mean"]
+                         if shock_metric["mean"] is not None else None),
         "shock_x_amplitude": amp_meas,
         "shock_x_phase_lag_rad": shock_metric["phase_lag_vs_q_rad"],
+        "response_supported": shock_metric.get("quality", {}).get("supported", False),
         "quasi_steady_amplitude": qs_amplitude,
         "amplitude_ratio_vs_quasi_steady": (
-            amp_meas / qs_amplitude if qs_amplitude > 0 else None),
+            amp_meas / qs_amplitude
+            if amp_meas is not None and qs_amplitude > 0 else None),
         "n_cycles": metrics["n_cycles_after_transient"],
         "warnings": "; ".join(metrics["warnings"]),
     }
@@ -215,6 +227,7 @@ def main(argv=None):
     plots_dir.mkdir(parents=True, exist_ok=True)
 
     write_json(output_root / "manifest.json", {
+        "schema_version": ARTIFACT_SCHEMA_VERSION,
         "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "study": "forced_shock_benchmark",
         "duct": {"A_in": A_in, "A_ex": A_ex, "L": L},
@@ -242,18 +255,31 @@ def main(argv=None):
         write_csv(case_dir / "shock_history.csv", qoi_rows)
         ratio = row["amplitude_ratio_vs_quasi_steady"]
         lag = row["shock_x_phase_lag_rad"]
-        print(f"    amplitude {row['shock_x_amplitude']:.4f} m "
+        amplitude_text = ("unsupported" if row["shock_x_amplitude"] is None
+                          else f"{row['shock_x_amplitude']:.4f} m")
+        print(f"    amplitude {amplitude_text} "
               f"(quasi-steady {row['quasi_steady_amplitude']:.4f} m, "
               f"ratio {ratio if ratio is None else round(ratio, 3)}), "
               f"phase lag {lag if lag is None else round(lag, 3)} rad")
 
+    phase_indices = [
+        i for i, row in enumerate(rows)
+        if row.get("shock_x_phase_lag_rad") is not None
+    ]
+    if phase_indices:
+        unwrapped = np.unwrap([
+            rows[i]["shock_x_phase_lag_rad"] for i in phase_indices
+        ])
+        for i, phase_value in zip(phase_indices, unwrapped):
+            rows[i]["shock_x_phase_lag_unwrapped_rad"] = float(phase_value)
     write_csv(output_root / "summary.csv", rows)
 
     valid = [r for r in rows if r["amplitude_ratio_vs_quasi_steady"] is not None]
     if valid:
         f_arr = [r["frequency_hz"] for r in valid]
         a_arr = [r["amplitude_ratio_vs_quasi_steady"] for r in valid]
-        l_arr = [r["shock_x_phase_lag_rad"] for r in valid]
+        l_arr = [r.get("shock_x_phase_lag_unwrapped_rad",
+                       r["shock_x_phase_lag_rad"]) for r in valid]
         fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
         axes[0].semilogx(f_arr, a_arr, "bo-")
         axes[0].axhline(1.0, color="k", ls="--", lw=0.8,

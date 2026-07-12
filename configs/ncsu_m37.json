@@ -1,0 +1,25 @@
+{
+  "name": "NC State supersonic tunnel — Config B (streamtraced Busemann inlet) conditions",
+  "description": "Freestream conditions for the Schram & Narayanaswamy streamtraced-inlet unstart experiment (research plan Config B). The q contraction axis maps onto this configuration.",
+  "source": "Schram & Narayanaswamy, Experiments in Fluids 67:64, 2026. doi:10.1007/s00348-026-04215-0 and companion AIAA Journal papers",
+  "status": "Transcribed from the 2026 paper via external review notes (2026-07-12); verify every value against the PDF before publication-grade use.",
+  "inlet": {
+    "mach": 3.7,
+    "T_inf_K": 79.7,
+    "p_inf_Pa": 10500.0,
+    "gamma": 1.4,
+    "R_gas": 287.0
+  },
+  "reference": {
+    "capture_diameter_mm": 44.0,
+    "throat_diameter_mm": 25.5,
+    "contraction_ratio": 3.0,
+    "inlet_design_mach_approx": 5.5,
+    "consistency_check": {
+      "T0_K": 297.9,
+      "p0_MPa": 1.060,
+      "diameter_squared_ratio": 2.977
+    }
+  },
+  "geometry_notes": "Use busemann.generate_busemann_inlet() for a parametric Busemann-family contour. The experiment used a streamtraced half-Busemann sugar-scoop inlet; obtain the measured contour/CAD before exact comparison. The 44/25.5 diameter-squared ratio is approximately the reported 3:1 contraction."
+}

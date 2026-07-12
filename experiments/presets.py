@@ -1,7 +1,7 @@
 """
 Experiment-condition presets.
 
-Loads a JSON preset from configs/ (e.g. tusq_m585.json, ncsu_m40.json) and
+Loads a JSON preset from configs/ (e.g. tusq_m585.json, ncsu_m37.json) and
 builds the matching InletConfig with explicit tunnel freestream conditions,
 overriding the standard-atmosphere model. Sweep scripts accept
 ``--preset configs/tusq_m585.json`` (path or bare name).
@@ -67,7 +67,7 @@ def inlet_from_preset(name_or_path, Yf_inlet=0.0):
 
 
 if __name__ == "__main__":
-    for name in ("tusq_m585", "ncsu_m40"):
+    for name in ("tusq_m585", "ncsu_m37"):
         ic = inlet_from_preset(name)
         print(f"  {name}: M={ic.mach}, T_inf={ic.T_inf:.1f} K, "
               f"p_inf={ic.p_inf:.0f} Pa, u_inf={ic.u_inf:.0f} m/s")

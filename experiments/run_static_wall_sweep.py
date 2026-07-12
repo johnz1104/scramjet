@@ -12,8 +12,10 @@ or combustion.
 import argparse
 import csv
 import json
+import platform
 import subprocess
 import sys
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -26,20 +28,31 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from mesh import LocalizedAreaPerturbation, PerturbedGeometryProfile, geometry_to_dict
+from mesh import (
+    LocalizedAreaPerturbation,
+    PerturbedGeometryProfile,
+    config_a_ramp_area_law,
+    geometry_to_dict,
+)
 from solver import CombustionConfig, InletConfig, Solver, SolverConfig
 from rom import _compute_qoi
 from diagnostics import all_case_diagnostics
 
 
+ARTIFACT_SCHEMA_VERSION = 2
+
+
 def default_q_values():
     """Default perturbation amplitudes in m^2, scaled to the 0.05 m^2 throat."""
-    return [-0.002, -0.001, 0.0, 0.001, 0.002]
+    # Includes every default DOE q_offset so strict exporter matching works.
+    return [-0.025, -0.0125, 0.0, 0.0125, 0.025]
 
 
-def make_config(q, nx=40, ny=8, n_steps=120, cfl=0.35,
+def make_config(q, nx=40, ny=8, n_steps=5000, cfl=0.35,
                 mach=6.0, altitude=25000.0, width=None,
-                x_center=None, min_area=1.0e-4, preset=None):
+                x_center=None, min_area=1.0e-4, preset=None,
+                steady_rtol=1.0e-6, steady_check_interval=50,
+                area_law="default"):
     """Build a cold-flow solver config for one static perturbation value."""
     cfg = SolverConfig()
     if preset:
@@ -51,11 +64,24 @@ def make_config(q, nx=40, ny=8, n_steps=120, cfl=0.35,
     cfg.mesh.ny = ny
     cfg.n_steps = n_steps
     cfg.cfl = cfl
-    cfg.print_interval = max(n_steps + 1, 1)
+    cfg.print_interval = 500
+    cfg.steady_rtol = steady_rtol
+    cfg.steady_check_interval = int(steady_check_interval)
+    cfg.residual_interval = int(steady_check_interval)
     cfg.viscous = False
     cfg.wall_type = "slip"
     cfg.combustion = CombustionConfig(enabled=False)
     cfg.area_source = True
+
+    if area_law == "config_a":
+        warnings.warn(
+            "Config-A area-law lengths/capture height are placeholders; "
+            "calibrate them from the UNSW drawings before quantitative use.",
+            RuntimeWarning,
+        )
+        cfg.geometry = config_a_ramp_area_law()
+    elif area_law != "default":
+        raise ValueError(f"unsupported area law: {area_law}")
 
     base = cfg.geometry
     if width is None:
@@ -98,6 +124,9 @@ def config_to_dict(cfg):
             "cfl": cfg.cfl,
             "n_steps": cfg.n_steps,
             "print_interval": cfg.print_interval,
+            "steady_rtol": cfg.steady_rtol,
+            "steady_check_interval": cfg.steady_check_interval,
+            "residual_interval": cfg.residual_interval,
         },
         "physics": {
             "cold_flow_only": True,
@@ -126,17 +155,40 @@ def git_metadata():
             return None
         return result.stdout.strip()
 
+    versions = {"python": platform.python_version()}
+    for module_name in ("numpy", "scipy", "numba", "matplotlib"):
+        try:
+            module = __import__(module_name)
+            versions[module_name] = getattr(module, "__version__", "unknown")
+        except (ImportError, AttributeError):
+            versions[module_name] = None
+
     return {
+        "schema_version": ARTIFACT_SCHEMA_VERSION,
         "commit": _run(["git", "rev-parse", "--short", "HEAD"]),
         "status_short": _run(["git", "status", "--short"]),
+        "dependencies": versions,
     }
 
 
 def write_json(path, data):
     """Write pretty JSON."""
+    def _safe(value):
+        if isinstance(value, dict):
+            return {key: _safe(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [_safe(item) for item in value]
+        if isinstance(value, (np.bool_,)):
+            return bool(value)
+        if isinstance(value, (np.integer,)):
+            return int(value)
+        if isinstance(value, (np.floating, float)):
+            return float(value) if np.isfinite(value) else None
+        return value
+
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w") as f:
-        json.dump(data, f, indent=2)
+        json.dump(_safe(data), f, indent=2, allow_nan=False)
         f.write("\n")
 
 
@@ -151,6 +203,29 @@ def write_csv(path, rows, fieldnames=None):
         writer.writeheader()
         for row in rows:
             writer.writerow(row)
+
+
+def require_schema_v2(artifact_root, artifact_name="artifact", warn_only=False):
+    """Gate analyses against pre-fix artifacts lacking schema version 2."""
+    root = Path(artifact_root)
+    manifest_path = root / "manifest.json"
+    version = None
+    if manifest_path.is_file():
+        try:
+            version = json.loads(manifest_path.read_text()).get("schema_version")
+        except (OSError, json.JSONDecodeError):
+            version = None
+    if version == ARTIFACT_SCHEMA_VERSION:
+        return True
+    message = (
+        f"{artifact_name} at {root} is schema_version={version!r}; "
+        f"version {ARTIFACT_SCHEMA_VERSION} is required because pre-fix "
+        "artifacts used invalid completion/energy conventions"
+    )
+    if warn_only:
+        warnings.warn(message, RuntimeWarning)
+        return False
+    raise ValueError(message)
 
 
 def case_name(q):
@@ -180,7 +255,12 @@ def centerline_rows(solver):
 def residual_rows(solver):
     """Extract available residual samples."""
     return [
-        {"sample": idx, "residual_l2": float(res)}
+        {
+            "sample": idx,
+            "step": int(solver.residual_steps[idx]),
+            "time": float(solver.residual_times[idx]),
+            "residual_l2": float(res),
+        }
         for idx, res in enumerate(solver.residual_history)
     ]
 
@@ -191,6 +271,7 @@ def qoi_with_diagnostics(solver, q):
     rho, u, v, p, T, Yf = solver.state.primitives()
     M = solver.state.mach()
     qoi.update({
+        "schema_version": ARTIFACT_SCHEMA_VERSION,
         "q": float(q),
         "steps": int(solver.step_count),
         "time": float(solver.time),
@@ -204,7 +285,27 @@ def qoi_with_diagnostics(solver, q):
         "temperature_max": float(np.max(T)),
         "throat_area": solver.cfg.geometry.throat_area(),
         "min_sampled_area": solver.cfg.geometry.min_area_value(),
+        "converged": bool(solver.run_status and solver.run_status["converged"]),
+        "final_residual": (
+            solver.run_status.get("final_residual") if solver.run_status else None
+        ),
     })
+
+    history = (solver.run_status or {}).get("steady_qoi_history", [])
+    drift = {}
+    if len(history) == 2:
+        old = history[0]["qoi"]
+        new = history[1]["qoi"]
+        for key in sorted(set(old) & set(new)):
+            a, b = old[key], new[key]
+            if (isinstance(a, (int, float, np.number))
+                    and not isinstance(a, (bool, np.bool_))
+                    and isinstance(b, (int, float, np.number))
+                    and not isinstance(b, (bool, np.bool_))
+                    and np.isfinite(a) and np.isfinite(b)):
+                drift[key] = float(abs(b - a) / max(abs(b), 1.0e-30))
+    qoi["qoi_drift_relative"] = drift
+    qoi["qoi_drift_max_relative"] = max(drift.values(), default=None)
     return qoi
 
 
@@ -212,6 +313,7 @@ def run_case(q, case_dir, **config_kwargs):
     """Run one cold-flow case and write per-case outputs."""
     cfg = make_config(q, **config_kwargs)
     write_json(case_dir / "config.json", {
+        "schema_version": ARTIFACT_SCHEMA_VERSION,
         "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "q": float(q),
         "git": git_metadata(),
@@ -219,14 +321,14 @@ def run_case(q, case_dir, **config_kwargs):
     })
 
     solver = Solver(cfg)
-    solver.run()
+    solver.run(steady_qoi_fn=_compute_qoi)
 
     qoi = qoi_with_diagnostics(solver, q)
     write_json(case_dir / "qoi.json", qoi)
     write_json(case_dir / "diagnostics.json", all_case_diagnostics(solver))
     write_csv(case_dir / "centerline.csv", centerline_rows(solver))
     write_csv(case_dir / "residual.csv", residual_rows(solver),
-              fieldnames=["sample", "residual_l2"])
+              fieldnames=["sample", "step", "time", "residual_l2"])
     return solver, qoi
 
 
@@ -247,7 +349,7 @@ def plot_area_profiles(configs, q_values, output_path):
     plt.close(fig)
 
 
-def plot_qoi_vs_q(summary_rows, output_path, metric="thrust"):
+def plot_qoi_vs_q(summary_rows, output_path, metric="tpr"):
     """Plot one QoI versus q."""
     q = np.array([row["q"] for row in summary_rows], dtype=float)
     y = np.array([row[metric] for row in summary_rows], dtype=float)
@@ -283,6 +385,7 @@ def run_sweep(q_values=None, output_root=None, **config_kwargs):
     plots_dir.mkdir(parents=True, exist_ok=True)
 
     write_json(output_root / "manifest.json", {
+        "schema_version": ARTIFACT_SCHEMA_VERSION,
         "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "study": "static_wall_sweep",
         "model": "cold_flow_effective_area_perturbation",
@@ -302,7 +405,7 @@ def run_sweep(q_values=None, output_root=None, **config_kwargs):
     fieldnames = sorted({key for row in summary_rows for key in row.keys()})
     write_csv(output_root / "summary.csv", summary_rows, fieldnames=fieldnames)
     plot_area_profiles(configs, q_values, plots_dir / "area_profiles.png")
-    plot_qoi_vs_q(summary_rows, plots_dir / "qoi_vs_q.png", metric="thrust")
+    plot_qoi_vs_q(summary_rows, plots_dir / "qoi_vs_q.png", metric="tpr")
     return output_root, summary_rows
 
 
@@ -322,7 +425,10 @@ def main(argv=None):
     parser.add_argument("--output-root", default=None)
     parser.add_argument("--nx", type=int, default=40)
     parser.add_argument("--ny", type=int, default=8)
-    parser.add_argument("--n-steps", type=int, default=120)
+    parser.add_argument("--n-steps", type=int, default=5000,
+                        help="Hard step cap for convergence-driven cases.")
+    parser.add_argument("--steady-rtol", type=float, default=1.0e-6)
+    parser.add_argument("--steady-check-interval", type=int, default=50)
     parser.add_argument("--cfl", type=float, default=0.35)
     parser.add_argument("--mach", type=float, default=6.0)
     parser.add_argument("--altitude", type=float, default=25000.0)
@@ -332,6 +438,8 @@ def main(argv=None):
     parser.add_argument("--preset", default=None,
                         help="Experiment-condition preset (e.g. configs/tusq_m585.json); "
                              "overrides --mach/--altitude.")
+    parser.add_argument("--area-law", choices=("default", "config_a"),
+                        default="default")
     args = parser.parse_args(argv)
 
     output_root, _ = run_sweep(
@@ -347,6 +455,9 @@ def main(argv=None):
         x_center=args.x_center,
         min_area=args.min_area,
         preset=args.preset,
+        steady_rtol=args.steady_rtol,
+        steady_check_interval=args.steady_check_interval,
+        area_law=args.area_law,
     )
     print(f"Static wall sweep written to: {output_root}")
 

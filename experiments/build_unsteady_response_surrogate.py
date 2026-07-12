@@ -36,7 +36,12 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from experiments.run_static_wall_sweep import write_csv, write_json
+from experiments.run_static_wall_sweep import (
+    ARTIFACT_SCHEMA_VERSION,
+    require_schema_v2,
+    write_csv,
+    write_json,
+)
 from optimization import GPSurrogate
 
 
@@ -50,8 +55,9 @@ DEFAULT_TARGETS = (
     "shock_x_mean",
     "pressure_recovery_mean",
     "pressure_recovery_amplitude",
-    "mdot_mean",
-    "mdot_amplitude",
+    "mdot_exit_mean",
+    "mdot_exit_amplitude",
+    "mass_defect_mean",
     "probe_throat_pressure_amplitude",
     "probe_combustor_pressure_amplitude",
     "probe_exit_pressure_amplitude",
@@ -107,15 +113,54 @@ def _drop_failed(rows):
     return cleaned
 
 
-def build_feature_matrix(rows):
-    """Return (n, ndim) feature matrix from selected rows."""
-    return np.array([[float(r[k]) for k in FEATURE_KEYS] for r in rows], dtype=float)
+def feature_names_for_rows(rows):
+    """Use circular features when the design actually varies phase."""
+    phases = {_parse_float(row.get("phase")) for row in rows}
+    phases.discard(None)
+    if len(phases) > 1:
+        return ("q_offset", "epsilon", "frequency_hz", "phase_sin", "phase_cos")
+    return FEATURE_KEYS
+
+
+def build_feature_matrix(rows, feature_names=None):
+    """Return the feature matrix with optional circular phase encoding."""
+    if feature_names is None:
+        feature_names = feature_names_for_rows(rows)
+    matrix = []
+    for row in rows:
+        phase = float(row["phase"])
+        values = {
+            "q_offset": float(row["q_offset"]),
+            "epsilon": float(row["epsilon"]),
+            "frequency_hz": float(row["frequency_hz"]),
+            "phase": phase,
+            "phase_sin": float(np.sin(phase)),
+            "phase_cos": float(np.cos(phase)),
+        }
+        matrix.append([values[name] for name in feature_names])
+    return np.asarray(matrix, dtype=float)
+
+
+def _parse_bool(text):
+    return str(text).strip().lower() in {"1", "true", "yes"}
+
+
+def _support_key_for_target(key):
+    if not key.endswith("_amplitude"):
+        return None
+    stem = key[:-len("_amplitude")]
+    if stem.startswith("probe_") and stem.endswith("_pressure"):
+        return f"{stem[:-len('_pressure')]}_supported"
+    return f"{stem}_supported"
 
 
 def collect_target_vector(rows, key):
     """Return (values_finite, mask) for one target metric."""
     parsed = [_parse_float(r.get(key)) for r in rows]
-    mask = np.array([v is not None for v in parsed])
+    support_key = _support_key_for_target(key)
+    supported = ([True] * len(rows) if support_key is None else
+                 [_parse_bool(row.get(support_key)) for row in rows])
+    mask = np.array([v is not None and ok for v, ok in zip(parsed, supported)])
     values = np.array([v if v is not None else np.nan for v in parsed], dtype=float)
     return values, mask
 
@@ -178,8 +223,8 @@ def predict_inverse_distance(model, X_query):
     return out
 
 
-def fit_gp(X_train, y_train, n_restarts=3):
-    """Train a GP surrogate from optimization.GPSurrogate."""
+def fit_gp(X_train, y_train, n_restarts=0):
+    """Fit a GP cache, using stable fixed hyperparameters by default."""
     gp = GPSurrogate(ndim=X_train.shape[1])
     gp.train(X_train, y_train, n_restarts=n_restarts)
     return ("gp", gp)
@@ -197,7 +242,7 @@ def fit_model(X_train_norm, y_train):
     n = X_train_norm.shape[0]
     if n >= MIN_LOO_SAMPLES:
         try:
-            return fit_gp(X_train_norm, y_train), "gp"
+            return fit_gp(X_train_norm, y_train), "gp_fixed_hyperparameters"
         except Exception:
             pass
     if n >= MIN_FIT_SAMPLES:
@@ -221,7 +266,7 @@ def predict_model(model, X_query_norm):
     raise ValueError(f"unknown model kind: {kind}")
 
 
-def leave_one_out(X_norm, y):
+def leave_one_out(X_norm, y, full_model=None, full_kind=None):
     """Return arrays of (predicted, actual) for LOO over the dataset.
 
     GP hyperparameters are fit once on the full dataset and held fixed
@@ -232,11 +277,12 @@ def leave_one_out(X_norm, y):
     """
     n = X_norm.shape[0]
     preds = np.zeros(n)
-    full_model, full_kind = fit_model(X_norm, y)
+    if full_model is None or full_kind is None:
+        full_model, full_kind = fit_model(X_norm, y)
     for i in range(n):
         mask = np.ones(n, dtype=bool)
         mask[i] = False
-        if full_kind == "gp":
+        if str(full_kind).startswith("gp"):
             _, gp_full = full_model
             gp_i = GPSurrogate(ndim=X_norm.shape[1])
             gp_i.log_sigma_f = gp_full.log_sigma_f
@@ -276,6 +322,7 @@ def build_surrogate(doe_root, output_root=None, targets=None,
     doe_root = Path(doe_root)
     if not doe_root.is_absolute():
         doe_root = REPO_ROOT / doe_root
+    require_schema_v2(doe_root, "unsteady DOE")
 
     if output_root is None:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -294,6 +341,7 @@ def build_surrogate(doe_root, output_root=None, targets=None,
 
     summary_rows, design_rows = load_doe_summary(doe_root)
     valid_rows = _drop_failed(summary_rows)
+    feature_names = feature_names_for_rows(valid_rows)
     rng = np.random.default_rng(seed)
 
     train_data_rows = []
@@ -307,17 +355,21 @@ def build_surrogate(doe_root, output_root=None, targets=None,
               fieldnames=["case_id", *FEATURE_KEYS, *targets])
 
     metadata = {
+        "schema_version": ARTIFACT_SCHEMA_VERSION,
         "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "doe_root": str(doe_root),
         "n_summary_rows": len(summary_rows),
         "n_valid_rows": len(valid_rows),
-        "features": list(FEATURE_KEYS),
+        "raw_design_features": list(FEATURE_KEYS),
+        "features": list(feature_names),
+        "circular_phase_encoding": "phase_sin" in feature_names,
         "targets": list(targets),
         "min_loo_samples": MIN_LOO_SAMPLES,
         "min_fit_samples": MIN_FIT_SAMPLES,
         "holdout_fraction": holdout_fraction,
         "seed": int(seed),
-        "model_hierarchy": ["gp", "ridge", "inverse_distance"],
+        "model_hierarchy": ["gp_fixed_hyperparameters", "ridge", "inverse_distance"],
+        "gp_hyperparameters_optimized": False,
         "scalar_response_surrogate": True,
         "time_accurate_rom": False,
         "limitations": [
@@ -341,7 +393,7 @@ def build_surrogate(doe_root, output_root=None, targets=None,
         print(message)
         return output_root, {"status": "insufficient_data"}
 
-    X = build_feature_matrix(valid_rows)
+    X = build_feature_matrix(valid_rows, feature_names=feature_names)
     X_norm, x_mins, x_ranges = normalize_features(X)
     metadata["feature_normalization"] = {
         "min": x_mins.tolist(), "range": x_ranges.tolist(),
@@ -376,7 +428,9 @@ def build_surrogate(doe_root, output_root=None, targets=None,
 
         if n_valid_target >= MIN_LOO_SAMPLES:
             try:
-                preds, actuals = leave_one_out(X_tgt, y_tgt)
+                preds, actuals = leave_one_out(
+                    X_tgt, y_tgt, full_model=model, full_kind=model_name,
+                )
                 err = preds - actuals
                 rmse = float(np.sqrt(np.mean(err**2)))
                 mae = float(np.mean(np.abs(err)))
