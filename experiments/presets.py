@@ -14,6 +14,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from mesh import load_config_a_geometry
 from solver import InletConfig
 
 CONFIG_DIR = REPO_ROOT / "configs"
@@ -48,7 +49,7 @@ def inlet_from_preset(name_or_path, Yf_inlet=0.0):
     """
     Build an InletConfig with the preset's explicit tunnel conditions.
 
-    Prints the preset's status note so placeholder conditions are never
+    Prints the preset's provenance/status note so source limitations are never
     used silently.
     """
     data = load_preset(name_or_path)
@@ -64,6 +65,39 @@ def inlet_from_preset(name_or_path, Yf_inlet=0.0):
         R_gas=float(inlet.get("R_gas", 287.0)),
         Yf_inlet=Yf_inlet,
     )
+
+
+def preset_geometry(name_or_path):
+    """Load a preset's frozen geometry profile, or return ``None``."""
+    data = load_preset(name_or_path)
+    geometry = data.get("geometry") or {}
+    artifact = geometry.get("profile_artifact")
+    if not artifact:
+        return None
+    path = Path(data["_path"]).parent / artifact
+    profile = load_config_a_geometry(path)
+    expected = geometry.get("geometry_lineage_id")
+    if expected and profile.geometry_lineage_id != expected:
+        raise ValueError(
+            f"preset geometry lineage mismatch: {profile.geometry_lineage_id} != {expected}"
+        )
+    return profile
+
+
+def resolve_area_law(area_law="auto", preset=None):
+    """Resolve ``auto`` without changing generic no-preset behavior."""
+    if area_law not in {"auto", "default", "config_a"}:
+        raise ValueError(f"unsupported area law: {area_law}")
+    if area_law != "auto":
+        return area_law
+    if preset and (load_preset(preset).get("geometry") or {}).get("profile_artifact"):
+        return "config_a"
+    return "default"
+
+
+def reduced_frequency_reference_from_preset(name_or_path):
+    """Return optional structured reduced-frequency reference metadata."""
+    return (load_preset(name_or_path).get("reduced_frequency_reference") or {}).copy()
 
 
 if __name__ == "__main__":

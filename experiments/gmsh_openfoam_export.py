@@ -4,9 +4,9 @@ Gmsh + OpenFOAM case emission for exported high-fidelity cases.
 Turns an exported case (wall contour + freestream conditions, as written by
 export_high_fidelity_scaffold.py) into:
 
-    gmsh/duct2d.geo        — parametric structured 2-D duct mesh
-                             (transfinite quads, one-cell z-extrusion,
-                             named Physical groups), MSH2-ready
+    gmsh/duct2d.geo        — either the structured closed effective duct or
+                             the piecewise Config-A external inlet, with a
+                             one-cell z-extrusion and named Physical groups
     openfoam_case/         — rhoCentralFoam case skeleton
                              (0/, constant/, system/, Allrun.sh)
 
@@ -105,6 +105,121 @@ def write_gmsh_duct(path, x_wall, y_wall, nx_cells=200, ny_cells=60,
     return path
 
 
+def write_gmsh_config_a_external(path, ramp_x, ramp_y, cowl_x, cowl_y,
+                                 nx_cells=200, ny_cells=60, dz=0.01):
+    """Write the source-reconstructed Config-A external-inlet topology.
+
+    Every reconstructed ramp interval is emitted as its own straight Gmsh
+    curve.  In particular, the 50 MOC compression segments are never replaced
+    by an unconstrained spline.  Upstream of the cowl lip the y=0 boundary is
+    an open farfield; downstream it is the fixed cowl wall.
+    """
+    ramp_x = np.asarray(ramp_x, dtype=float)
+    ramp_y = np.asarray(ramp_y, dtype=float)
+    cowl_x = np.asarray(cowl_x, dtype=float)
+    cowl_y = np.asarray(cowl_y, dtype=float)
+    if (ramp_x.ndim != 1 or ramp_x.shape != ramp_y.shape
+            or len(ramp_x) < 4 or np.any(np.diff(ramp_x) <= 0.0)):
+        raise ValueError("ramp coordinates must be increasing matched arrays")
+    if (cowl_x.ndim != 1 or cowl_x.shape != cowl_y.shape
+            or len(cowl_x) < 2 or np.any(np.diff(cowl_x) <= 0.0)):
+        raise ValueError("cowl coordinates must be increasing matched arrays")
+    if not np.isclose(cowl_x[-1], ramp_x[-1], atol=1.0e-12):
+        raise ValueError("ramp and cowl must terminate at the same outlet station")
+    if cowl_x[0] <= ramp_x[0] or np.any(cowl_y <= ramp_y[-1]):
+        raise ValueError("external-inlet cowl must lie above and downstream of inlet")
+
+    # Point order and boundary-curve order are explicit so the extrusion's
+    # lateral surfaces can be grouped into stable physical patch names.
+    lines = [
+        "// duct2d.geo — Config-A source_reconstructed_v1 external inlet",
+        "// Discrete reconstructed ramp segments; no smoothing spline.",
+        "// Build: gmsh -3 duct2d.geo -format msh2 -o duct2d.msh",
+        f"// nominal resolution guidance: nx={int(nx_cells)}, ny={int(ny_cells)}",
+        f"dz = {float(dz):.9g};",
+        "Mesh.Algorithm = 6;",
+        "",
+    ]
+    ramp_ids = list(range(1, len(ramp_x) + 1))
+    for pid, x_value, y_value in zip(ramp_ids, ramp_x, ramp_y):
+        lines.append(
+            f"Point({pid}) = {{{x_value:.12g}, {y_value:.12g}, 0, "
+            f"{max((ramp_x[-1] - ramp_x[0]) / max(nx_cells, 1), 1.0e-6):.9g}}};"
+        )
+    cowl_ids = list(range(len(ramp_ids) + 1,
+                          len(ramp_ids) + len(cowl_x) + 1))
+    for pid, x_value, y_value in zip(cowl_ids, cowl_x, cowl_y):
+        lines.append(
+            f"Point({pid}) = {{{x_value:.12g}, {y_value:.12g}, 0, "
+            f"{max((ramp_x[-1] - ramp_x[0]) / max(nx_cells, 1), 1.0e-6):.9g}}};"
+        )
+    inlet_top_id = cowl_ids[-1] + 1
+    lines.append(
+        f"Point({inlet_top_id}) = {{{ramp_x[0]:.12g}, {cowl_y[0]:.12g}, 0, "
+        f"{max(abs(cowl_y[0] - ramp_y[0]) / max(ny_cells, 1), 1.0e-6):.9g}}};"
+    )
+
+    curve_id = 1
+    ramp_curves = []
+    lines += ["", "// rampWall: one straight curve per reconstructed segment"]
+    for left, right in zip(ramp_ids[:-1], ramp_ids[1:]):
+        ramp_curves.append(curve_id)
+        lines.append(f"Line({curve_id}) = {{{left}, {right}}};")
+        curve_id += 1
+    outlet_curve = curve_id
+    lines.append(f"Line({outlet_curve}) = {{{ramp_ids[-1]}, {cowl_ids[-1]}}};")
+    curve_id += 1
+    cowl_curves = []
+    for left, right in zip(cowl_ids[:-1], cowl_ids[1:]):
+        cowl_curves.append(curve_id)
+        lines.append(f"Line({curve_id}) = {{{left}, {right}}};")
+        curve_id += 1
+    farfield_curve = curve_id
+    lines.append(f"Line({farfield_curve}) = {{{inlet_top_id}, {cowl_ids[0]}}};")
+    curve_id += 1
+    inlet_curve = curve_id
+    lines.append(f"Line({inlet_curve}) = {{{ramp_ids[0]}, {inlet_top_id}}};")
+
+    loop = (
+        ramp_curves + [outlet_curve]
+        + [-value for value in reversed(cowl_curves)]
+        + [-farfield_curve, -inlet_curve]
+    )
+    lines += [
+        "",
+        f"Curve Loop(1) = {{{', '.join(str(value) for value in loop)}}};",
+        "Plane Surface(1) = {1};",
+        "Recombine Surface {1};",
+        "ex[] = Extrude {0, 0, dz} { Surface{1}; Layers{1}; Recombine; };",
+        "",
+        'Physical Surface("frontAndBack") = {1, ex[0]};',
+    ]
+    lateral_index = 2
+    ramp_surfaces = list(range(lateral_index, lateral_index + len(ramp_curves)))
+    lateral_index += len(ramp_curves)
+    outlet_surface = lateral_index
+    lateral_index += 1
+    cowl_surfaces = list(range(lateral_index, lateral_index + len(cowl_curves)))
+    lateral_index += len(cowl_curves)
+    farfield_surface = lateral_index
+    inlet_surface = lateral_index + 1
+    lines += [
+        f'Physical Surface("rampWall") = '
+        f'{{{", ".join(f"ex[{value}]" for value in ramp_surfaces)}}};',
+        f'Physical Surface("outlet") = {{ex[{outlet_surface}]}};',
+        f'Physical Surface("cowlWall") = '
+        f'{{{", ".join(f"ex[{value}]" for value in cowl_surfaces)}}};',
+        f'Physical Surface("farfield") = {{ex[{farfield_surface}]}};',
+        f'Physical Surface("inlet") = {{ex[{inlet_surface}]}};',
+        'Physical Volume("fluid") = {ex[1]};',
+        "",
+    ]
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines))
+    return path
+
+
 # OpenFOAM case skeleton
 
 _FOAM_HEADER = """/*--------------------------------*- C++ -*----------------------------------*\\
@@ -126,7 +241,8 @@ def _dict_file(cls, obj, body):
 
 
 def write_openfoam_case(case_dir, freestream, end_time, write_interval,
-                        p_back=None, x_end=1.0, y_mid=0.5, z_mid=0.005):
+                        p_back=None, x_end=1.0, y_mid=0.5, z_mid=0.005,
+                        comparison_topology="closed_effective_duct"):
     """
     Write a minimal rhoCentralFoam case skeleton.
 
@@ -146,6 +262,11 @@ def write_openfoam_case(case_dir, freestream, end_time, write_interval,
     p = float(freestream["p_inf"])
     T = float(freestream["T_inf"])
 
+    if comparison_topology not in {
+        "closed_effective_duct", "config_a_external_inlet",
+    }:
+        raise ValueError(f"unsupported comparison topology: {comparison_topology}")
+
     outlet_p = (f"""    outlet
     {{
         type            fixedValue;
@@ -155,6 +276,30 @@ def write_openfoam_case(case_dir, freestream, end_time, write_interval,
     {
         type            zeroGradient;
     }""")
+    if comparison_topology == "config_a_external_inlet":
+        scalar_walls = """    rampWall       { type zeroGradient; }
+    cowlWall       { type zeroGradient; }
+    farfield
+    {
+        type            fixedValue;
+        value           uniform {value};
+    }"""
+        velocity_walls = f"""    rampWall       {{ type slip; }}
+    cowlWall       {{ type slip; }}
+    farfield
+    {{
+        type            fixedValue;
+        value           uniform ({u} 0 0);
+    }}"""
+        wall_patch_commands = """foamDictionary constant/polyMesh/boundary -entry entry0/rampWall/type -set wall
+foamDictionary constant/polyMesh/boundary -entry entry0/cowlWall/type -set wall"""
+    else:
+        scalar_walls = """    bottomWall      { type zeroGradient; }
+    topWall         { type zeroGradient; }"""
+        velocity_walls = """    bottomWall      { type slip; }
+    topWall         { type slip; }"""
+        wall_patch_commands = """foamDictionary constant/polyMesh/boundary -entry entry0/bottomWall/type -set wall
+foamDictionary constant/polyMesh/boundary -entry entry0/topWall/type -set wall"""
 
     (case / "0" / "p").write_text(_dict_file("volScalarField", "p", f"""
 dimensions      [1 -1 -2 0 0 0 0];
@@ -168,8 +313,7 @@ boundaryField
         value           uniform {p};
     }}
 {outlet_p}
-    bottomWall      {{ type zeroGradient; }}
-    topWall         {{ type zeroGradient; }}
+{scalar_walls.replace("{value}", str(p))}
     frontAndBack    {{ type empty; }}
 }}
 """))
@@ -186,8 +330,7 @@ boundaryField
         value           uniform {T};
     }}
     outlet          {{ type zeroGradient; }}
-    bottomWall      {{ type zeroGradient; }}
-    topWall         {{ type zeroGradient; }}
+{scalar_walls.replace("{value}", str(T))}
     frontAndBack    {{ type empty; }}
 }}
 """))
@@ -206,8 +349,7 @@ boundaryField
     outlet          {{ type zeroGradient; }}
     // slip for the inviscid screening case; switch to noSlip (+ boundary
     // layer resolution and a turbulence model) for viscous studies
-    bottomWall      {{ type slip; }}
-    topWall         {{ type slip; }}
+{velocity_walls}
     frontAndBack    {{ type empty; }}
 }}
 """))
@@ -403,13 +545,12 @@ gmshToFoam duct2d.msh
 
 # gmshToFoam marks every boundary as 'patch'; fix the types it can't infer
 foamDictionary constant/polyMesh/boundary -entry entry0/frontAndBack/type -set empty
-foamDictionary constant/polyMesh/boundary -entry entry0/bottomWall/type -set wall
-foamDictionary constant/polyMesh/boundary -entry entry0/topWall/type -set wall
+{wall_patch_commands}
 
 checkMesh
 rhoCentralFoam | tee log.rhoCentralFoam
 python3 postprocess_qoi.py
-""")
+""".format(wall_patch_commands=wall_patch_commands))
     allrun.chmod(0o755)
     _write_qoi_bridge(case)
     return case
@@ -578,4 +719,32 @@ def emit_gmsh_openfoam(output_dir, wall_rows, freestream, nx_cells=200,
                                    write_interval=f"{end_time / 20.0:.6e}",
                                    p_back=p_back, x_end=float(x[-1]),
                                    y_mid=0.5 * float(np.mean(y)), z_mid=0.005)
+    return geo_path, case_dir
+
+
+def emit_config_a_external_openfoam(output_dir, ramp_x, ramp_y, cowl_x,
+                                    cowl_y, freestream, nx_cells=200,
+                                    ny_cells=60, flow_throughs=8.0,
+                                    p_back=None):
+    """Emit the reconstructed external-inlet Gmsh and OpenFOAM handoff."""
+    output_dir = Path(output_dir)
+    ramp_x = np.asarray(ramp_x, dtype=float)
+    ramp_y = np.asarray(ramp_y, dtype=float)
+    cowl_x = np.asarray(cowl_x, dtype=float)
+    cowl_y = np.asarray(cowl_y, dtype=float)
+    geo_path = write_gmsh_config_a_external(
+        output_dir / "gmsh" / "duct2d.geo",
+        ramp_x, ramp_y, cowl_x, cowl_y,
+        nx_cells=nx_cells, ny_cells=ny_cells,
+    )
+    u_inf = float(freestream["u_inf"])
+    end_time = flow_throughs * (ramp_x[-1] - ramp_x[0]) / max(u_inf, 1.0e-30)
+    case_dir = write_openfoam_case(
+        output_dir / "openfoam_case", freestream,
+        end_time=f"{end_time:.6e}",
+        write_interval=f"{end_time / 20.0:.6e}",
+        p_back=p_back, x_end=float(ramp_x[-1]),
+        y_mid=float(0.5 * (ramp_y[-1] + cowl_y[-1])), z_mid=0.005,
+        comparison_topology="config_a_external_inlet",
+    )
     return geo_path, case_dir

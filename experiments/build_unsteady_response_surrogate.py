@@ -105,6 +105,68 @@ def default_targets():
 
 MIN_LOO_SAMPLES = 5
 MIN_FIT_SAMPLES = 3
+MAX_REPORTABLE_CIRCULAR_LOO_RMSE_RAD = 1.0
+MIN_REPORTABLE_SUPPORTED_CASES = 20
+
+
+def response_reportability(circular_loo_rmse_rad, supported_cases,
+                           varying_features):
+    """Evaluate the explicit phase-response reporting gate.
+
+    ``status: ok`` elsewhere means that a model was constructed.  It does not
+    imply that its phase predictions are accurate or sufficiently supported.
+    The reporting policy deliberately counts the four physical design axes
+    before any sine/cosine expansion of phase.
+    """
+    supported_cases = int(supported_cases)
+    varying_features = int(varying_features)
+    required_cases = max(
+        MIN_REPORTABLE_SUPPORTED_CASES,
+        4 * (varying_features + 1),
+    )
+    policy = {
+        "name": "circular_loo_support_gate_v1",
+        "circular_loo_rmse_rad_max": MAX_REPORTABLE_CIRCULAR_LOO_RMSE_RAD,
+        "supported_cases_minimum_rule": "max(20, 4*(varying_features+1))",
+        "varying_features": varying_features,
+        "supported_cases_required": required_cases,
+        "supported_cases_observed": supported_cases,
+    }
+    reasons = []
+    rmse = _parse_float(circular_loo_rmse_rad)
+    if rmse is None:
+        reasons.append("circular_loo_rmse_unavailable")
+    elif rmse > MAX_REPORTABLE_CIRCULAR_LOO_RMSE_RAD:
+        reasons.append("circular_loo_rmse_exceeds_1_rad")
+    if supported_cases < required_cases:
+        reasons.append("insufficient_supported_cases")
+    return {
+        "reportable": not reasons,
+        "reportability_reasons": reasons,
+        "reportability_policy": policy,
+    }
+
+
+def _varying_physical_feature_count(rows, row_indices=None):
+    """Count varying physical design axes before circular phase expansion."""
+    if row_indices is not None:
+        rows = [rows[int(index)] for index in row_indices]
+    if not rows:
+        return 0
+    frequency_key = (
+        "reduced_frequency"
+        if all(_parse_float(row.get("reduced_frequency")) is not None
+               for row in rows)
+        else "frequency_hz"
+    )
+    keys = ("q_offset", "epsilon", frequency_key, "phase")
+    varying = 0
+    for key in keys:
+        values = [_parse_float(row.get(key)) for row in rows]
+        values = np.asarray([value for value in values if value is not None])
+        if len(values) > 1 and float(np.ptp(values)) > 1.0e-14:
+            varying += 1
+    return varying
 
 
 def _parse_float(text):
@@ -624,6 +686,11 @@ def build_surrogate(doe_root, output_root=None, targets=None,
     if not doe_root.is_absolute():
         doe_root = REPO_ROOT / doe_root
     require_schema_v2(doe_root, "unsteady DOE")
+    doe_manifest_path = doe_root / "manifest.json"
+    doe_manifest = (
+        json.loads(doe_manifest_path.read_text())
+        if doe_manifest_path.is_file() else {}
+    )
 
     if output_root is None:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -659,6 +726,8 @@ def build_surrogate(doe_root, output_root=None, targets=None,
         "schema_version": ARTIFACT_SCHEMA_VERSION,
         "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "doe_root": str(doe_root),
+        "geometry_lineage_id": doe_manifest.get("geometry_lineage_id"),
+        "reduced_frequency": doe_manifest.get("reduced_frequency"),
         "n_summary_rows": len(summary_rows),
         "n_valid_rows": len(valid_rows),
         "raw_design_features": list(RAW_FEATURE_KEYS),
@@ -677,6 +746,12 @@ def build_surrogate(doe_root, output_root=None, targets=None,
             "definition": "H = amplitude*exp(-i*positive_phase_lag)",
             "stems": list(COMPLEX_RESPONSE_STEMS),
             "unsupported_lags_trained": False,
+            "reportability_policy": {
+                "name": "circular_loo_support_gate_v1",
+                "circular_loo_rmse_rad_max": 1.0,
+                "supported_cases_minimum_rule": "max(20, 4*(varying_features+1))",
+                "status_ok_meaning": "model constructed successfully",
+            },
         },
         "feature_relevance": {
             "method": "absolute Spearman association on valid target rows",
@@ -703,11 +778,31 @@ def build_surrogate(doe_root, output_root=None, targets=None,
             f"only {len(valid_rows)} valid DOE rows available; need at least "
             f"{MIN_FIT_SAMPLES}. Surrogate training skipped."
         )
+        complex_responses = {}
+        for stem in COMPLEX_RESPONSE_STEMS:
+            real_name, imag_name = complex_target_names(stem)
+            supported_indices = [
+                index for index, row in enumerate(valid_rows)
+                if (_value_for_target(row, real_name) is not None
+                    and _value_for_target(row, imag_name) is not None)
+            ]
+            complex_responses[stem] = {
+                "status": "insufficient_supported_data",
+                "n_samples": len(supported_indices),
+                "circular_loo_rmse_rad": None,
+                **response_reportability(
+                    None, len(supported_indices),
+                    _varying_physical_feature_count(
+                        valid_rows, supported_indices,
+                    ),
+                ),
+            }
         write_json(output_root / "model_metadata.json", metadata)
         write_json(output_root / "surrogate_validation_summary.json", {
             "status": "insufficient_data",
             "message": message,
             "metadata": metadata,
+            "complex_responses": complex_responses,
         })
         print(message)
         return output_root, {"status": "insufficient_data"}
@@ -835,8 +930,22 @@ def build_surrogate(doe_root, output_root=None, targets=None,
     for stem in COMPLEX_RESPONSE_STEMS:
         real_name, imag_name = complex_target_names(stem)
         if real_name not in loo_cache or imag_name not in loo_cache:
+            supported_indices = [
+                index for index, row in enumerate(valid_rows)
+                if (_value_for_target(row, real_name) is not None
+                    and _value_for_target(row, imag_name) is not None)
+            ]
             validation_summary["complex_responses"][stem] = {
                 "status": "insufficient_supported_data",
+                "n_samples": len(supported_indices),
+                "circular_loo_rmse_rad": None,
+                **response_reportability(
+                    None,
+                    len(supported_indices),
+                    _varying_physical_feature_count(
+                        valid_rows, supported_indices,
+                    ),
+                ),
             }
             continue
         real_cache = loo_cache[real_name]
@@ -864,17 +973,24 @@ def build_surrogate(doe_root, output_root=None, targets=None,
         actual_lag = wrap_phase(np.arctan2(-actual_imag, actual_real))
         circular_error = wrap_phase(predicted_lag - actual_lag)
         amplitude_error = predicted_amplitude - actual_amplitude
+        circular_rmse = float(np.sqrt(np.mean(circular_error**2)))
         response_result = {
             "status": "ok",
             "n_samples": len(common),
             "circular_mae_rad": float(np.mean(np.abs(circular_error))),
-            "circular_rmse_rad": float(np.sqrt(np.mean(circular_error**2))),
+            "circular_rmse_rad": circular_rmse,
+            "circular_loo_rmse_rad": circular_rmse,
             "amplitude_rmse": float(np.sqrt(np.mean(amplitude_error**2))),
             "amplitude_rmse_over_std": float(
                 np.sqrt(np.mean(amplitude_error**2))
                 / max(float(np.std(actual_amplitude)), 1.0e-12)
             ),
             "phase_convention": "positive lag; H=A*exp(-i*lag)",
+            **response_reportability(
+                circular_rmse,
+                len(common),
+                _varying_physical_feature_count(valid_rows, common),
+            ),
         }
         validation_summary["complex_responses"][stem] = response_result
         for offset, row_index in enumerate(common):
@@ -907,6 +1023,8 @@ def build_surrogate(doe_root, output_root=None, targets=None,
         "created_utc": metadata["created_utc"],
         "study": "unsteady_response_surrogate",
         "doe_root": str(doe_root),
+        "geometry_lineage_id": metadata.get("geometry_lineage_id"),
+        "reduced_frequency": metadata.get("reduced_frequency"),
         "features": list(feature_names),
         "complex_response_stems": list(COMPLEX_RESPONSE_STEMS),
     })

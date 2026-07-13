@@ -100,12 +100,18 @@ def assess_hysteresis(rows, shock_position_tolerance_m, tpr_tolerance=0.01):
         if up.get("tpr") is not None and down.get("tpr") is not None:
             tpr_delta = float(down["tpr"] - up["tpr"])
         class_changed = up.get("classification") != down.get("classification")
-        path_dependent = bool(
-            class_changed
-            or (position_delta is not None
-                and abs(position_delta) > shock_position_tolerance_m)
-            or (tpr_delta is not None and abs(tpr_delta) > tpr_tolerance)
+        shock_difference_exceeds_tolerance = bool(
+            position_delta is not None
+            and abs(position_delta) > shock_position_tolerance_m
         )
+        tpr_difference_exceeds_tolerance = bool(
+            tpr_delta is not None and abs(tpr_delta) > tpr_tolerance
+        )
+        corroborated_path_dependence = bool(
+            shock_difference_exceeds_tolerance
+            or tpr_difference_exceeds_tolerance
+        )
+        threshold_flip = bool(class_changed and not corroborated_path_dependence)
         comparisons.append({
             "pressure_factor": factor,
             "up_classification": up.get("classification"),
@@ -113,14 +119,22 @@ def assess_hysteresis(rows, shock_position_tolerance_m, tpr_tolerance=0.01):
             "classification_changed": class_changed,
             "shock_position_delta_down_minus_up_m": position_delta,
             "tpr_delta_down_minus_up": tpr_delta,
-            "path_dependent": path_dependent,
+            "shock_difference_exceeds_tolerance": shock_difference_exceeds_tolerance,
+            "tpr_difference_exceeds_tolerance": tpr_difference_exceeds_tolerance,
+            "corroborated_path_dependence": corroborated_path_dependence,
+            "threshold_flip_at_resolution": threshold_flip,
+            # Backward-readable summary field. A bare threshold flip is no
+            # longer promoted to numerical path dependence.
+            "path_dependent": corroborated_path_dependence,
         })
 
     all_complete = bool(rows) and all(row.get("status") == "ok" for row in rows)
     if not comparisons or not all_complete:
         classification = "indeterminate_incomplete"
-    elif any(item["path_dependent"] for item in comparisons):
+    elif any(item["corroborated_path_dependence"] for item in comparisons):
         classification = "numerical_path_dependence_detected"
+    elif any(item["threshold_flip_at_resolution"] for item in comparisons):
+        classification = "threshold_flip_at_resolution"
     else:
         classification = "single_path_within_resolution"
     return {
@@ -310,6 +324,7 @@ def run_hysteresis(output_root=None, pressure_factors=None, nx=100,
     initialize_shock(
         solver, geom, initial_shock_x, A_in, A_ex, L, M1, p1, T1,
     )
+    shock_tolerance = 2.0 * float(np.mean(solver.mesh.dx))
 
     write_json(output_root / "manifest.json", {
         "schema_version": ARTIFACT_SCHEMA_VERSION,
@@ -320,6 +335,16 @@ def run_hysteresis(output_root=None, pressure_factors=None, nx=100,
         "random_seed": None,
         "state_carry_over": True,
         "physical_hysteresis_validation": False,
+        "classification_policy": {
+            "shock_position_tolerance_m": shock_tolerance,
+            "tpr_tolerance": 0.01,
+            "outcomes": [
+                "indeterminate_incomplete",
+                "numerical_path_dependence_detected",
+                "threshold_flip_at_resolution",
+                "single_path_within_resolution",
+            ],
+        },
         "pressure_factors_up": sorted({float(value) for value in pressure_factors}),
         "base_back_pressure_Pa": p_base,
         "base_shock_x_m": base_shock_x,
@@ -397,9 +422,8 @@ def run_hysteresis(output_root=None, pressure_factors=None, nx=100,
         "schema_version": ARTIFACT_SCHEMA_VERSION,
         "stages": stage_statuses,
     })
-    dx = float(np.mean(solver.mesh.dx))
     assessment = assess_hysteresis(
-        rows, shock_position_tolerance_m=2.0 * dx,
+        rows, shock_position_tolerance_m=shock_tolerance,
     )
     write_json(output_root / "hysteresis_assessment.json", assessment)
     plot_paths(rows, plots_dir / "hysteresis_paths.png")

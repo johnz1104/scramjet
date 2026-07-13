@@ -1,8 +1,8 @@
 {
-  "name": "TUSQ Ludwieg tube — UNSW Config A (aeroelastic ramp) conditions",
-  "description": "Freestream conditions for the Bhattrai et al. cantilevered compression-ramp experiment (research plan Config A). Replaces the generic Mach 6 / 25 km atmosphere baseline when targeting this anchor.",
-  "source": "Bhattrai, McQuellin, Currao, Neely, Buttsworth, J. Propulsion and Power 38(1), 2022. doi:10.2514/1.B38348; UNSW High-Speed FSI Database Case 05-2020",
-  "status": "Values transcribed from the research plan summary of the paper. Re-verify against the paper PDF before publication-grade comparisons.",
+  "name": "TUSQ Ludwieg tube — UNSW Config A (Ramp-1018) conditions",
+  "description": "Static tunnel conditions and the source-constrained Ramp-1018 reconstruction used for the Config-A research anchor.",
+  "source": "Bhattrai, McQuellin, Currao, Neely, Buttsworth, J. Propulsion and Power 38(1), 2022, doi:10.2514/1.B38348; UNSW High-Speed FSI Database Case 05-2020; Bhattrai PhD thesis.",
+  "status": "Geometry is source_reconstructed_v1, not exact CAD and not experiment calibrated. The solver freestream retains the verified static case-sheet values.",
   "inlet": {
     "mach": 5.85,
     "T_inf_K": 75.0,
@@ -14,8 +14,58 @@
     "p0_kPa": 1000.0,
     "T0_K": 584.0,
     "T_wall_K": 290.0,
-    "Re_per_m": 7.16e6,
-    "test_time_s": 0.2
+    "Re_per_m": 7160000.0,
+    "test_time_s": 0.2,
+    "nominal_stagnation_variants": {
+      "case_sheet_05_2020": {
+        "p0_kPa": 1000.0,
+        "T0_K": 584.0
+      },
+      "thesis_table_3_2": {
+        "p0_kPa": 1020.0,
+        "T0_K": 588.3
+      },
+      "usage": "Provenance note only; these variants do not replace the verified static p_inf=755 Pa and T_inf=75 K solver inputs."
+    }
   },
-  "geometry_notes": "Pair with mesh.config_a_ramp_area_law() for the calibrated effective-area law (its default lengths are placeholders — set L_ramp / L_isolator / H_capture from the paper drawings). Ramp: leading-edge incidence 8.33 deg, total turning 18.51 deg, 3 mm Al 6061-T6 cantilever."
+  "geometry": {
+    "status": "source_reconstructed_v1",
+    "profile_artifact": "geometry/config_a_source_reconstructed_v1.json",
+    "geometry_lineage_id": "unsw_ramp1018_source_reconstructed_v1",
+    "coordinate_rebase": "solver x=0 at ramp leading edge",
+    "nominal_stations_m": {
+      "leading_edge": 0.0,
+      "cowl": 0.1758,
+      "support": 0.2051,
+      "outlet": 0.2358
+    },
+    "physical_model": "Ramp-1018 leading-edge incidence 8.33 deg, total turn 18.51 deg, 3 mm Al 6061-T6 cantilever",
+    "claim_limit": "Trend-level low-fidelity and code-to-code work. Exact experiment matching requires the original UNSW CAD/50-node coordinates."
+  },
+  "motion": {
+    "mode": "model_assumed_cantilever_first_mode",
+    "beta_1": 1.875104,
+    "surface_coordinate": "reconstructed deformable ramp arc length",
+    "normalization": "unit leading-edge gap increase; zero displacement and slope at support; zero downstream",
+    "positive_displacement": "downward ramp motion / increased gap",
+    "dic_calibrated": false,
+    "sampling_guidance_hz": {
+      "manufactured_ramp_impulse_test": 55.5,
+      "fem_first_mode": 60.0,
+      "dic_response": 52.0
+    }
+  },
+  "reduced_frequency_reference": {
+    "length_ref_m": 0.2111,
+    "length_name": "published deformable surface arc length",
+    "velocity_ref": "inlet.u_inf",
+    "definition": "k=2*pi*f*length_ref/u_ref"
+  },
+  "provenance": {
+    "unsw_case_url": "https://www.unsw.edu.au/canberra/our-research/research-excellence/engineering-research/hypersonics/high-speed-fsi-database/cantilevered-compression-ramp-3mm",
+    "thesis_url": "https://unsworks.unsw.edu.au/server/api/core/bitstreams/bf902a7a-7e55-4fda-80b2-527430526d7b/content",
+    "intake_design_url": "https://www.researchgate.net/publication/336114358_Impact_of_Aeroelasticity_on_Hypersonic_Intake_Performance",
+    "raw_cad_available": false,
+    "full_field_dic_available": false
+  }
 }

@@ -33,6 +33,17 @@ case has yet been meshed, run, and postprocessed in this repository. The model
 here resolves the quasi-1D compressible dynamics and the geometry and
 forcing parameter space that frame those simulations.
 
+Config A now uses a deterministic, frozen Ramp-1018 reconstruction labeled
+`source_reconstructed_v1`. It is constrained by the public UNSW case sheet,
+thesis, and author-uploaded intake-design paper, but it is not the original
+CAD and is not experiment calibrated. Publication-grade experiment matching
+still requires the unpublished UNSW CAD/50-node coordinates and full-field
+DIC motion data.
+
+Reconstruction provenance: [UNSW Case 05-2020](https://www.unsw.edu.au/canberra/our-research/research-excellence/engineering-research/hypersonics/high-speed-fsi-database/cantilevered-compression-ramp-3mm),
+[UNSW thesis](https://unsworks.unsw.edu.au/server/api/core/bitstreams/bf902a7a-7e55-4fda-80b2-527430526d7b/content), and the
+[author-uploaded intake-design paper](https://www.researchgate.net/publication/336114358_Impact_of_Aeroelasticity_on_Hypersonic_Intake_Performance).
+
 ## Research direction
 
 Two coupled questions drive the work.
@@ -64,16 +75,17 @@ study flags as significant.
 > **Geometries of interest.** The streamtraced/Busemann inlet of [1] and the
 > cantilevered compression-ramp intake of [2] are the initial reference
 > geometries. They enter the model through their effective-area signatures: a
-> static contraction parameter `q` and a localized breathing mode
-> `eps * phi(x)`. These signatures are general. Sweeping `q` defines a family of
+> static contraction parameter `q` and a breathing mode `eps * phi(x)`. For
+> Config A, `phi` is the assumed classical first cantilever eigenfunction;
+> generic ducts retain the Gaussian mode. Sweeping `q` defines a family of
 > inlet wall positions, and varying the breathing amplitude, frequency, and
 > phase defines a family of wall-motion regimes. A parametric **Busemann
 > generator** (`busemann.py`, Taylor–Maccoll integration) produces the Config-B
 > geometry family directly, and experiment-condition presets (`configs/`)
 > replace the generic atmosphere baseline with tunnel freestream conditions.
-> Any selected configuration is reconstructed body-fitted in OpenFOAM, for
-> which the exporter emits the geometry, freestream state, a structured Gmsh
-> mesh definition, and an OpenFOAM case template with shared QoI definitions.
+> The exporter retains the closed effective-area duct for strict code
+> comparison and adds a Config-A physical external-inlet topology with an open
+> upstream freestream region, fixed cowl, and discrete ramp segments.
 
 ![Effective-area parameterization](figures/geometry_parameterization.png)
 
@@ -142,12 +154,18 @@ therefore sets the compression delivered to the isolator, and there is a
 contraction limit beyond which a started, fully supersonic solution no longer
 exists and the inlet unstarts, expelling the shock system upstream [3].
 
-The duct geometry is a three-section area law `A_base(x)` (a contracting inlet,
-a slightly diverging combustor, and an expanding nozzle); tabulated area laws
-(`TabulatedAreaProfile`) admit experiment-derived geometries — a Config-A-like
-ramp/isolator turning schedule and Busemann-generated contours — through the
-same interface. The two research controls are localized perturbations of the
-law about the throat, using a Gaussian shape `phi(x)`:
+The generic duct geometry is a three-section area law `A_base(x)` (a
+contracting inlet, a slightly diverging combustor, and an expanding nozzle).
+`TabulatedAreaProfile` admits sampled area laws, while
+`WallContourGeometryProfile` retains physical walls, effective area, and
+geometry lineage. Config A is reconstructed by solving the weak leading-edge
+shock at Mach 5.85 and 8.33 degrees, marching 50 Prandtl-Meyer/MOC compression
+segments to 18.51 degrees about the cowl focal point, and closing a tangent
+circular shoulder and horizontal isolator against the published dimensions.
+The frozen artifact is
+`configs/geometry/config_a_source_reconstructed_v1.json`.
+
+Generic geometries use the Gaussian perturbation
 
 ```math
 A(x; q) = A_{\text{base}}(x) + q\,\phi(x), \qquad
@@ -158,16 +176,27 @@ A(x; q) = A_{\text{base}}(x) + q\,\phi(x), \qquad
 A(x, t) = A_{\text{base}}(x) + \big(q_{\text{offset}} + \varepsilon \sin(2\pi f t + \psi)\big)\,\phi(x).
 ```
 
+For Config A, `phi(x)` is instead the classical first cantilever eigenfunction
+with `beta_1=1.875104`, evaluated along the reconstructed 0.2111 m surface arc.
+It has unit leading-edge gap increase, zero displacement and slope at the
+support, and is zero downstream. Positive displacement means downward ramp
+motion/increased gap. This mode is labeled
+`model_assumed_cantilever_first_mode`; the published 55.5, 60, and 52 Hz values
+guide sampling only and do not make it DIC calibrated.
+
+The raw `q_offset` and `epsilon` coordinates remain available. Config-A runs
+also accept mutually exclusive normalized inputs `q_offset_le_over_S` and
+`epsilon_le_over_S`, where `S=0.2111 m`, and record both representations.
+
 Frequency is also stored as
 
 ```math
 k = \frac{2\pi f L_{\mathrm{ref}}}{u_{\mathrm{ref}}}.
 ```
 
-Every DoE manifest records the dimensional references. Demo defaults use the
-full duct length and inlet velocity; both are CLI-overridable so calibrated
-Config-A work can use its ramp/motion length rather than silently inheriting a
-generic duct scale.
+Every DoE manifest records the dimensional references. Generic runs default to
+the full duct length; Config A defaults to the published 0.2111 m deformable
+surface. Explicit CLI references take precedence.
 
 The static parameter `q` represents an effective throat-area or wall-position
 change and is the axis for the contraction and unstart study. The time-periodic
@@ -254,20 +283,31 @@ The compressible model is paired with two reduced representations:
   feature association, dense in-domain amplitude/lag maps, and the exact
   zero-forcing boundary are emitted with the model audit.
 
+  Constructing a complex-response model (`status: ok`) is separate from being
+  allowed to report its predicted phase. Each response records `reportable`,
+  `reportability_reasons`, and `reportability_policy`. The default gate requires
+  circular LOO RMSE at most 1 rad and at least
+  `max(20, 4*(varying_features+1))` supported cases. Missing legacy metadata is
+  unknown/non-reportable for enforcement, although it remains readable for an
+  audit display.
+
 Candidate configurations are ranked by a transparent weighted score over
 normalized quantities of interest, and the selected geometries are exported
-for OpenFOAM and FUN3D as an area profile, a wall contour, freestream and
+for OpenFOAM and FUN3D as an area profile, wall contours, freestream and
 derived stagnation conditions, shared quantity-of-interest definitions, a
-structured **Gmsh** mesh definition (`.geo`, transfinite quads, named physical
-groups), and an **OpenFOAM case template** (`rhoCentralFoam`-style `0/`,
+**Gmsh** mesh definition (`.geo`, named physical groups), and an **OpenFOAM
+case template** (`rhoCentralFoam`-style `0/`,
 `constant/`, `system/`, and a `pipefail`-safe `Allrun.sh` driver), sampling
 function objects, and an executable `postprocess_qoi.py` that writes the shared
 schema-v2 TPR/shock QoIs. Measured supported lag remains authoritative for
 evaluated DoE cases; optional surrogate LOO lag can be carried into the report
 or used as an additional finite-value gate, but never replaces the measured
-value in the score. This is designed for apples-to-apples comparison;
-the loop is not yet closed. Review the dictionaries against the pinned
-OpenFOAM version before production runs.
+value in the score. The manifest field `comparison_topology` distinguishes
+`closed_effective_duct` from `config_a_external_inlet`; the latter requires the
+reconstructed lineage and uses `inlet`, `farfield`, `rampWall`, `cowlWall`,
+`outlet`, and `frontAndBack` patches. This is designed for apples-to-apples
+comparison; the loop is not yet closed. Review the dictionaries against the
+pinned OpenFOAM version before production runs.
 
 **Scope.** The model resolves inviscid, quasi-1D compressible duct dynamics
 with the variable-area coupling, plus optional molecular diffusion and
@@ -396,8 +436,10 @@ curve must not be relabeled as a strict outlet-forcing validation.
 up/down back-pressure staircase. At 60 cells the regenerated 15-stage demo
 settles every level and finds a classification difference at pressure factor
 1.323: shock-at-inlet on the up leg and a captured shock on the down leg. A
-repeat run is byte-identical. This is numerical path dependence in the
-prescribed-inlet model, not validation of physical spillage hysteresis.
+repeat run is byte-identical. The shock-position difference is one cell and
+does not exceed the two-cell tolerance, so the assessment is
+`threshold_flip_at_resolution`, not numerical path dependence and not
+validation of physical spillage hysteresis.
 
 ### Reduced-order model and adaptive sampling
 
@@ -449,7 +491,7 @@ balance to integration accuracy.*
 | File | Description |
 |---|---|
 | `gasdynamics.py` | Exact isentropic, normal-shock, and oblique-shock relations (shared references). |
-| `mesh.py` | Structured 2-D mesh; `GeometryProfile` (three-section area law); perturbation and breathing-mode wrappers (incl. `dA/dt`); `TabulatedAreaProfile`; Config-A-like ramp area law. |
+| `mesh.py` | Structured 2-D mesh; generic, tabulated, and physical-wall profiles; Gaussian/tabulated motion modes; Config-A lineage and serialization. |
 | `fvm.py` | `StateVector`, boundary conditions (supersonic in/out, modulated back-pressure outlet, walls), HLLC, cell-slope MUSCL with per-variable limiter scaling, JIT flux assembly with quasi-1D area weighting, RK3-SSP with stage times. |
 | `physics.py` | Sutherland transport, quasi-1D source-vector reference form, single-step Arrhenius, prescribed heat release, implicit FEM diffusion (moving-wall capable). |
 | `solver.py` | Configuration containers (atmosphere or explicit tunnel freestream) and the Strang-split `Solver`. |
@@ -458,17 +500,18 @@ balance to integration accuracy.*
 | `optimization.py` | `DesignSpace`, full-only `GPSurrogate`, Expected Improvement, and ROM-prescreen/full-confirm adaptive sampling. |
 | `response_metrics.py` | Own-time-array, drift-aware amplitude/positive-lag estimation with support and fit-quality guards. |
 | `diagnostics.py` | TPR, shock detection (total-pressure destruction), scalar-boundedness and flow diagnostics. |
-| `configs/` | Experiment-condition presets: `tusq_m585.json` (Config A), `ncsu_m37.json` (Config B; review-note transcription flagged in-file). |
-| `experiments/` | Static sweep, unsteady runs, DoE, complex-response surrogate and ROM builders, candidate ranking, forced-shock benchmark, deterministic hysteresis diagnostic, presets loader, and the OpenFOAM/FUN3D + Gmsh exporter. |
+| `configs/` | Experiment-condition presets plus the frozen `source_reconstructed_v1` Config-A geometry artifact. |
+| `experiments/` | Reconstruction utility, static/unsteady runners, DoE, reportability-gated surrogate, ranking/diagnostics, and dual-topology OpenFOAM/FUN3D + Gmsh export. |
 | `figures/make_geometry_figure.py` | Regenerates the parameterization figure above. |
-| `tests.py` | Thirteen validation groups; exits 1 on failure and 2 for an unknown group. |
+| `tests.py` | Fourteen validation groups; exits 1 on failure and 2 for an unknown group. |
 | `verification/verify_all.py` | Assertion-bearing end-to-end harness writing `verify_results.json` and `verify_*.png`. |
 
 ## Quick start
 
 ```bash
 python3 -m pip install -r requirements.txt
-python3 tests.py                            # validation suite, 13 groups
+python3 tests.py                            # validation suite, 14 groups
+python3 experiments/reconstruct_config_a_geometry.py --check
 python3 verification/verify_all.py          # baseline, ROM, optimization (~1 min)
 python3 figures/make_geometry_figure.py     # regenerate the geometry figure
 python3 busemann.py                         # Busemann generator demo
@@ -486,19 +529,32 @@ python3 experiments/export_high_fidelity_scaffold.py --sweep-root runs/static_de
     --selected-cases runs/ranked_demo/selected_cases.json --output-root runs/export_demo
 python3 experiments/run_forced_shock_benchmark.py   --output-root runs/forced_shock
 python3 experiments/run_hysteresis_sweep.py         --output-root runs/hysteresis_demo
+
+# Config-A normalized static example (auto selects preset geometry)
+python3 experiments/run_static_wall_sweep.py \
+    --preset configs/tusq_m585.json --area-law auto \
+    --q-values-le-over-S=-0.04,0,0.04 --output-root runs/config_a_static
+
+# Physical external-inlet handoff; this does not execute Gmsh or OpenFOAM
+python3 experiments/export_high_fidelity_scaffold.py \
+    --sweep-root runs/config_a_static --output-root runs/config_a_external \
+    --comparison-topology config_a_external_inlet
 ```
 
 Experiment-condition presets replace the generic atmosphere baseline
-(`--preset configs/tusq_m585.json` on the sweep and DoE runners). The exporter
-writes geometry, area, and wall-contour files, freestream and stagnation
-conditions, shared QoI definitions, mesh and turbulence notes, a structured
-Gmsh `.geo`, an OpenFOAM case template, sampling objects, and an executable QoI
+(`--preset configs/tusq_m585.json` on the sweep and DoE runners). Geometry
+selection is `--area-law {auto,default,config_a}`: `auto` uses a preset profile,
+`default` explicitly bypasses it, and generic no-preset behavior is unchanged.
+The exporter writes geometry, area, and wall-contour files, freestream and
+stagnation conditions, shared QoI definitions, mesh and turbulence notes, a
+Gmsh `.geo` (structured for the closed duct; piecewise physical walls for the
+external inlet), an OpenFOAM case template, sampling objects, and an executable QoI
 bridge per selected case. Schema-v2 gates prevent older, pre-energy-fix runs
 from entering the ROM/surrogate/ranking/export stages. Demo runs use three
 cycles with a 25% time discard; each case also persists `run_status.json`. For
-reportable response maps use converged baselines,
-5–10 post-transient forcing cycles, and a transient discard tied to the
-flow-through time.
+reportable response maps must pass the circular-error/support gate in addition
+to using converged baselines, 5–10 post-transient forcing cycles, and a
+transient discard tied to the flow-through time.
 
 ## Reproducing the numbers
 

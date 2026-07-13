@@ -7,9 +7,9 @@ reduced-fidelity effective-area forcing model
     q_total(t) = q_offset + epsilon * sin(2*pi*frequency_hz*t + phase)
     A(x, t)    = A_base(x) + q_total(t) * phi(x),
 
-where phi(x) is the same Gaussian throat localization used by the static
-and unsteady prototypes. This is an effective area-source DOE, not a
-moving-wall or deforming-mesh CFD study.
+where generic geometries use Gaussian throat localization and reconstructed
+Config A uses the model-assumed first cantilever mode. This is an effective
+area-source DOE, not a moving-wall or deforming-mesh CFD study.
 
 Each successful case writes:
     config.json, forcing_history.csv, qoi_history.csv,
@@ -21,8 +21,8 @@ Aggregate outputs:
 
 Every new case also records the reduced-frequency coordinate
 ``k = 2*pi*f*L_ref/u_ref``.  The dimensional references are explicit in the
-manifest and may be overridden for calibrated Config-A studies; demo defaults
-use the full duct length and inlet velocity.
+manifest and may be overridden explicitly. Generic cases default to full duct
+length; Config A defaults to the 0.2111 m deformable surface.
 
 Failed cases are recorded as rows in summary.csv with status="failed"
 and an error_message, so the DOE does not crash on a single bad case.
@@ -45,9 +45,13 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from mesh import (
+    CONFIG_A_GEOMETRY_LINEAGE_ID,
     LocalizedAreaPerturbation,
     SinusoidalAreaForcing,
     TimeDependentPerturbedGeometryProfile,
+    config_a_cantilever_mode,
+    config_a_normalized_to_raw,
+    config_a_raw_to_normalized,
 )
 from solver import Solver
 from diagnostics import all_case_diagnostics
@@ -117,7 +121,8 @@ def reduced_frequency(frequency_hz, length_ref, velocity_ref):
 
 
 def design_matrix(q_offsets, epsilons, frequencies_hz, phases,
-                  length_ref=None, velocity_ref=None):
+                  length_ref=None, velocity_ref=None,
+                  deformable_surface_length=None):
     """Cartesian product of the four DOE axes plus optional reduced frequency."""
     rows = []
     for idx, (q_offset, eps, freq, phi) in enumerate(
@@ -130,6 +135,13 @@ def design_matrix(q_offsets, epsilons, frequencies_hz, phases,
             "frequency_hz": float(freq),
             "phase": float(phi),
         }
+        if deformable_surface_length is not None:
+            row["q_offset_le_over_S"] = (
+                float(q_offset) / float(deformable_surface_length)
+            )
+            row["epsilon_le_over_S"] = (
+                float(eps) / float(deformable_surface_length)
+            )
         if length_ref is not None and velocity_ref is not None:
             row["reduced_frequency"] = reduced_frequency(
                 freq, length_ref, velocity_ref,
@@ -140,21 +152,36 @@ def design_matrix(q_offsets, epsilons, frequencies_hz, phases,
 
 def build_time_dependent_geometry(base_geometry, q_offset, epsilon,
                                    frequency_hz, phase, width=None,
-                                   x_center=None, min_area=1.0e-4):
+                                   x_center=None, min_area=1.0e-4,
+                                   motion_mode="auto"):
     """Construct A(x, t) = A_base(x) + (q_offset + epsilon*sin(...)) * phi(x)."""
     if width is None:
         width = 0.05 * base_geometry.L_total
     if x_center is None:
         x_center = base_geometry.x_throat
 
-    perturbation = LocalizedAreaPerturbation(
-        enabled=True,
-        mode="throat_gaussian",
-        amplitude=0.0,
-        x_center=x_center,
-        width=width,
-        min_area=min_area,
-    )
+    if motion_mode not in {"auto", "gaussian", "config_a"}:
+        raise ValueError(f"unsupported motion mode: {motion_mode}")
+    resolved_motion = motion_mode
+    if resolved_motion == "auto":
+        resolved_motion = (
+            "config_a"
+            if getattr(base_geometry, "geometry_lineage_id", None) == CONFIG_A_GEOMETRY_LINEAGE_ID
+            else "gaussian"
+        )
+    if resolved_motion == "config_a":
+        perturbation = config_a_cantilever_mode(
+            base_geometry, amplitude=0.0, min_area=min_area,
+        )
+    else:
+        perturbation = LocalizedAreaPerturbation(
+            enabled=True,
+            mode="throat_gaussian",
+            amplitude=0.0,
+            x_center=x_center,
+            width=width,
+            min_area=min_area,
+        )
     forcing = SinusoidalAreaForcing(
         amplitude=float(epsilon),
         frequency_hz=float(frequency_hz),
@@ -176,7 +203,8 @@ def run_one_case(case_dir, design_row, baseline_state_U, baseline_summary,
                  nx, ny, cfl, mach, altitude, width, x_center, min_area,
                  cycles, t_final_static, unsteady_steps, sample_interval_steps,
                  discard_fraction, preset=None,
-                 legacy_breathing_energy=False):
+                 legacy_breathing_energy=False, area_law="auto",
+                 motion_mode="auto"):
     """Run a single DOE case. Returns a summary row (status PASS/FAIL)."""
     plots_dir = case_dir / "plots"
     case_dir.mkdir(parents=True, exist_ok=True)
@@ -193,6 +221,9 @@ def run_one_case(case_dir, design_row, baseline_state_U, baseline_summary,
     }
     if "reduced_frequency" in design_row:
         summary_row["reduced_frequency"] = design_row["reduced_frequency"]
+    for key in ("q_offset_le_over_S", "epsilon_le_over_S"):
+        if key in design_row:
+            summary_row[key] = design_row[key]
 
     solver = None
     try:
@@ -205,6 +236,7 @@ def run_one_case(case_dir, design_row, baseline_state_U, baseline_summary,
         cfg = make_cold_flow_config(
             nx=nx, ny=ny, n_steps=step_cap, cfl=cfl,
             mach=mach, altitude=altitude, preset=preset,
+            area_law=area_law,
         )
         cfg.t_final = t_final
         cfg.legacy_breathing_energy = bool(legacy_breathing_energy)
@@ -215,6 +247,7 @@ def run_one_case(case_dir, design_row, baseline_state_U, baseline_summary,
             frequency_hz=design_row["frequency_hz"],
             phase=design_row["phase"],
             width=width, x_center=x_center, min_area=min_area,
+            motion_mode=motion_mode,
         )
 
         solver = Solver(cfg)
@@ -253,6 +286,15 @@ def run_one_case(case_dir, design_row, baseline_state_U, baseline_summary,
             "study": "parametric_unsteady_doe",
             "model": "time_dependent_effective_area_forcing_with_offset",
             "not_true_moving_wall_cfd": True,
+            "geometry_lineage_id": getattr(
+                cfg.geometry, "geometry_lineage_id", None,
+            ),
+            "forcing_coordinates": {
+                "q_offset": design_row["q_offset"],
+                "epsilon": design_row["epsilon"],
+                "q_offset_le_over_S": design_row.get("q_offset_le_over_S"),
+                "epsilon_le_over_S": design_row.get("epsilon_le_over_S"),
+            },
             "design": design_row,
             "baseline": baseline_summary,
             "config": config_to_dict(cfg),
@@ -470,14 +512,17 @@ def plot_frequency_response(summary_rows, path):
 def warm_start_baseline(q_offset, nx, ny, baseline_steps, cfl, mach,
                         altitude, width=None, x_center=None,
                         min_area=1.0e-4, steady_rtol=1.0e-6,
-                        steady_check_interval=50, preset=None):
+                        steady_check_interval=50, preset=None,
+                        area_law="auto", motion_mode="auto"):
     """Converge the static mean geometry for one unique q_offset."""
     cfg = make_cold_flow_config(nx=nx, ny=ny, n_steps=baseline_steps, cfl=cfl,
-                                mach=mach, altitude=altitude, preset=preset)
+                                mach=mach, altitude=altitude, preset=preset,
+                                area_law=area_law)
     cfg.geometry = build_time_dependent_geometry(
         cfg.geometry, q_offset=q_offset, epsilon=0.0,
         frequency_hz=0.0, phase=0.0, width=width,
         x_center=x_center, min_area=min_area,
+        motion_mode=motion_mode,
     )
     cfg.steady_rtol = float(steady_rtol)
     cfg.steady_check_interval = int(steady_check_interval)
@@ -488,6 +533,7 @@ def warm_start_baseline(q_offset, nx, ny, baseline_steps, cfl, mach,
 
 
 def run_doe(output_root=None, q_offsets=None, epsilons=None,
+            q_offsets_le_over_S=None, epsilons_le_over_S=None,
             frequencies_hz=None, phases=None, nx=30, ny=6,
             unsteady_steps=None, baseline_steps=5000, cfl=0.35,
             mach=6.0, altitude=25000.0, width=None, x_center=None,
@@ -497,12 +543,76 @@ def run_doe(output_root=None, q_offsets=None, epsilons=None,
             baseline_check_interval=50, preset=None,
             legacy_breathing_energy=False,
             reduced_frequency_length_ref=None,
-            reduced_frequency_velocity_ref=None):
+            reduced_frequency_velocity_ref=None,
+            area_law="auto", motion_mode="auto"):
     """Run the DOE and aggregate outputs."""
-    q_offsets = list(default_q_offsets() if q_offsets is None else q_offsets)
-    epsilons = list(default_epsilons() if epsilons is None else epsilons)
     frequencies_hz = list(default_frequencies_hz() if frequencies_hz is None else frequencies_hz)
     phases = list(default_phases() if phases is None else phases)
+
+    if q_offsets is not None and q_offsets_le_over_S is not None:
+        raise ValueError("raw q_offsets and q_offsets_le_over_S are mutually exclusive")
+    if epsilons is not None and epsilons_le_over_S is not None:
+        raise ValueError("raw epsilons and epsilons_le_over_S are mutually exclusive")
+
+    reference_cfg = make_cold_flow_config(
+        nx=nx, ny=ny, n_steps=1, cfl=cfl,
+        mach=mach, altitude=altitude, preset=preset, area_law=area_law,
+    )
+    reference_geometry = reference_cfg.geometry
+    is_config_a = (
+        getattr(reference_geometry, "geometry_lineage_id", None)
+        == CONFIG_A_GEOMETRY_LINEAGE_ID
+    )
+    surface_length = (
+        float(reference_geometry.reduced_frequency_length_ref_m)
+        if is_config_a else None
+    )
+    if (q_offsets_le_over_S is not None or epsilons_le_over_S is not None) and not is_config_a:
+        raise ValueError("normalized Delta-Y_LE/S inputs require Config-A geometry")
+
+    if q_offsets_le_over_S is not None:
+        q_offsets_le_over_S = [float(value) for value in q_offsets_le_over_S]
+        q_offsets = [
+            config_a_normalized_to_raw(value, reference_geometry)
+            for value in q_offsets_le_over_S
+        ]
+        q_input_representation = "q_offset_le_over_S"
+    elif q_offsets is None and is_config_a:
+        q_offsets_le_over_S = [-0.04, 0.0, 0.04]
+        q_offsets = [
+            config_a_normalized_to_raw(value, reference_geometry)
+            for value in q_offsets_le_over_S
+        ]
+        q_input_representation = "config_a_normalized_default"
+    else:
+        q_offsets = list(default_q_offsets() if q_offsets is None else q_offsets)
+        q_offsets_le_over_S = (
+            [config_a_raw_to_normalized(value, reference_geometry) for value in q_offsets]
+            if is_config_a else None
+        )
+        q_input_representation = "raw_q_offset"
+
+    if epsilons_le_over_S is not None:
+        epsilons_le_over_S = [float(value) for value in epsilons_le_over_S]
+        epsilons = [
+            config_a_normalized_to_raw(value, reference_geometry)
+            for value in epsilons_le_over_S
+        ]
+        epsilon_input_representation = "epsilon_le_over_S"
+    elif epsilons is None and is_config_a:
+        epsilons_le_over_S = [0.0, 0.01, 0.02]
+        epsilons = [
+            config_a_normalized_to_raw(value, reference_geometry)
+            for value in epsilons_le_over_S
+        ]
+        epsilon_input_representation = "config_a_normalized_default"
+    else:
+        epsilons = list(default_epsilons() if epsilons is None else epsilons)
+        epsilons_le_over_S = (
+            [config_a_raw_to_normalized(value, reference_geometry) for value in epsilons]
+            if is_config_a else None
+        )
+        epsilon_input_representation = "raw_epsilon"
 
     if output_root is None:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -517,12 +627,12 @@ def run_doe(output_root=None, q_offsets=None, epsilons=None,
     cases_root.mkdir(parents=True, exist_ok=True)
     plots_dir.mkdir(parents=True, exist_ok=True)
 
-    reference_cfg = make_cold_flow_config(
-        nx=nx, ny=ny, n_steps=1, cfl=cfl,
-        mach=mach, altitude=altitude, preset=preset,
+    default_length_ref = (
+        float(reference_geometry.reduced_frequency_length_ref_m)
+        if is_config_a else float(reference_geometry.L_total)
     )
     length_ref = (
-        float(reference_cfg.geometry.L_total)
+        default_length_ref
         if reduced_frequency_length_ref is None
         else float(reduced_frequency_length_ref)
     )
@@ -537,6 +647,7 @@ def run_doe(output_root=None, q_offsets=None, epsilons=None,
     design_rows = design_matrix(
         q_offsets, epsilons, frequencies_hz, phases,
         length_ref=length_ref, velocity_ref=velocity_ref,
+        deformable_surface_length=surface_length,
     )
     write_csv(output_root / "design_matrix.csv", design_rows)
 
@@ -549,6 +660,8 @@ def run_doe(output_root=None, q_offsets=None, epsilons=None,
         "axes": {
             "q_offset": q_offsets,
             "epsilon": epsilons,
+            "q_offset_le_over_S": q_offsets_le_over_S,
+            "epsilon_le_over_S": epsilons_le_over_S,
             "frequency_hz": frequencies_hz,
             "reduced_frequency": [
                 reduced_frequency(f, length_ref, velocity_ref)
@@ -556,12 +669,22 @@ def run_doe(output_root=None, q_offsets=None, epsilons=None,
             ],
             "phase": phases,
         },
+        "input_representations": {
+            "q_offset": q_input_representation,
+            "epsilon": epsilon_input_representation,
+            "raw_and_normalized_recorded": bool(is_config_a),
+        },
+        "geometry_lineage_id": getattr(
+            reference_geometry, "geometry_lineage_id", None,
+        ),
         "reduced_frequency": {
             "symbol": "k",
             "definition": "2*pi*frequency_hz*length_ref_m/velocity_ref_m_s",
             "length_ref_m": length_ref,
             "length_source": (
-                "geometry.L_total" if reduced_frequency_length_ref is None
+                ("geometry.reduced_frequency_length_ref_m"
+                 if is_config_a else "geometry.L_total")
+                if reduced_frequency_length_ref is None
                 else "cli_override"
             ),
             "velocity_ref_m_s": velocity_ref,
@@ -580,6 +703,8 @@ def run_doe(output_root=None, q_offsets=None, epsilons=None,
             "baseline_steady_rtol": baseline_steady_rtol,
             "baseline_check_interval": baseline_check_interval,
             "legacy_breathing_energy": bool(legacy_breathing_energy),
+            "area_law": area_law,
+            "motion_mode": motion_mode,
         },
         "git": git_metadata(),
     })
@@ -595,10 +720,16 @@ def run_doe(output_root=None, q_offsets=None, epsilons=None,
             steady_rtol=baseline_steady_rtol,
             steady_check_interval=baseline_check_interval,
             preset=preset,
+            area_law=area_law,
+            motion_mode=motion_mode,
         )
         recent_dt = baseline_solver.dt_history[-min(50, len(baseline_solver.dt_history)):]
         baseline_summary = {
             "q_offset": q_offset,
+            "q_offset_le_over_S": (
+                config_a_raw_to_normalized(q_offset, reference_geometry)
+                if is_config_a else None
+            ),
             "steps": int(baseline_solver.step_count),
             "final_time": float(baseline_solver.time),
             "converged": bool(baseline_solver.converged),
@@ -611,6 +742,9 @@ def run_doe(output_root=None, q_offsets=None, epsilons=None,
         }
     write_json(output_root / "baselines.json", {
         "schema_version": ARTIFACT_SCHEMA_VERSION,
+        "geometry_lineage_id": getattr(
+            reference_geometry, "geometry_lineage_id", None,
+        ),
         "baselines": [entry["summary"] for entry in baselines.values()],
     })
 
@@ -634,6 +768,8 @@ def run_doe(output_root=None, q_offsets=None, epsilons=None,
             discard_fraction=discard_fraction,
             preset=preset,
             legacy_breathing_energy=legacy_breathing_energy,
+            area_law=area_law,
+            motion_mode=motion_mode,
         )
         summary_rows.append(row)
         if row["status"] != "ok":
@@ -676,8 +812,18 @@ def main(argv=None):
                         help="Output directory (default: timestamped runs/ subdir).")
     parser.add_argument("--q-offsets", default=None,
                         help="Comma-separated q_offset values [m^2].")
+    parser.add_argument(
+        "--q-offsets-le-over-S", "--q-offset-le-over-S",
+        dest="q_offsets_le_over_S", default=None,
+        help="Comma-separated Config-A leading-edge offsets Delta-Y_LE/S.",
+    )
     parser.add_argument("--epsilons", default=None,
                         help="Comma-separated forcing amplitudes [m^2].")
+    parser.add_argument(
+        "--epsilons-le-over-S", "--epsilon-le-over-S",
+        dest="epsilons_le_over_S", default=None,
+        help="Comma-separated Config-A forcing amplitudes Delta-Y_LE/S.",
+    )
     parser.add_argument("--frequencies-hz", default=None,
                         help="Comma-separated forcing frequencies [Hz].")
     parser.add_argument("--phases", default=None,
@@ -705,12 +851,16 @@ def main(argv=None):
     parser.add_argument("--preset", default=None,
                         help="Experiment-condition preset (e.g. configs/tusq_m585.json); "
                              "overrides --mach/--altitude.")
+    parser.add_argument("--area-law", choices=("auto", "default", "config_a"),
+                        default="auto")
+    parser.add_argument("--motion-mode", choices=("auto", "gaussian", "config_a"),
+                        default="auto")
     parser.add_argument("--legacy-breathing-energy", action="store_true",
                         help="Audit only: reproduce the historically wrong energy source.")
     parser.add_argument(
         "--reduced-frequency-length-ref", type=float, default=None,
-        help=("L_ref [m] in k=2*pi*f*L_ref/u_ref. Default: geometry.L_total; "
-              "use the calibrated ramp/motion length for Config-A research."),
+        help=("L_ref [m] in k=2*pi*f*L_ref/u_ref. Default: geometry.L_total, "
+              "or the reconstructed 0.2111 m deformable surface for Config A."),
     )
     parser.add_argument(
         "--reduced-frequency-velocity-ref", type=float, default=None,
@@ -723,6 +873,14 @@ def main(argv=None):
         output_root=args.output_root,
         q_offsets=parse_float_list(args.q_offsets) if args.q_offsets else None,
         epsilons=parse_float_list(args.epsilons) if args.epsilons else None,
+        q_offsets_le_over_S=(
+            parse_float_list(args.q_offsets_le_over_S)
+            if args.q_offsets_le_over_S else None
+        ),
+        epsilons_le_over_S=(
+            parse_float_list(args.epsilons_le_over_S)
+            if args.epsilons_le_over_S else None
+        ),
         frequencies_hz=parse_float_list(args.frequencies_hz) if args.frequencies_hz else None,
         phases=parse_float_list(args.phases) if args.phases else None,
         nx=args.nx, ny=args.ny,
@@ -739,6 +897,8 @@ def main(argv=None):
         legacy_breathing_energy=args.legacy_breathing_energy,
         reduced_frequency_length_ref=args.reduced_frequency_length_ref,
         reduced_frequency_velocity_ref=args.reduced_frequency_velocity_ref,
+        area_law=args.area_law,
+        motion_mode=args.motion_mode,
     )
 
 

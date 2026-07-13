@@ -7,8 +7,34 @@ Contains:
 
 Dependency: numpy, matplotlib (plotting only)
 """
+import copy
+import hashlib
+import json
+from pathlib import Path
+
 import numpy as np
 import matplotlib.pyplot as plt
+
+
+CONFIG_A_GEOMETRY_LINEAGE_ID = "unsw_ramp1018_source_reconstructed_v1"
+CONFIG_A_GEOMETRY_ARTIFACT = (
+    Path(__file__).resolve().parent
+    / "configs" / "geometry" / "config_a_source_reconstructed_v1.json"
+)
+
+
+def _mirror_optional_geometry_metadata(target, source):
+    """Copy additive research metadata without changing the solver interface."""
+    for name in (
+        "geometry_lineage_id",
+        "reconstruction_status",
+        "source_artifact_checksum_sha256",
+        "reduced_frequency_length_ref_m",
+        "positive_displacement_convention",
+        "nominal_stations",
+    ):
+        if hasattr(source, name):
+            setattr(target, name, copy.deepcopy(getattr(source, name)))
 
 
 # StructuredMesh2D
@@ -337,6 +363,7 @@ class LocalizedAreaPerturbation:
     def to_dict(self):
         """JSON-serialisable representation."""
         return {
+            "type": "LocalizedAreaPerturbation",
             "enabled": self.enabled,
             "mode": self.mode,
             "amplitude": self.amplitude,
@@ -344,6 +371,85 @@ class LocalizedAreaPerturbation:
             "width": self.width,
             "min_area": self.min_area,
             "active": self.active,
+        }
+
+
+class TabulatedAreaPerturbation:
+    """Dimensionless perturbation mode tabulated along solver ``x``.
+
+    The scalar amplitude retains the existing raw effective-area units.  The
+    table supplies only ``phi(x)`` in ``A=A_base+q*phi`` and therefore works
+    with both static and sinusoidal wrappers without special solver branches.
+    PCHIP preserves the monotone cantilever shape and the explicit zero tail.
+    """
+
+    def __init__(self, x_samples, shape_samples, enabled=True,
+                 mode="tabulated", amplitude=0.0, min_area=1.0e-6,
+                 metadata=None):
+        from scipy.interpolate import PchipInterpolator
+
+        x = np.asarray(x_samples, dtype=np.float64)
+        shape = np.asarray(shape_samples, dtype=np.float64)
+        if x.ndim != 1 or x.shape != shape.shape or len(x) < 4:
+            raise ValueError("need matching 1-D x/shape samples (>= 4 points)")
+        if np.any(np.diff(x) <= 0.0):
+            raise ValueError("tabulated perturbation x samples must increase")
+        if min_area <= 0.0:
+            raise ValueError("min_area must be positive")
+        self.x_samples = x.copy()
+        self.shape_samples = shape.copy()
+        self.enabled = bool(enabled)
+        self.mode = str(mode)
+        self.amplitude = float(amplitude)
+        self.min_area = float(min_area)
+        self.metadata = copy.deepcopy(metadata or {})
+        self._interp = PchipInterpolator(x, shape, extrapolate=False)
+        self._interp_deriv = self._interp.derivative()
+
+    @property
+    def active(self):
+        return self.enabled and abs(self.amplitude) > 0.0
+
+    def copy(self):
+        return TabulatedAreaPerturbation(
+            self.x_samples, self.shape_samples,
+            enabled=self.enabled, mode=self.mode,
+            amplitude=self.amplitude, min_area=self.min_area,
+            metadata=self.metadata,
+        )
+
+    def shape(self, x, base_geometry):
+        del base_geometry
+        values = np.asarray(x, dtype=np.float64)
+        clipped = np.clip(values, self.x_samples[0], self.x_samples[-1])
+        result = np.asarray(self._interp(clipped), dtype=np.float64)
+        result = np.where(
+            (values < self.x_samples[0]) | (values > self.x_samples[-1]),
+            0.0, result,
+        )
+        return result
+
+    def shape_gradient(self, x, base_geometry):
+        del base_geometry
+        values = np.asarray(x, dtype=np.float64)
+        clipped = np.clip(values, self.x_samples[0], self.x_samples[-1])
+        result = np.asarray(self._interp_deriv(clipped), dtype=np.float64)
+        return np.where(
+            (values < self.x_samples[0]) | (values > self.x_samples[-1]),
+            0.0, result,
+        )
+
+    def to_dict(self):
+        return {
+            "type": "TabulatedAreaPerturbation",
+            "enabled": self.enabled,
+            "mode": self.mode,
+            "amplitude": self.amplitude,
+            "min_area": self.min_area,
+            "active": self.active,
+            "x_samples": [float(value) for value in self.x_samples],
+            "shape_samples": [float(value) for value in self.shape_samples],
+            "metadata": copy.deepcopy(self.metadata),
         }
 
 
@@ -372,6 +478,7 @@ class PerturbedGeometryProfile:
         self.x_throat = self.base_geometry.x_throat
         self.x_comb_exit = self.base_geometry.x_comb_exit
         self.x_exit = self.base_geometry.x_exit
+        _mirror_optional_geometry_metadata(self, self.base_geometry)
 
         self._validate_profile()
 
@@ -436,7 +543,7 @@ class PerturbedGeometryProfile:
 
     def to_dict(self):
         """JSON-serialisable representation."""
-        return {
+        data = {
             "type": "PerturbedGeometryProfile",
             "base": geometry_to_dict(self.base_geometry),
             "perturbation": self.perturbation.to_dict(),
@@ -444,6 +551,15 @@ class PerturbedGeometryProfile:
             "throat_area": self.throat_area(),
             "min_sampled_area": self.min_area_value(),
         }
+        if getattr(self, "geometry_lineage_id", None) is not None:
+            data["geometry_lineage_id"] = self.geometry_lineage_id
+            data["reconstruction_status"] = getattr(
+                self, "reconstruction_status", None,
+            )
+            data["reduced_frequency_length_ref_m"] = getattr(
+                self, "reduced_frequency_length_ref_m", None,
+            )
+        return data
 
     def plot(self, n_pts=500):
         """Plot the active area profile and gradient."""
@@ -560,6 +676,7 @@ class TimeDependentPerturbedGeometryProfile:
         self.x_throat = self.base_geometry.x_throat
         self.x_comb_exit = self.base_geometry.x_comb_exit
         self.x_exit = self.base_geometry.x_exit
+        _mirror_optional_geometry_metadata(self, self.base_geometry)
 
         self._validate_profile_over_cycle()
 
@@ -679,7 +796,7 @@ class TimeDependentPerturbedGeometryProfile:
 
     def to_dict(self):
         """JSON-serialisable representation."""
-        return {
+        data = {
             "type": "TimeDependentPerturbedGeometryProfile",
             "base": geometry_to_dict(self.base_geometry),
             "perturbation": self.perturbation.to_dict(),
@@ -690,6 +807,15 @@ class TimeDependentPerturbedGeometryProfile:
             "throat_area": self.throat_area(),
             "min_sampled_area": self.min_area_value(),
         }
+        if getattr(self, "geometry_lineage_id", None) is not None:
+            data["geometry_lineage_id"] = self.geometry_lineage_id
+            data["reconstruction_status"] = getattr(
+                self, "reconstruction_status", None,
+            )
+            data["reduced_frequency_length_ref_m"] = getattr(
+                self, "reduced_frequency_length_ref_m", None,
+            )
+        return data
 
 
 class TabulatedAreaProfile:
@@ -697,7 +823,7 @@ class TabulatedAreaProfile:
     Area law defined by sampled (x, A) pairs with monotone PCHIP interpolation.
 
     Mirrors the `GeometryProfile` interface used by the solver (`area`,
-    `area_gradient`, `copy`, section attributes), so calibrated experiment
+    `area_gradient`, `copy`, section attributes), so sourced/reconstructed
     geometries (Config A ramp/isolator, Busemann ducts) can drive the same
     quasi-1D machinery as the parametric three-section duct.
 
@@ -770,46 +896,305 @@ class TabulatedAreaProfile:
         }
 
 
-def config_a_ramp_area_law(L_ramp=0.100, L_isolator=0.060,
-                           H_capture=0.050, incidence_deg=8.33,
-                           total_turn_deg=18.51, n_samples=200):
+class WallContourGeometryProfile(TabulatedAreaProfile):
+    """Tabulated area law retaining the physical lower and upper walls.
+
+    The solver still consumes only ``area(x)`` and ``area_gradient(x)``.  The
+    additional contours and lineage prevent an effective closed duct from
+    being confused with the reconstructed external-inlet topology during
+    export.
     """
-    Approximate effective-area law for the UNSW Config A ramp + isolator.
 
-    Models the captured streamtube of the cantilevered concave (isentropic)
-    compression ramp of Bhattrai et al. (JPP 38(1), 2022): the local flow
-    turning grows linearly from `incidence_deg` at the leading edge to
-    `total_turn_deg` at the ramp end, contracting the captured height
-    dH/dx = -tan(theta(x)); the isolator then holds the area constant.
+    def __init__(self, x_samples, A_samples, ramp_x, ramp_y,
+                 cowl_x, cowl_y, name="wall_contour", metadata=None):
+        super().__init__(x_samples, A_samples, name=name)
+        ramp_x = np.asarray(ramp_x, dtype=np.float64)
+        ramp_y = np.asarray(ramp_y, dtype=np.float64)
+        cowl_x = np.asarray(cowl_x, dtype=np.float64)
+        cowl_y = np.asarray(cowl_y, dtype=np.float64)
+        if ramp_x.ndim != 1 or ramp_x.shape != ramp_y.shape or len(ramp_x) < 4:
+            raise ValueError("need matching physical ramp coordinates")
+        if cowl_x.ndim != 1 or cowl_x.shape != cowl_y.shape or len(cowl_x) < 2:
+            raise ValueError("need matching physical cowl coordinates")
+        if np.any(np.diff(ramp_x) <= 0.0) or np.any(np.diff(cowl_x) <= 0.0):
+            raise ValueError("physical wall x coordinates must increase")
+        self.ramp_x = ramp_x.copy()
+        self.ramp_y = ramp_y.copy()
+        self.cowl_x = cowl_x.copy()
+        self.cowl_y = cowl_y.copy()
+        self.metadata = copy.deepcopy(metadata or {})
+        self.geometry_lineage_id = self.metadata.get("geometry_lineage_id")
+        self.reconstruction_status = self.metadata.get("reconstruction_status")
+        self.source_artifact_checksum_sha256 = self.metadata.get(
+            "source_artifact_checksum_sha256",
+        )
+        self.reduced_frequency_length_ref_m = float(self.metadata.get(
+            "reduced_frequency_length_ref_m", self.L_total,
+        ))
+        self.positive_displacement_convention = self.metadata.get(
+            "positive_displacement_convention",
+            "positive q increases effective gap",
+        )
+        self.nominal_stations = copy.deepcopy(
+            self.metadata.get("nominal_stations", {}),
+        )
+        self.section_break_indices = copy.deepcopy(
+            self.metadata.get("section_break_indices", {}),
+        )
 
-    IMPORTANT: the turning schedule and angles are documented in the paper,
-    but the default lengths/capture height here are PLACEHOLDERS chosen at
-    model scale — calibrate L_ramp, L_isolator, H_capture against the paper
-    drawings / UNSW database before quantitative comparisons. Areas are per
-    unit depth (2-D planar), consistent with the rest of the repo.
+    def copy(self):
+        return WallContourGeometryProfile(
+            self.x_samples, self.A_samples,
+            self.ramp_x, self.ramp_y, self.cowl_x, self.cowl_y,
+            name=self.name, metadata=self.metadata,
+        )
 
-    Returns:
-        TabulatedAreaProfile
+    def surface_arc_coordinate(self, x):
+        """Arc coordinate from the leading edge, clamped at the support."""
+        from scipy.interpolate import PchipInterpolator
+
+        support_index = int(self.section_break_indices.get(
+            "support", len(self.ramp_x) - 1,
+        ))
+        wall_x = self.ramp_x[:support_index + 1]
+        wall_y = self.ramp_y[:support_index + 1]
+        s_polyline = np.r_[0.0, np.cumsum(np.hypot(
+            np.diff(wall_x), np.diff(wall_y),
+        ))]
+        if s_polyline[-1] <= 0.0:
+            raise ValueError("physical ramp arc length is zero")
+        s_polyline *= self.reduced_frequency_length_ref_m / s_polyline[-1]
+        interp = PchipInterpolator(wall_x, s_polyline, extrapolate=False)
+        values = np.asarray(x, dtype=np.float64)
+        clipped = np.clip(values, wall_x[0], wall_x[-1])
+        return np.asarray(interp(clipped), dtype=np.float64)
+
+    def to_dict(self):
+        return {
+            "type": "WallContourGeometryProfile",
+            "name": self.name,
+            "L_total": self.L_total,
+            "x_throat": self.x_throat,
+            "A_inlet": self.A_inlet,
+            "A_throat": self.A_throat,
+            "A_exit": self.A_exit,
+            "n_samples": int(len(self.x_samples)),
+            "x_samples": [float(value) for value in self.x_samples],
+            "A_samples": [float(value) for value in self.A_samples],
+            "physical_walls": {
+                "ramp_x": [float(value) for value in self.ramp_x],
+                "ramp_y": [float(value) for value in self.ramp_y],
+                "cowl_x": [float(value) for value in self.cowl_x],
+                "cowl_y": [float(value) for value in self.cowl_y],
+            },
+            "geometry_lineage_id": self.geometry_lineage_id,
+            "reconstruction_status": self.reconstruction_status,
+            "source_artifact_checksum_sha256": self.source_artifact_checksum_sha256,
+            "reduced_frequency_length_ref_m": self.reduced_frequency_length_ref_m,
+            "positive_displacement_convention": self.positive_displacement_convention,
+            "nominal_stations": copy.deepcopy(self.nominal_stations),
+            "section_break_indices": copy.deepcopy(self.section_break_indices),
+            "metadata": copy.deepcopy(self.metadata),
+        }
+
+
+def _canonical_artifact_checksum(data):
+    payload = dict(data)
+    payload.pop("artifact_checksum_sha256", None)
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def load_config_a_geometry(artifact_path=None):
+    """Load and verify the frozen Config-A reconstruction artifact."""
+    path = CONFIG_A_GEOMETRY_ARTIFACT if artifact_path is None else Path(artifact_path)
+    data = json.loads(path.read_text())
+    expected = data.get("artifact_checksum_sha256")
+    actual = _canonical_artifact_checksum(data)
+    if expected != actual:
+        raise ValueError(
+            f"Config-A geometry artifact checksum mismatch: expected {expected}, got {actual}"
+        )
+    if data.get("geometry_lineage_id") != CONFIG_A_GEOMETRY_LINEAGE_ID:
+        raise ValueError("unsupported Config-A geometry lineage")
+    if data.get("reconstruction_status") != "source_reconstructed_v1":
+        raise ValueError("Config-A artifact is not source_reconstructed_v1")
+    if data.get("hard_constraints_within_published_rounding") is not True:
+        raise ValueError("Config-A artifact failed a hard source constraint")
+    area = data["effective_area_per_unit_depth"]
+    walls = data["physical_wall_coordinates"]
+    ramp = walls["ramp"]
+    cowl = walls["cowl"]
+    return WallContourGeometryProfile(
+        area["x_m_solver"], area["area_m2_per_m_depth"],
+        ramp["x_m_solver"], ramp["y_m_original"],
+        cowl["x_m_solver"], cowl["y_m_original"],
+        name="config_a_source_reconstructed_v1",
+        metadata={
+            "geometry_lineage_id": data["geometry_lineage_id"],
+            "reconstruction_status": data["reconstruction_status"],
+            "source_artifact_checksum_sha256": expected,
+            "source_artifact": str(path),
+            "reduced_frequency_length_ref_m": data["derived_values"][
+                "reduced_frequency_reference_length_m"
+            ],
+            "positive_displacement_convention": (
+                "positive displacement is downward ramp motion / increased gap"
+            ),
+            "nominal_stations": data["nominal_stations"],
+            "section_break_indices": ramp["section_break_indices"],
+            "derived_values": data["derived_values"],
+            "provenance": data["provenance"],
+            "comparison_topologies": [
+                "closed_effective_duct", "config_a_external_inlet",
+            ],
+        },
+    )
+
+
+def config_a_cantilever_mode(base_geometry, amplitude=0.0,
+                             min_area=1.0e-6):
+    """Return the assumed classical first cantilever mode for Config A."""
+    if getattr(base_geometry, "geometry_lineage_id", None) != CONFIG_A_GEOMETRY_LINEAGE_ID:
+        raise ValueError("Config-A cantilever mode requires reconstructed geometry lineage")
+    beta = 1.875104
+    support = float(base_geometry.nominal_stations["support_x_m_solver"])
+    x = base_geometry.ramp_x.copy()
+    s = base_geometry.surface_arc_coordinate(x)
+    length = float(base_geometry.reduced_frequency_length_ref_m)
+    xi = np.clip((length - s) / length, 0.0, 1.0)
+    sigma = ((np.cosh(beta) + np.cos(beta))
+             / (np.sinh(beta) + np.sin(beta)))
+    shape = (
+        np.cosh(beta * xi) - np.cos(beta * xi)
+        - sigma * (np.sinh(beta * xi) - np.sin(beta * xi))
+    )
+    shape /= float(shape[0])
+    shape[x >= support] = 0.0
+    return TabulatedAreaPerturbation(
+        x, shape, enabled=True,
+        mode="model_assumed_cantilever_first_mode",
+        amplitude=amplitude, min_area=min_area,
+        metadata={
+            "beta_1": beta,
+            "surface_coordinate": "reconstructed ramp arc length",
+            "normalization": "unit gap increase at leading edge",
+            "support_boundary": "zero displacement and slope",
+            "downstream_of_support": "zero",
+            "positive_displacement": "downward ramp motion / increased gap",
+            "dic_calibrated": False,
+            "sampling_guidance_hz": {
+                "manufactured_ramp_impulse_test": 55.5,
+                "fem_first_mode": 60.0,
+                "dic_response": 52.0,
+            },
+        },
+    )
+
+
+def config_a_normalized_to_raw(value, geometry):
+    """Convert Delta-Y_LE/S to raw per-unit-depth effective-area amplitude."""
+    length = float(geometry.reduced_frequency_length_ref_m)
+    return float(value) * length
+
+
+def config_a_raw_to_normalized(value, geometry):
+    """Convert raw per-unit-depth effective-area amplitude to Delta-Y_LE/S."""
+    length = float(geometry.reduced_frequency_length_ref_m)
+    return float(value) / length
+
+
+def config_a_ramp_area_law(artifact_path=None, **legacy_overrides):
+    """Load the frozen source-constrained Ramp-1018 reconstruction.
+
+    The former tunable placeholder has intentionally been removed.  Supplying
+    its old scale/shape arguments would create an untraceable Config-A claim,
+    so callers must use a separate generic ``TabulatedAreaProfile`` instead.
     """
-    th0 = np.deg2rad(float(incidence_deg))
-    th1 = np.deg2rad(float(total_turn_deg))
-    x_ramp = np.linspace(0.0, L_ramp, max(n_samples // 2, 8))
-    theta = th0 + (th1 - th0) * (x_ramp / L_ramp)
+    if legacy_overrides:
+        names = ", ".join(sorted(legacy_overrides))
+        raise ValueError(
+            f"Config-A reconstruction is frozen; unsupported overrides: {names}"
+        )
+    return load_config_a_geometry(artifact_path)
 
-    # captured-height contraction: dH/dx = -tan(theta(x))
-    H = np.empty_like(x_ramp)
-    H[0] = H_capture
-    for i in range(1, len(x_ramp)):
-        dx = x_ramp[i] - x_ramp[i - 1]
-        H[i] = H[i - 1] - np.tan(0.5 * (theta[i] + theta[i - 1])) * dx
-    if H[-1] <= 0.0:
-        raise ValueError("Config A ramp closes the duct: reduce L_ramp or "
-                         "increase H_capture")
 
-    x_iso = np.linspace(L_ramp, L_ramp + L_isolator, max(n_samples // 4, 6))[1:]
-    x = np.concatenate([x_ramp, x_iso])
-    A = np.concatenate([H, np.full(len(x_iso), H[-1])])
-    return TabulatedAreaProfile(x, A, name="config_a_ramp_isolator")
+def perturbation_from_dict(data):
+    """Rebuild either legacy Gaussian or new tabulated perturbation metadata."""
+    if data.get("type") == "TabulatedAreaPerturbation" or "x_samples" in data:
+        return TabulatedAreaPerturbation(
+            data["x_samples"], data["shape_samples"],
+            enabled=data.get("enabled", True),
+            mode=data.get("mode", "tabulated"),
+            amplitude=data.get("amplitude", 0.0),
+            min_area=data.get("min_area", 1.0e-6),
+            metadata=data.get("metadata"),
+        )
+    return LocalizedAreaPerturbation(
+        enabled=data.get("enabled", True),
+        mode=data.get("mode", "throat_gaussian"),
+        amplitude=data.get("amplitude", 0.0),
+        x_center=data.get("x_center"),
+        width=data.get("width", 0.05),
+        min_area=data.get("min_area", 1.0e-6),
+    )
+
+
+def geometry_from_dict(data):
+    """Rebuild every geometry type used by solver, ROM, and export paths."""
+    geometry_type = data["type"]
+    if geometry_type == "GeometryProfile":
+        return GeometryProfile(
+            data["L_inlet"], data["L_combustor"], data["L_nozzle"],
+            data["A_inlet"], data["A_throat"],
+            data["A_comb_exit"], data["A_exit"],
+        )
+    if geometry_type == "TabulatedAreaProfile":
+        return TabulatedAreaProfile(
+            data["x_samples"], data["A_samples"],
+            name=data.get("name", "tabulated"),
+        )
+    if geometry_type == "WallContourGeometryProfile":
+        walls = data["physical_walls"]
+        metadata = copy.deepcopy(data.get("metadata") or {})
+        for key in (
+            "geometry_lineage_id", "reconstruction_status",
+            "source_artifact_checksum_sha256", "reduced_frequency_length_ref_m",
+            "positive_displacement_convention", "nominal_stations",
+            "section_break_indices",
+        ):
+            if key in data:
+                metadata[key] = copy.deepcopy(data[key])
+        return WallContourGeometryProfile(
+            data["x_samples"], data["A_samples"],
+            walls["ramp_x"], walls["ramp_y"],
+            walls["cowl_x"], walls["cowl_y"],
+            name=data.get("name", "wall_contour"), metadata=metadata,
+        )
+    if geometry_type == "PerturbedGeometryProfile":
+        return PerturbedGeometryProfile(
+            geometry_from_dict(data["base"]),
+            perturbation_from_dict(data["perturbation"]),
+        )
+    if geometry_type == "TimeDependentPerturbedGeometryProfile":
+        forcing_data = data.get("forcing", {})
+        forcing = SinusoidalAreaForcing(
+            amplitude=forcing_data.get("amplitude", 0.0),
+            frequency_hz=forcing_data.get("frequency_hz", 0.0),
+            phase=forcing_data.get("phase", 0.0),
+            enabled=forcing_data.get("enabled", True),
+            mean=forcing_data.get("mean", 0.0),
+        )
+        geometry = TimeDependentPerturbedGeometryProfile(
+            geometry_from_dict(data["base"]),
+            perturbation_from_dict(data["perturbation"]),
+            forcing,
+        )
+        geometry.time = float(data.get("current_time", 0.0))
+        return geometry
+    raise ValueError(f"Unsupported geometry type: {geometry_type}")
 
 
 def geometry_to_dict(geometry):

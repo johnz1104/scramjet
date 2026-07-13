@@ -39,7 +39,8 @@ DEFAULT_WEIGHTS = {
 }
 
 DESIGN_KEYS = (
-    "q_offset", "epsilon", "frequency_hz", "reduced_frequency", "phase",
+    "q_offset", "epsilon", "q_offset_le_over_S", "epsilon_le_over_S",
+    "frequency_hz", "reduced_frequency", "phase",
 )
 
 
@@ -109,6 +110,30 @@ def load_surrogate_audit(surrogate_root):
         }
     validation = json.loads(validation_path.read_text())
     return predictions, validation
+
+
+def require_reportable_response(validation, response="exit_mach"):
+    """Reject phase enforcement unless reportability is explicitly true.
+
+    Older schema-v2 surrogate artifacts remain readable for audit display, but
+    their missing reportability metadata is intentionally treated as unknown.
+    """
+    result = ((validation or {}).get("complex_responses") or {}).get(response)
+    if result is not None and result.get("reportable") is True:
+        return result
+    if result is None:
+        detail = "response diagnostics are missing"
+    elif "reportable" not in result:
+        detail = "legacy artifact has unknown/missing reportability metadata"
+    else:
+        reasons = result.get("reportability_reasons") or ["unspecified gate failure"]
+        detail = ", ".join(str(reason) for reason in reasons)
+    raise ValueError(
+        "--require-finite-predicted-phase cannot enforce predictions for "
+        f"the '{response}' response because it is not reportable: {detail}. "
+        "Surrogate status='ok' only means model construction succeeded; "
+        "omit the enforcement flag to retain audit-only display."
+    )
 
 
 def normalized(values, higher_is_better):
@@ -318,15 +343,16 @@ def write_selection_report(path, doe_root, static_root, weights,
         complex_block = surrogate_validation.get("complex_responses", {})
         lines.append("Surrogate values below are leave-one-out diagnostics only; ")
         lines.append("they do not replace measured DOE metrics in the score.\n")
-        lines.append("| response | supported LOO samples | circular MAE [rad] | circular RMSE [rad] |")
-        lines.append("|---|---:|---:|---:|")
+        lines.append("| response | supported LOO samples | circular MAE [rad] | circular RMSE [rad] | reportable |")
+        lines.append("|---|---:|---:|---:|---|")
         for stem, result in complex_block.items():
             if result.get("status") != "ok":
                 continue
             lines.append(
                 f"| {stem} | {result.get('n_samples', '')} | "
                 f"{result.get('circular_mae_rad', float('nan')):.4f} | "
-                f"{result.get('circular_rmse_rad', float('nan')):.4f} |"
+                f"{result.get('circular_rmse_rad', float('nan')):.4f} | "
+                f"{result.get('reportable', 'unknown')} |"
             )
     else:
         lines.append("(no response-surrogate audit supplied)")
@@ -384,11 +410,14 @@ def rank_cases(doe_root, output_root=None, static_root=None, top_k=5,
     if not doe_root.is_absolute():
         doe_root = REPO_ROOT / doe_root
     require_schema_v2(doe_root, "unsteady DOE")
+    doe_manifest = json.loads((doe_root / "manifest.json").read_text())
+    static_manifest = {}
     if static_root:
         static_root = Path(static_root)
         if not static_root.is_absolute():
             static_root = REPO_ROOT / static_root
         require_schema_v2(static_root, "static sweep")
+        static_manifest = json.loads((static_root / "manifest.json").read_text())
 
     if output_root is None:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -408,6 +437,8 @@ def rank_cases(doe_root, output_root=None, static_root=None, top_k=5,
         raise ValueError(
             "require_predicted_phase=True requires --surrogate-root with LOO predictions"
         )
+    if require_predicted_phase:
+        require_reportable_response(surrogate_validation, "exit_mach")
 
     scored_doe, effective_weights = score_doe_cases(
         doe_rows, weights,
@@ -438,6 +469,11 @@ def rank_cases(doe_root, output_root=None, static_root=None, top_k=5,
         "validated_physical_optima": False,
         "doe_root": str(doe_root),
         "static_sweep_root": str(static_root) if static_root else None,
+        "geometry_lineage": {
+            "doe": doe_manifest.get("geometry_lineage_id"),
+            "static_sweep": static_manifest.get("geometry_lineage_id"),
+        },
+        "reduced_frequency": doe_manifest.get("reduced_frequency"),
         "top_k": int(top_k),
         "weights": effective_weights,
         "surrogate_audit": {
@@ -448,6 +484,7 @@ def rank_cases(doe_root, output_root=None, static_root=None, top_k=5,
             "complex_response_validation": (
                 (surrogate_validation or {}).get("complex_responses")
             ),
+            "nonreportable_predictions_audit_only": True,
         },
         "doe_candidates": [
             {
@@ -487,6 +524,9 @@ def rank_cases(doe_root, output_root=None, static_root=None, top_k=5,
                 "rank": i + 1,
                 "score": float(score),
                 "q": _parse_float(row.get("q")),
+                "q_offset_le_over_S": _parse_float(
+                    row.get("q_offset_le_over_S"),
+                ),
                 "tpr": _parse_float(row.get("tpr")),
                 "exit_mach": _parse_float(row.get("exit_mach")),
                 "case_relpath": str(Path("cases") / row.get("q", "")),

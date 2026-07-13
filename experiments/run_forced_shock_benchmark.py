@@ -64,6 +64,23 @@ from experiments.run_static_wall_sweep import (
 )
 
 
+CULICK_ROGERS_TRANSCRIPTION_PROVENANCE = {
+    "transcription_verified": True,
+    "source_record_url": "https://authors.library.caltech.edu/records/xyxx9-h6n68",
+    "source_file": "265_Culick_FEC_1981.pdf",
+    "source_file_md5": "03fec8618b3d0c512a75acf7b89ff11e",
+    "source_file_sha256": "1863479c77563eb6d0d7871186d8c8c4f7be4c05fe9cb8d63ff651da6ca45071",
+    "journal_pages": [1387, 1388],
+    "pdf_pages_one_based": [6, 7],
+    "equations": [43, 44],
+    "verification_method": (
+        "visual comparison with the attached Caltech scan; variables and "
+        "grouping independently checked for C and tau"
+    ),
+    "verified_utc_date": "2026-07-13",
+}
+
+
 # Benchmark duct: linear diffuser, Mach 2 inlet (same as tests.py shock test)
 
 def make_duct(A_in=0.05, A_ex=0.10, L=1.0, n_samples=60):
@@ -356,6 +373,7 @@ def main(argv=None):
                 "the published first-order relaxation factor"
             ),
             "pass_fail_assertion": False,
+            "transcription": CULICK_ROGERS_TRANSCRIPTION_PROVENANCE,
         },
         "git": git_metadata(),
     })

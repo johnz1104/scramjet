@@ -33,6 +33,7 @@ Usage:
     python tests.py diffusion    # transient diffusion only
     python tests.py config       # config clone/application invariants
     python tests.py research     # research-coordinate/workflow invariants
+    python tests.py config_a     # source-reconstructed Config-A invariants
 
 Dependency: mesh.py, fvm.py, physics.py, solver.py, diagnostics.py
 """
@@ -699,6 +700,242 @@ def test_research_workflow_coordinates():
         "Culick--Rogers first-order gain/lag limits": culick_rogers_ok,
         "optional predicted-phase ranking gate": predicted_phase_gate_ok,
         "hysteresis sequence and resolution-aware classification deterministic": hysteresis_logic_ok,
+    }
+    for name, ok in checks.items():
+        print(f"  {name}: {'PASS' if ok else 'FAIL'}")
+    return all(checks.values())
+
+
+def test_config_a_reconstruction():
+    """Source, motion, lineage, and topology gates for reconstructed Config A."""
+    print("\n" + "=" * 60)
+    print("TEST: Config-A Source Reconstruction and Research Gates")
+    print("=" * 60)
+
+    import tempfile
+    from pathlib import Path
+
+    from mesh import (
+        CONFIG_A_GEOMETRY_LINEAGE_ID,
+        config_a_cantilever_mode,
+        config_a_normalized_to_raw,
+        config_a_raw_to_normalized,
+        geometry_from_dict,
+        load_config_a_geometry,
+    )
+    from experiments.build_unsteady_response_surrogate import response_reportability
+    from experiments.export_high_fidelity_scaffold import (
+        config_a_external_wall_coordinates,
+        wall_contour_rows,
+    )
+    from experiments.gmsh_openfoam_export import (
+        write_gmsh_config_a_external,
+        write_gmsh_duct,
+    )
+    from experiments.rank_candidate_cases import require_reportable_response
+    from experiments.reconstruct_config_a_geometry import reconstruct_config_a
+    from experiments.run_hysteresis_sweep import assess_hysteresis
+    from experiments.run_static_wall_sweep import make_config
+    from experiments.run_unsteady_area_breathing import make_cold_flow_config
+
+    fresh_a = reconstruct_config_a()
+    fresh_b = reconstruct_config_a()
+    deterministic = (
+        fresh_a == fresh_b
+        and fresh_a["artifact_checksum_sha256"]
+        == "0dfd7e0afbde75121973fa9ded4371dbd2e0a71720a277dfadc34556b491af95"
+    )
+    hard_constraints = (
+        fresh_a["hard_constraints_within_published_rounding"] is True
+        and all(
+            (not result["hard"]) or result["within_published_rounding"]
+            for result in fresh_a["constraint_residuals"].values()
+        )
+        and fresh_a["gas_dynamic_design"]["compression_segments"] == 50
+        and fresh_a["gas_dynamic_design"]["segment_interpolation"]
+        == "piecewise_linear_only"
+    )
+
+    geometry = load_config_a_geometry()
+    station_ok = all(
+        abs(geometry.nominal_stations[name] - expected) < 1.0e-14
+        for name, expected in {
+            "leading_edge_x_m_solver": 0.0,
+            "cowl_x_m_solver": 0.1758,
+            "support_x_m_solver": 0.2051,
+            "outlet_x_m_solver": 0.2358,
+        }.items()
+    )
+    dense_x = np.linspace(0.0, geometry.L_total, 5000)
+    dense_area = geometry.area(dense_x)
+    monotone_area = (
+        np.all(dense_area > 0.0)
+        and np.max(np.diff(dense_area)) <= 1.0e-12
+        and dense_area.min() >= geometry.A_samples.min() - 1.0e-14
+        and dense_area.max() <= geometry.A_samples.max() + 1.0e-14
+    )
+    rebuilt = geometry_from_dict(geometry_to_dict(geometry))
+    serialization_ok = (
+        rebuilt.geometry_lineage_id == CONFIG_A_GEOMETRY_LINEAGE_ID
+        and geometry_to_dict(rebuilt) == geometry_to_dict(geometry)
+        and np.array_equal(rebuilt.area(dense_x), geometry.area(dense_x))
+    )
+
+    mode = config_a_cantilever_mode(geometry, amplitude=0.0)
+    support = geometry.nominal_stations["support_x_m_solver"]
+    mode_points = np.array([0.0, support, geometry.L_total])
+    mode_shape = mode.shape(mode_points, geometry)
+    mode_gradient = mode.shape_gradient(np.array([support]), geometry)[0]
+    zero_geometry = PerturbedGeometryProfile(geometry, mode)
+    raw = config_a_normalized_to_raw(0.04, geometry)
+    motion_ok = (
+        np.allclose(mode_shape, [1.0, 0.0, 0.0], rtol=0.0, atol=1.0e-14)
+        and abs(mode_gradient) < 1.0e-12
+        and np.array_equal(zero_geometry.area(dense_x), geometry.area(dense_x))
+        and abs(config_a_raw_to_normalized(raw, geometry) - 0.04) < 1.0e-15
+        and mode.metadata["dic_calibrated"] is False
+        and mode.metadata["positive_displacement"]
+        == "downward ramp motion / increased gap"
+    )
+
+    preset = "configs/tusq_m585.json"
+    auto_config = make_cold_flow_config(
+        nx=8, ny=3, n_steps=1, preset=preset, area_law="auto",
+    )
+    bypass_config = make_cold_flow_config(
+        nx=8, ny=3, n_steps=1, preset=preset, area_law="default",
+    )
+    generic_config = make_cold_flow_config(
+        nx=8, ny=3, n_steps=1, area_law="auto",
+    )
+    rom_config = make_config(
+        0.0, nx=8, ny=3, n_steps=1, preset=preset, area_law="auto",
+    )
+    rom_clone = _clone_config(rom_config)
+    _apply_params(rom_clone, {"q_throat": raw})
+    selection_ok = (
+        auto_config.geometry.geometry_lineage_id == CONFIG_A_GEOMETRY_LINEAGE_ID
+        and abs(auto_config.geometry.reduced_frequency_length_ref_m - 0.2111) < 1.0e-14
+        and not hasattr(bypass_config.geometry, "geometry_lineage_id")
+        and not hasattr(generic_config.geometry, "geometry_lineage_id")
+        and rom_clone.geometry.geometry_lineage_id == CONFIG_A_GEOMETRY_LINEAGE_ID
+        and rom_clone.geometry.perturbation.mode
+        == "model_assumed_cantilever_first_mode"
+        and abs(rom_clone.geometry.perturbation.amplitude - raw) < 1.0e-15
+    )
+
+    sparse_gate = response_reportability(0.5, 12, 4)
+    supported_gate = response_reportability(0.5, 20, 4)
+    legacy_rejected = False
+    sparse_rejected = False
+    try:
+        require_reportable_response({
+            "complex_responses": {"exit_mach": {"status": "ok"}},
+        })
+    except ValueError as exc:
+        legacy_rejected = "unknown/missing" in str(exc)
+    try:
+        require_reportable_response({
+            "complex_responses": {"exit_mach": sparse_gate},
+        })
+    except ValueError as exc:
+        sparse_rejected = "not reportable" in str(exc)
+    reportability_ok = (
+        sparse_gate["reportable"] is False
+        and "insufficient_supported_cases" in sparse_gate["reportability_reasons"]
+        and supported_gate["reportable"] is True
+        and legacy_rejected and sparse_rejected
+        and require_reportable_response({
+            "complex_responses": {"exit_mach": supported_gate},
+        }) is supported_gate
+    )
+
+    flip_rows = [
+        {"leg": "up", "pressure_factor": 1.0, "classification": "started",
+         "shock_x": 0.50, "tpr": 0.90, "status": "ok"},
+        {"leg": "down", "pressure_factor": 1.0, "classification": "unstarted",
+         "shock_x": 0.505, "tpr": 0.899, "status": "ok"},
+    ]
+    path_rows = [dict(row) for row in flip_rows]
+    path_rows[1]["shock_x"] = 0.54
+    incomplete_rows = [dict(row) for row in flip_rows]
+    incomplete_rows[1]["status"] = "incomplete"
+    hysteresis_ok = (
+        assess_hysteresis(flip_rows, 0.02)["classification"]
+        == "threshold_flip_at_resolution"
+        and assess_hysteresis(path_rows, 0.02)["classification"]
+        == "numerical_path_dependence_detected"
+        and assess_hysteresis(incomplete_rows, 0.02)["classification"]
+        == "indeterminate_incomplete"
+    )
+
+    base, ramp_x, ramp_y, cowl_x, cowl_y = (
+        config_a_external_wall_coordinates(geometry)
+    )
+    closed_rows = wall_contour_rows(geometry, n_points=len(ramp_x))
+    topology_area_ok = (
+        np.allclose(-ramp_y, geometry.area(ramp_x), rtol=0.0, atol=1.0e-12)
+        and all(row["height_per_unit_depth"] > 0.0 for row in closed_rows)
+    )
+    legacy_lineage_rejected = False
+    try:
+        config_a_external_wall_coordinates(GeometryProfile.default())
+    except ValueError as exc:
+        legacy_lineage_rejected = "legacy schema-v2" in str(exc)
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        closed_geo = write_gmsh_duct(
+            tmp / "closed.geo", geometry.x_samples, geometry.A_samples,
+        )
+        external_geo = write_gmsh_config_a_external(
+            tmp / "external.geo", ramp_x, ramp_y, cowl_x, cowl_y,
+        )
+        closed_text = closed_geo.read_text()
+        external_text = external_geo.read_text()
+        patches_ok = all(
+            f'Physical Surface("{name}")' in external_text
+            for name in (
+                "inlet", "farfield", "rampWall", "cowlWall", "outlet",
+                "frontAndBack",
+            )
+        )
+        export_ok = (
+            'Physical Surface("bottomWall")' in closed_text
+            and patches_ok and "Spline(" not in external_text
+            and legacy_lineage_rejected
+        )
+
+    smoke_cfg = make_config(
+        0.0, nx=30, ny=4, n_steps=1200, cfl=0.25,
+        preset=preset, area_law="auto", steady_rtol=2.0e-5,
+        steady_check_interval=50,
+    )
+    smoke_cfg.print_interval = smoke_cfg.n_steps + 1
+    smoke_solver = Solver(smoke_cfg)
+    from rom import _compute_qoi
+    smoke_solver.run(steady_qoi_fn=_compute_qoi)
+    smoke_qoi = _compute_qoi(smoke_solver)
+    smoke_ok = (
+        smoke_solver.converged
+        and smoke_qoi["state_admissible"]
+        and all(np.isfinite(smoke_qoi[key]) for key in (
+            "tpr", "exit_mach", "mdot_exit", "mass_defect",
+        ))
+        and 0.0 < smoke_qoi["tpr"] <= 1.0
+    )
+
+    checks = {
+        "deterministic frozen checksum": deterministic,
+        "hard source constraints and 50 MOC segments": hard_constraints,
+        "solver stations use the published rebase": station_ok,
+        "effective area is positive monotone without overshoot": monotone_area,
+        "wall geometry serialization is exact": serialization_ok,
+        "cantilever normalization and raw conversion": motion_ok,
+        "preset auto/default geometry selection": selection_ok,
+        "phase reportability and legacy enforcement gates": reportability_ok,
+        "resolution-aware hysteresis outcomes": hysteresis_ok,
+        "closed/external export topology and lineage gates": topology_area_ok and export_ok,
+        "Config-A q=0 solver smoke converges with TPR <= 1": smoke_ok,
     }
     for name, ok in checks.items():
         print(f"  {name}: {'PASS' if ok else 'FAIL'}")
@@ -1780,6 +2017,7 @@ if __name__ == "__main__":
         "reduced": test_reduced_fidelity_extensions,
         "metrics": test_response_metrics,
         "research": test_research_workflow_coordinates,
+        "config_a": test_config_a_reconstruction,
         "busemann": test_busemann_generator,
         "sod": test_sod_shock_tube,
         "nozzle": test_nozzle_area_mach,

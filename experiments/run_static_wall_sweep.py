@@ -1,13 +1,14 @@
 """
 Minimal static cold-flow throat-area sweep runner.
 
-This script uses a localized effective-area perturbation,
+Generic ducts use a localized Gaussian effective-area perturbation,
 
     A(x; q) = A_base(x) + q * exp(-0.5 * ((x - x_center) / width)^2),
 
-as a low-fidelity wall-position proxy inside the existing quasi-1D area-source
-framework. It does not model true wall motion, a moving mesh, ALE, turbulence,
-or combustion.
+while Config A uses the tabulated model-assumed first cantilever shape on the
+source-reconstructed wall. Both are low-fidelity wall-position proxies inside
+the quasi-1D area-source framework. Neither models a moving mesh, ALE,
+turbulence, or combustion.
 """
 import argparse
 import csv
@@ -29,8 +30,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from mesh import (
+    CONFIG_A_GEOMETRY_LINEAGE_ID,
     LocalizedAreaPerturbation,
     PerturbedGeometryProfile,
+    config_a_cantilever_mode,
+    config_a_normalized_to_raw,
+    config_a_raw_to_normalized,
     config_a_ramp_area_law,
     geometry_to_dict,
 )
@@ -52,7 +57,7 @@ def make_config(q, nx=40, ny=8, n_steps=5000, cfl=0.35,
                 mach=6.0, altitude=25000.0, width=None,
                 x_center=None, min_area=1.0e-4, preset=None,
                 steady_rtol=1.0e-6, steady_check_interval=50,
-                area_law="default"):
+                area_law="auto", motion_mode="auto"):
     """Build a cold-flow solver config for one static perturbation value."""
     cfg = SolverConfig()
     if preset:
@@ -73,15 +78,14 @@ def make_config(q, nx=40, ny=8, n_steps=5000, cfl=0.35,
     cfg.combustion = CombustionConfig(enabled=False)
     cfg.area_source = True
 
-    if area_law == "config_a":
-        warnings.warn(
-            "Config-A area-law lengths/capture height are placeholders; "
-            "calibrate them from the UNSW drawings before quantitative use.",
-            RuntimeWarning,
+    from experiments.presets import preset_geometry, resolve_area_law
+    resolved_area_law = resolve_area_law(area_law, preset=preset)
+    if resolved_area_law == "config_a":
+        cfg.geometry = (
+            preset_geometry(preset) if preset else config_a_ramp_area_law()
         )
-        cfg.geometry = config_a_ramp_area_law()
-    elif area_law != "default":
-        raise ValueError(f"unsupported area law: {area_law}")
+        if cfg.geometry is None:
+            cfg.geometry = config_a_ramp_area_law()
 
     base = cfg.geometry
     if width is None:
@@ -89,14 +93,28 @@ def make_config(q, nx=40, ny=8, n_steps=5000, cfl=0.35,
     if x_center is None:
         x_center = base.x_throat
 
-    perturbation = LocalizedAreaPerturbation(
-        enabled=True,
-        mode="throat_gaussian",
-        amplitude=q,
-        x_center=x_center,
-        width=width,
-        min_area=min_area,
-    )
+    if motion_mode not in {"auto", "gaussian", "config_a"}:
+        raise ValueError(f"unsupported motion mode: {motion_mode}")
+    resolved_motion = motion_mode
+    if resolved_motion == "auto":
+        resolved_motion = (
+            "config_a"
+            if getattr(base, "geometry_lineage_id", None) == CONFIG_A_GEOMETRY_LINEAGE_ID
+            else "gaussian"
+        )
+    if resolved_motion == "config_a":
+        perturbation = config_a_cantilever_mode(
+            base, amplitude=q, min_area=min_area,
+        )
+    else:
+        perturbation = LocalizedAreaPerturbation(
+            enabled=True,
+            mode="throat_gaussian",
+            amplitude=q,
+            x_center=x_center,
+            width=width,
+            min_area=min_area,
+        )
     cfg.geometry = PerturbedGeometryProfile(base, perturbation)
     return cfg
 
@@ -265,7 +283,7 @@ def residual_rows(solver):
     ]
 
 
-def qoi_with_diagnostics(solver, q):
+def qoi_with_diagnostics(solver, q, q_offset_le_over_S=None):
     """Compute available QoI and simple field extrema."""
     qoi = _compute_qoi(solver)
     rho, u, v, p, T, Yf = solver.state.primitives()
@@ -273,6 +291,11 @@ def qoi_with_diagnostics(solver, q):
     qoi.update({
         "schema_version": ARTIFACT_SCHEMA_VERSION,
         "q": float(q),
+        "q_offset": float(q),
+        "q_offset_le_over_S": q_offset_le_over_S,
+        "geometry_lineage_id": getattr(
+            solver.cfg.geometry, "geometry_lineage_id", None,
+        ),
         "steps": int(solver.step_count),
         "time": float(solver.time),
         "dt_min": float(np.min(solver.dt_history)) if solver.dt_history else 0.0,
@@ -309,13 +332,18 @@ def qoi_with_diagnostics(solver, q):
     return qoi
 
 
-def run_case(q, case_dir, **config_kwargs):
+def run_case(q, case_dir, q_offset_le_over_S=None, **config_kwargs):
     """Run one cold-flow case and write per-case outputs."""
     cfg = make_config(q, **config_kwargs)
     write_json(case_dir / "config.json", {
         "schema_version": ARTIFACT_SCHEMA_VERSION,
         "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "q": float(q),
+        "q_offset": float(q),
+        "q_offset_le_over_S": q_offset_le_over_S,
+        "geometry_lineage_id": getattr(
+            cfg.geometry, "geometry_lineage_id", None,
+        ),
         "git": git_metadata(),
         "config": config_to_dict(cfg),
     })
@@ -323,7 +351,7 @@ def run_case(q, case_dir, **config_kwargs):
     solver = Solver(cfg)
     solver.run(steady_qoi_fn=_compute_qoi)
 
-    qoi = qoi_with_diagnostics(solver, q)
+    qoi = qoi_with_diagnostics(solver, q, q_offset_le_over_S)
     write_json(case_dir / "qoi.json", qoi)
     write_json(case_dir / "diagnostics.json", all_case_diagnostics(solver))
     write_csv(case_dir / "centerline.csv", centerline_rows(solver))
@@ -365,11 +393,45 @@ def plot_qoi_vs_q(summary_rows, output_path, metric="tpr"):
     plt.close(fig)
 
 
-def run_sweep(q_values=None, output_root=None, **config_kwargs):
+def run_sweep(q_values=None, q_values_le_over_S=None,
+              output_root=None, **config_kwargs):
     """Run the full static sweep and write aggregate outputs."""
-    if q_values is None:
-        q_values = default_q_values()
+    if q_values is not None and q_values_le_over_S is not None:
+        raise ValueError("raw q_values and normalized q_values_le_over_S are mutually exclusive")
+    normalized_values = None
+    input_representation = "raw_q_offset"
+    if q_values_le_over_S is not None:
+        input_representation = "q_offset_le_over_S"
+        normalized_values = [float(value) for value in q_values_le_over_S]
+        reference_cfg = make_config(0.0, **config_kwargs)
+        base = getattr(reference_cfg.geometry, "base_geometry", reference_cfg.geometry)
+        if getattr(base, "geometry_lineage_id", None) != CONFIG_A_GEOMETRY_LINEAGE_ID:
+            raise ValueError("normalized Delta-Y_LE/S inputs require Config-A geometry")
+        q_values = [
+            config_a_normalized_to_raw(value, base)
+            for value in normalized_values
+        ]
+    elif q_values is None:
+        reference_cfg = make_config(0.0, **config_kwargs)
+        base = getattr(reference_cfg.geometry, "base_geometry", reference_cfg.geometry)
+        if getattr(base, "geometry_lineage_id", None) == CONFIG_A_GEOMETRY_LINEAGE_ID:
+            input_representation = "config_a_normalized_default"
+            normalized_values = [-0.04, 0.0, 0.04]
+            q_values = [
+                config_a_normalized_to_raw(value, base)
+                for value in normalized_values
+            ]
+        else:
+            q_values = default_q_values()
     q_values = [float(q) for q in q_values]
+    if normalized_values is None:
+        reference_cfg = make_config(0.0, **config_kwargs)
+        base = getattr(reference_cfg.geometry, "base_geometry", reference_cfg.geometry)
+        normalized_values = (
+            [config_a_raw_to_normalized(value, base) for value in q_values]
+            if getattr(base, "geometry_lineage_id", None) == CONFIG_A_GEOMETRY_LINEAGE_ID
+            else [None] * len(q_values)
+        )
 
     if output_root is None:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -390,15 +452,30 @@ def run_sweep(q_values=None, output_root=None, **config_kwargs):
         "study": "static_wall_sweep",
         "model": "cold_flow_effective_area_perturbation",
         "q_values": q_values,
+        "q_values_le_over_S": normalized_values,
+        "input_representation": input_representation,
+        "geometry_lineage_id": getattr(base, "geometry_lineage_id", None),
+        "reduced_frequency_reference": {
+            "length_ref_m": getattr(
+                base, "reduced_frequency_length_ref_m", base.L_total,
+            ),
+            "length_source": (
+                "published_deformable_surface"
+                if getattr(base, "geometry_lineage_id", None)
+                == CONFIG_A_GEOMETRY_LINEAGE_ID else "geometry.L_total"
+            ),
+        },
         "config_defaults": config_kwargs,
         "git": git_metadata(),
     })
 
     summary_rows = []
     configs = []
-    for q in q_values:
+    for q, q_normalized in zip(q_values, normalized_values):
         case_dir = cases_dir / case_name(q)
-        solver, qoi = run_case(q, case_dir, **config_kwargs)
+        solver, qoi = run_case(
+            q, case_dir, q_offset_le_over_S=q_normalized, **config_kwargs,
+        )
         summary_rows.append(qoi)
         configs.append(solver.cfg)
 
@@ -421,7 +498,13 @@ def parse_q_values(text):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Run a static cold-flow wall sweep")
-    parser.add_argument("--q-values", default=",".join(str(q) for q in default_q_values()))
+    parser.add_argument("--q-values", default=None,
+                        help="Comma-separated raw effective-area offsets [m^2].")
+    parser.add_argument(
+        "--q-values-le-over-S", "--q-offset-le-over-S",
+        dest="q_values_le_over_S", default=None,
+        help="Comma-separated Config-A leading-edge offsets Delta-Y_LE/S.",
+    )
     parser.add_argument("--output-root", default=None)
     parser.add_argument("--nx", type=int, default=40)
     parser.add_argument("--ny", type=int, default=8)
@@ -438,12 +521,18 @@ def main(argv=None):
     parser.add_argument("--preset", default=None,
                         help="Experiment-condition preset (e.g. configs/tusq_m585.json); "
                              "overrides --mach/--altitude.")
-    parser.add_argument("--area-law", choices=("default", "config_a"),
-                        default="default")
+    parser.add_argument("--area-law", choices=("auto", "default", "config_a"),
+                        default="auto")
+    parser.add_argument("--motion-mode", choices=("auto", "gaussian", "config_a"),
+                        default="auto")
     args = parser.parse_args(argv)
 
     output_root, _ = run_sweep(
-        q_values=parse_q_values(args.q_values),
+        q_values=parse_q_values(args.q_values) if args.q_values else None,
+        q_values_le_over_S=(
+            parse_q_values(args.q_values_le_over_S)
+            if args.q_values_le_over_S else None
+        ),
         output_root=args.output_root,
         nx=args.nx,
         ny=args.ny,
@@ -458,6 +547,7 @@ def main(argv=None):
         steady_rtol=args.steady_rtol,
         steady_check_interval=args.steady_check_interval,
         area_law=args.area_law,
+        motion_mode=args.motion_mode,
     )
     print(f"Static wall sweep written to: {output_root}")
 

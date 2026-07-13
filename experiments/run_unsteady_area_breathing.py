@@ -10,6 +10,8 @@ inside the existing quasi-1D area-source framework. It is not true
 moving-wall CFD: there is no moving mesh, ALE boundary condition, turbulence
 model, or combustion model.  It does include the quasi-1D moving-control-
 volume source, including wall-pressure work in the energy equation.
+Generic ducts use a Gaussian ``phi``; Config A uses the tabulated
+model-assumed first cantilever shape.
 """
 import argparse
 import csv
@@ -28,9 +30,14 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from mesh import (
+    CONFIG_A_GEOMETRY_LINEAGE_ID,
     LocalizedAreaPerturbation,
     SinusoidalAreaForcing,
     TimeDependentPerturbedGeometryProfile,
+    config_a_cantilever_mode,
+    config_a_normalized_to_raw,
+    config_a_raw_to_normalized,
+    config_a_ramp_area_law,
 )
 from solver import CombustionConfig, InletConfig, Solver, SolverConfig
 from rom import _compute_qoi
@@ -45,7 +52,8 @@ from experiments.run_static_wall_sweep import (
 
 
 def make_cold_flow_config(nx=30, ny=6, n_steps=120, cfl=0.35,
-                          mach=6.0, altitude=25000.0, preset=None):
+                          mach=6.0, altitude=25000.0, preset=None,
+                          area_law="auto"):
     """Build a cold-flow config with combustion disabled."""
     cfg = SolverConfig()
     if preset:
@@ -62,12 +70,19 @@ def make_cold_flow_config(nx=30, ny=6, n_steps=120, cfl=0.35,
     cfg.wall_type = "slip"
     cfg.combustion = CombustionConfig(enabled=False)
     cfg.area_source = True
+    from experiments.presets import preset_geometry, resolve_area_law
+    if resolve_area_law(area_law, preset=preset) == "config_a":
+        cfg.geometry = (
+            preset_geometry(preset) if preset else config_a_ramp_area_law()
+        )
+        if cfg.geometry is None:
+            cfg.geometry = config_a_ramp_area_law()
     return cfg
 
 
 def attach_unsteady_area_breathing(cfg, amplitude=0.001, frequency_hz=1000.0,
                                    phase=0.0, width=None, x_center=None,
-                                   min_area=1.0e-4):
+                                   min_area=1.0e-4, motion_mode="auto"):
     """Attach time-dependent effective-area forcing to a config."""
     base = cfg.geometry
     if width is None:
@@ -75,14 +90,28 @@ def attach_unsteady_area_breathing(cfg, amplitude=0.001, frequency_hz=1000.0,
     if x_center is None:
         x_center = base.x_throat
 
-    perturbation = LocalizedAreaPerturbation(
-        enabled=True,
-        mode="throat_gaussian",
-        amplitude=0.0,
-        x_center=x_center,
-        width=width,
-        min_area=min_area,
-    )
+    if motion_mode not in {"auto", "gaussian", "config_a"}:
+        raise ValueError(f"unsupported motion mode: {motion_mode}")
+    resolved_motion = motion_mode
+    if resolved_motion == "auto":
+        resolved_motion = (
+            "config_a"
+            if getattr(base, "geometry_lineage_id", None) == CONFIG_A_GEOMETRY_LINEAGE_ID
+            else "gaussian"
+        )
+    if resolved_motion == "config_a":
+        perturbation = config_a_cantilever_mode(
+            base, amplitude=0.0, min_area=min_area,
+        )
+    else:
+        perturbation = LocalizedAreaPerturbation(
+            enabled=True,
+            mode="throat_gaussian",
+            amplitude=0.0,
+            x_center=x_center,
+            width=width,
+            min_area=min_area,
+        )
     forcing = SinusoidalAreaForcing(
         amplitude=amplitude,
         frequency_hz=frequency_hz,
@@ -250,11 +279,13 @@ def validate_output_histories(forcing_rows, qoi_rows, probe_rows, forcing):
             raise ValueError("forcing_history q(t) does not match forcing model")
 
 
-def run_case(output_root=None, amplitude=0.001, frequency_hz=1000.0,
+def run_case(output_root=None, amplitude=None, epsilon_le_over_S=None,
+             frequency_hz=1000.0,
              phase=0.0, cycles=0.5, t_final=None, width=None,
              x_center=None, min_area=1.0e-4, nx=30, ny=6,
              baseline_steps=80, unsteady_steps=160, cfl=0.35,
-             mach=6.0, altitude=25000.0, sample_interval_steps=2):
+             mach=6.0, altitude=25000.0, sample_interval_steps=2,
+             preset=None, area_law="auto", motion_mode="auto"):
     """Run a small unsteady effective-area breathing case."""
     if frequency_hz < 0.0:
         raise ValueError("frequency_hz must be non-negative")
@@ -277,14 +308,28 @@ def run_case(output_root=None, amplitude=0.001, frequency_hz=1000.0,
 
     baseline_cfg = make_cold_flow_config(
         nx=nx, ny=ny, n_steps=baseline_steps, cfl=cfl,
-        mach=mach, altitude=altitude,
+        mach=mach, altitude=altitude, preset=preset, area_law=area_law,
+    )
+    base_geometry = baseline_cfg.geometry
+    if amplitude is not None and epsilon_le_over_S is not None:
+        raise ValueError("raw amplitude and epsilon_le_over_S are mutually exclusive")
+    if epsilon_le_over_S is not None:
+        if getattr(base_geometry, "geometry_lineage_id", None) != CONFIG_A_GEOMETRY_LINEAGE_ID:
+            raise ValueError("epsilon_le_over_S requires Config-A geometry")
+        amplitude = config_a_normalized_to_raw(epsilon_le_over_S, base_geometry)
+    elif amplitude is None:
+        amplitude = 0.001
+    normalized_amplitude = (
+        config_a_raw_to_normalized(amplitude, base_geometry)
+        if getattr(base_geometry, "geometry_lineage_id", None) == CONFIG_A_GEOMETRY_LINEAGE_ID
+        else None
     )
     baseline_solver = Solver(baseline_cfg)
     baseline_solver.run()
 
     cfg = make_cold_flow_config(
         nx=nx, ny=ny, n_steps=unsteady_steps, cfl=cfl,
-        mach=mach, altitude=altitude,
+        mach=mach, altitude=altitude, preset=preset, area_law=area_law,
     )
     cfg.t_final = t_final
     attach_unsteady_area_breathing(
@@ -295,6 +340,7 @@ def run_case(output_root=None, amplitude=0.001, frequency_hz=1000.0,
         width=width,
         x_center=x_center,
         min_area=min_area,
+        motion_mode=motion_mode,
     )
 
     solver = Solver(cfg)
@@ -328,6 +374,25 @@ def run_case(output_root=None, amplitude=0.001, frequency_hz=1000.0,
         "model": "time_dependent_effective_area_forcing",
         "not_true_moving_wall_cfd": True,
         "git": git_metadata(),
+        "geometry_lineage_id": getattr(cfg.geometry, "geometry_lineage_id", None),
+        "reduced_frequency_reference": {
+            "length_ref_m": getattr(
+                cfg.geometry, "reduced_frequency_length_ref_m",
+                cfg.geometry.L_total,
+            ),
+            "length_source": (
+                "published_deformable_surface"
+                if getattr(cfg.geometry, "geometry_lineage_id", None)
+                == CONFIG_A_GEOMETRY_LINEAGE_ID else "geometry.L_total"
+            ),
+        },
+        "forcing_coordinates": {
+            "epsilon": float(amplitude),
+            "epsilon_le_over_S": normalized_amplitude,
+            "input_representation": (
+                "epsilon_le_over_S" if epsilon_le_over_S is not None else "raw_epsilon"
+            ),
+        },
         "baseline": {
             "steps": baseline_solver.step_count,
             "final_time": baseline_solver.time,
@@ -360,7 +425,8 @@ def run_case(output_root=None, amplitude=0.001, frequency_hz=1000.0,
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Run unsteady effective-area breathing")
     parser.add_argument("--output-root", default=None)
-    parser.add_argument("--amplitude", type=float, default=0.001)
+    parser.add_argument("--amplitude", type=float, default=None)
+    parser.add_argument("--epsilon-le-over-S", type=float, default=None)
     parser.add_argument("--frequency-hz", type=float, default=1000.0)
     parser.add_argument("--phase", type=float, default=0.0)
     parser.add_argument("--cycles", type=float, default=0.5)
@@ -375,12 +441,18 @@ def main(argv=None):
     parser.add_argument("--cfl", type=float, default=0.35)
     parser.add_argument("--mach", type=float, default=6.0)
     parser.add_argument("--altitude", type=float, default=25000.0)
+    parser.add_argument("--preset", default=None)
+    parser.add_argument("--area-law", choices=("auto", "default", "config_a"),
+                        default="auto")
+    parser.add_argument("--motion-mode", choices=("auto", "gaussian", "config_a"),
+                        default="auto")
     parser.add_argument("--sample-interval-steps", type=int, default=2)
     args = parser.parse_args(argv)
 
     output_root, summary = run_case(
         output_root=args.output_root,
         amplitude=args.amplitude,
+        epsilon_le_over_S=args.epsilon_le_over_S,
         frequency_hz=args.frequency_hz,
         phase=args.phase,
         cycles=args.cycles,
@@ -396,6 +468,9 @@ def main(argv=None):
         mach=args.mach,
         altitude=args.altitude,
         sample_interval_steps=args.sample_interval_steps,
+        preset=args.preset,
+        area_law=args.area_law,
+        motion_mode=args.motion_mode,
     )
     print(f"Unsteady area-breathing run written to: {output_root}")
     print(json.dumps(summary, indent=2))

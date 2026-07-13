@@ -20,10 +20,13 @@ if str(REPO_ROOT) not in sys.path:
 import numpy as np
 
 from mesh import (
+    CONFIG_A_GEOMETRY_LINEAGE_ID,
     GeometryProfile,
-    LocalizedAreaPerturbation,
     PerturbedGeometryProfile,
     TabulatedAreaProfile,
+    TimeDependentPerturbedGeometryProfile,
+    WallContourGeometryProfile,
+    geometry_from_dict as rebuild_geometry_from_dict,
 )
 from experiments.run_static_wall_sweep import (
     ARTIFACT_SCHEMA_VERSION,
@@ -40,55 +43,25 @@ def load_json(path):
 
 
 def geometry_from_dict(data):
-    """Rebuild a geometry object from static sweep JSON metadata."""
-    if data["type"] == "GeometryProfile":
-        return GeometryProfile(
-            L_inlet=data["L_inlet"],
-            L_combustor=data["L_combustor"],
-            L_nozzle=data["L_nozzle"],
-            A_inlet=data["A_inlet"],
-            A_throat=data["A_throat"],
-            A_comb_exit=data["A_comb_exit"],
-            A_exit=data["A_exit"],
-        )
+    """Rebuild export geometry, freezing dynamic cases at their mean shape.
 
-    if data["type"] == "PerturbedGeometryProfile":
-        base = geometry_from_dict(data["base"])
-        p = data["perturbation"]
-        perturbation = LocalizedAreaPerturbation(
-            enabled=p.get("enabled", True),
-            mode=p.get("mode", "throat_gaussian"),
-            amplitude=p.get("amplitude", 0.0),
-            x_center=p.get("x_center", None),
-            width=p.get("width", 0.05),
-            min_area=p.get("min_area", data.get("min_area", 1.0e-6)),
-        )
-        return PerturbedGeometryProfile(base, perturbation)
-
-    if data["type"] == "TabulatedAreaProfile":
-        return TabulatedAreaProfile(
-            data["x_samples"], data["A_samples"],
-            name=data.get("name", "tabulated"),
-        )
-
-    if data["type"] == "TimeDependentPerturbedGeometryProfile":
-        base = geometry_from_dict(data["base"])
-        p = data["perturbation"]
-        forcing = data.get("forcing", {})
-        mean_q = float(forcing.get("mean", 0.0)) if forcing.get("enabled", True) else 0.0
-        perturbation = LocalizedAreaPerturbation(
-            enabled=p.get("enabled", True),
-            mode=p.get("mode", "throat_gaussian"),
-            amplitude=mean_q,
-            x_center=p.get("x_center"),
-            width=p.get("width", 0.05),
-            min_area=p.get("min_area", data.get("min_area", 1.0e-6)),
-        )
-        mean_geometry = PerturbedGeometryProfile(base, perturbation)
-        mean_geometry.exported_forcing_spec = forcing.copy()
-        return mean_geometry
-
-    raise ValueError(f"Unsupported geometry type for export: {data['type']}")
+    Solver/ROM serialization uses :func:`mesh.geometry_from_dict` directly.
+    An external CFD handoff needs one static mesh, so a time-dependent record
+    is deliberately represented by its forcing mean while retaining the full
+    forcing specification as audit metadata.
+    """
+    geometry = rebuild_geometry_from_dict(data)
+    if not isinstance(geometry, TimeDependentPerturbedGeometryProfile):
+        return geometry
+    perturbation = geometry.perturbation.copy()
+    perturbation.amplitude = (
+        float(geometry.forcing.mean) if geometry.forcing.enabled else 0.0
+    )
+    mean_geometry = PerturbedGeometryProfile(
+        geometry.base_geometry, perturbation,
+    )
+    mean_geometry.exported_forcing_spec = data.get("forcing", {}).copy()
+    return mean_geometry
 
 
 def area_profile_rows(geometry, n_points=300):
@@ -120,6 +93,44 @@ def wall_contour_rows(geometry, n_points=300):
         }
         for xi, ai in zip(x, A)
     ]
+
+
+def config_a_external_wall_coordinates(geometry):
+    """Return physical Config-A walls matching the exported effective area."""
+    base = geometry
+    while hasattr(base, "base_geometry"):
+        base = base.base_geometry
+    if (not isinstance(base, WallContourGeometryProfile)
+            or base.geometry_lineage_id != CONFIG_A_GEOMETRY_LINEAGE_ID):
+        raise ValueError(
+            "config_a_external_inlet export requires reconstructed lineage "
+            f"{CONFIG_A_GEOMETRY_LINEAGE_ID!r}; legacy schema-v2 geometry "
+            "remains readable only as a closed effective duct"
+        )
+    ramp_x = base.ramp_x.copy()
+    # The reconstructed cowl datum is y=0 and positive model displacement is
+    # downward/increased gap, so the active wall is exactly y=-A(x).
+    ramp_y = -np.asarray(geometry.area(ramp_x), dtype=float)
+    cowl_x = base.cowl_x.copy()
+    cowl_y = base.cowl_y.copy()
+    if not np.allclose(-ramp_y, geometry.area(ramp_x), rtol=0.0, atol=1.0e-12):
+        raise ValueError("external wall contour does not reproduce effective area")
+    return base, ramp_x, ramp_y, cowl_x, cowl_y
+
+
+def physical_wall_rows(ramp_x, ramp_y, cowl_x, cowl_y):
+    """Flatten physical walls into a CSV-friendly ordered representation."""
+    rows = [
+        {"boundary": "rampWall", "point_index": index,
+         "x": float(x), "y": float(y)}
+        for index, (x, y) in enumerate(zip(ramp_x, ramp_y))
+    ]
+    rows.extend(
+        {"boundary": "cowlWall", "point_index": index,
+         "x": float(x), "y": float(y)}
+        for index, (x, y) in enumerate(zip(cowl_x, cowl_y))
+    )
+    return rows
 
 
 def qoi_definitions():
@@ -235,34 +246,59 @@ def freestream_inflow_notes(inlet):
     }
 
 
-def openfoam_metadata(case_name, config, selection_overlay=None):
+def openfoam_metadata(case_name, config, selection_overlay=None,
+                      comparison_topology="closed_effective_duct"):
     """OpenFOAM-oriented placeholder metadata."""
     return {
         "case_name": case_name,
+        "comparison_topology": comparison_topology,
         "status": ("OpenFOAM screening template with executable shared-QoI bridge; "
                    "not yet meshed/run/validated"),
         "recommended_future_solver_family": "compressible RANS/URANS as appropriate",
         "suggested_turbulence_placeholder": "SST k-omega for later high-fidelity RANS screening",
-        "boundaries": {
-            "inlet": "supersonic inflow/freestream state from config.json",
-            "outlet": "supersonic or wave-transmissive outlet, to be selected in OpenFOAM setup",
-            "walls": "body-fitted no-slip adiabatic/isothermal wall definitions required later",
-        },
-        "mesh_notes": [
-            "Current CSV contour is derived from effective area per unit depth.",
-            "Generate a body-fitted mesh with wall-normal spacing set by target y+.",
-            "This Python export does not include dynamic mesh or moving-wall setup.",
-        ],
+        "boundaries": (
+            {
+                "inlet": "open upstream supersonic inflow",
+                "farfield": "open upstream freestream boundary",
+                "rampWall": "source-reconstructed piecewise ramp",
+                "cowlWall": "fixed cowl beginning at the published cowl station",
+                "outlet": "downstream isolator outlet",
+                "frontAndBack": "empty pseudo-2D faces",
+            }
+            if comparison_topology == "config_a_external_inlet" else
+            {
+                "inlet": "supersonic inflow/freestream state from config.json",
+                "outlet": "supersonic or wave-transmissive outlet",
+                "bottomWall": "closed effective-duct lower wall",
+                "topWall": "closed effective-duct area contour",
+                "frontAndBack": "empty pseudo-2D faces",
+            }
+        ),
+        "mesh_notes": (
+            [
+                "physical_wall_contours.csv preserves the reconstructed piecewise ramp and fixed cowl.",
+                "The 50 compression segments are emitted as lines, not a smoothing spline.",
+                "This template does not include dynamic mesh or moving-wall setup.",
+            ]
+            if comparison_topology == "config_a_external_inlet" else
+            [
+                "The suggested contour is effective area per unit depth.",
+                "Generate a body-fitted mesh with wall-normal spacing set by target y+.",
+                "This template does not include dynamic mesh or moving-wall setup.",
+            ]
+        ),
         "inlet": config["inlet"],
         "qoi_definitions_file": "qoi_definitions.json",
         "selection_overlay": selection_overlay or {},
     }
 
 
-def fun3d_metadata(case_name, config, selection_overlay=None):
+def fun3d_metadata(case_name, config, selection_overlay=None,
+                   comparison_topology="closed_effective_duct"):
     """FUN3D-oriented placeholder metadata."""
     return {
         "case_name": case_name,
+        "comparison_topology": comparison_topology,
         "status": "metadata scaffold only, not a runnable FUN3D case",
         "geometry_summary": config["geometry"],
         "run_conditions": config["inlet"],
@@ -281,18 +317,26 @@ def fun3d_metadata(case_name, config, selection_overlay=None):
 
 
 def export_case(case_dir, output_dir, n_points=300, selection_overlay=None,
-                emit_gmsh=True, nx_cells=200, ny_cells=60):
+                emit_gmsh=True, nx_cells=200, ny_cells=60,
+                comparison_topology="closed_effective_duct"):
     """Export one static sweep case (+ optional Gmsh/OpenFOAM emission)."""
     case_dir = Path(case_dir)
     output_dir = Path(output_dir)
     config_data = load_json(case_dir / "config.json")
     config = config_data["config"]
     geometry = geometry_from_dict(config["geometry"])
+    if comparison_topology not in {
+        "closed_effective_duct", "config_a_external_inlet",
+    }:
+        raise ValueError(f"unsupported comparison topology: {comparison_topology}")
     case_name = ((selection_overlay or {}).get("export_name")
                  or case_dir.name)
 
     area_rows = area_profile_rows(geometry, n_points=n_points)
     contour_rows = wall_contour_rows(geometry, n_points=n_points)
+    external_coordinates = None
+    if comparison_topology == "config_a_external_inlet":
+        external_coordinates = config_a_external_wall_coordinates(geometry)
     area_values = np.array([row["area"] for row in area_rows])
     positive_area = bool(np.all(area_values > 0.0))
 
@@ -314,13 +358,23 @@ def export_case(case_dir, output_dir, n_points=300, selection_overlay=None,
         "mean_geometry_exported": geometry_dict.get("type") == "TimeDependentPerturbedGeometryProfile",
         "forcing_spec": geometry_dict.get("forcing"),
         "selection_overlay": selection_overlay or {},
+        "comparison_topology": comparison_topology,
+        "geometry_lineage_id": getattr(geometry, "geometry_lineage_id", None),
     })
     write_csv(output_dir / "area_profile.csv", area_rows)
     write_csv(output_dir / "suggested_wall_contour.csv", contour_rows)
+    if external_coordinates is not None:
+        _, ramp_x, ramp_y, cowl_x, cowl_y = external_coordinates
+        write_csv(
+            output_dir / "physical_wall_contours.csv",
+            physical_wall_rows(ramp_x, ramp_y, cowl_x, cowl_y),
+        )
     write_json(output_dir / "openfoam_metadata.json",
-               openfoam_metadata(case_name, config, selection_overlay))
+               openfoam_metadata(case_name, config, selection_overlay,
+                                 comparison_topology))
     write_json(output_dir / "fun3d_metadata.json",
-               fun3d_metadata(case_name, config, selection_overlay))
+               fun3d_metadata(case_name, config, selection_overlay,
+                              comparison_topology))
     write_json(output_dir / "qoi_definitions.json", qoi_definitions())
     write_json(output_dir / "turbulence_notes.json", turbulence_notes())
     write_json(output_dir / "combustion_notes.json", combustion_notes(config))
@@ -331,10 +385,21 @@ def export_case(case_dir, output_dir, n_points=300, selection_overlay=None,
 
     gmsh_report = {}
     if emit_gmsh:
-        from experiments.gmsh_openfoam_export import emit_gmsh_openfoam
-        geo_path, foam_case = emit_gmsh_openfoam(
-            output_dir, contour_rows, config["inlet"],
-            nx_cells=nx_cells, ny_cells=ny_cells)
+        if comparison_topology == "config_a_external_inlet":
+            from experiments.gmsh_openfoam_export import (
+                emit_config_a_external_openfoam,
+            )
+            _, ramp_x, ramp_y, cowl_x, cowl_y = external_coordinates
+            geo_path, foam_case = emit_config_a_external_openfoam(
+                output_dir, ramp_x, ramp_y, cowl_x, cowl_y,
+                config["inlet"], nx_cells=nx_cells, ny_cells=ny_cells,
+            )
+        else:
+            from experiments.gmsh_openfoam_export import emit_gmsh_openfoam
+            geo_path, foam_case = emit_gmsh_openfoam(
+                output_dir, contour_rows, config["inlet"],
+                nx_cells=nx_cells, ny_cells=ny_cells,
+            )
         gmsh_report = {
             "gmsh_geo": str(geo_path.relative_to(output_dir)),
             "openfoam_case": str(foam_case.relative_to(output_dir)),
@@ -350,6 +415,8 @@ def export_case(case_dir, output_dir, n_points=300, selection_overlay=None,
 
     report = {
         "case_name": case_name,
+        "comparison_topology": comparison_topology,
+        "geometry_lineage_id": getattr(geometry, "geometry_lineage_id", None),
         "positive_area": positive_area,
         "min_area": float(np.min(area_values)),
         "max_area": float(np.max(area_values)),
@@ -524,7 +591,8 @@ def select_cases_from_selection_json(selection_path, sweep_root,
 def export_sweep(sweep_root, output_root=None, case_names=None, n_points=300,
                  emit_gmsh=True, nx_cells=200, ny_cells=60,
                  selected_cases=None, q_match_tol=1.0e-8,
-                 allow_nearest=False):
+                 allow_nearest=False,
+                 comparison_topology="closed_effective_duct"):
     """Export selected cases from a completed static sweep.
 
     If ``selected_cases`` is provided, it overrides ``case_names`` and the
@@ -566,12 +634,14 @@ def export_sweep(sweep_root, output_root=None, case_names=None, n_points=300,
             emit_gmsh=emit_gmsh,
             nx_cells=nx_cells,
             ny_cells=ny_cells,
+            comparison_topology=comparison_topology,
         ))
 
     write_json(output_root / "export_summary.json", {
         "schema_version": ARTIFACT_SCHEMA_VERSION,
         "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "source_sweep": str(sweep_root),
+        "comparison_topology": comparison_topology,
         "selected_cases_source": str(selected_cases) if selected_cases else None,
         "status": "scaffold + gmsh/openfoam templates" if emit_gmsh else "scaffold only",
         "produces_runnable_openfoam_case": emit_gmsh,
@@ -609,6 +679,12 @@ def main(argv=None):
     parser.add_argument("--q-match-tol", type=float, default=1.0e-8)
     parser.add_argument("--allow-nearest", action="store_true",
                         help="Permit an out-of-tolerance q match with a loud warning.")
+    parser.add_argument(
+        "--comparison-topology",
+        choices=("closed_effective_duct", "config_a_external_inlet"),
+        default="closed_effective_duct",
+        help="Choose the legacy effective duct or reconstructed physical inlet.",
+    )
     args = parser.parse_args(argv)
 
     output_root, reports = export_sweep(
@@ -622,6 +698,7 @@ def main(argv=None):
         ny_cells=args.ny_cells,
         q_match_tol=args.q_match_tol,
         allow_nearest=args.allow_nearest,
+        comparison_topology=args.comparison_topology,
     )
     print(f"Export scaffold written to: {output_root}")
     print(json.dumps({"n_cases": len(reports)}, indent=2))

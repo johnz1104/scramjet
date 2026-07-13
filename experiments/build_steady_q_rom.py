@@ -235,6 +235,13 @@ def build_rom(sweep_root=None, output_root=None, nx=30, ny=6, n_steps=1400,
         "study": "steady_q_rom",
         "source_sweep_root": str(sweep_root) if sweep_root else None,
         "model": "steady_pod_rom_over_q_throat",
+        "geometry_lineage_id": getattr(
+            base_cfg.geometry, "geometry_lineage_id", None,
+        ),
+        "reduced_frequency_length_ref_m": getattr(
+            base_cfg.geometry, "reduced_frequency_length_ref_m",
+            base_cfg.geometry.L_total,
+        ),
         "time_accurate_rom": False,
         "config_defaults": {
             "nx": nx, "ny": ny, "n_steps": n_steps, "cfl": cfl,
