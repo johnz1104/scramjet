@@ -19,6 +19,11 @@ Each successful case writes:
 Aggregate outputs:
     design_matrix.csv, summary.csv, plots/
 
+Every new case also records the reduced-frequency coordinate
+``k = 2*pi*f*L_ref/u_ref``.  The dimensional references are explicit in the
+manifest and may be overridden for calibrated Config-A studies; demo defaults
+use the full duct length and inlet velocity.
+
 Failed cases are recorded as rows in summary.csv with status="failed"
 and an error_message, so the DOE does not crash on a single bad case.
 """
@@ -100,19 +105,36 @@ def case_label(idx):
     return f"case_{idx:03d}"
 
 
-def design_matrix(q_offsets, epsilons, frequencies_hz, phases):
-    """Cartesian product of the four DOE axes."""
+def reduced_frequency(frequency_hz, length_ref, velocity_ref):
+    """Return ``k = 2*pi*f*L_ref/u_ref`` with validated SI references."""
+    length_ref = float(length_ref)
+    velocity_ref = float(velocity_ref)
+    if length_ref <= 0.0:
+        raise ValueError("reduced-frequency length reference must be positive")
+    if velocity_ref <= 0.0:
+        raise ValueError("reduced-frequency velocity reference must be positive")
+    return float(2.0 * np.pi * float(frequency_hz) * length_ref / velocity_ref)
+
+
+def design_matrix(q_offsets, epsilons, frequencies_hz, phases,
+                  length_ref=None, velocity_ref=None):
+    """Cartesian product of the four DOE axes plus optional reduced frequency."""
     rows = []
     for idx, (q_offset, eps, freq, phi) in enumerate(
         itertools.product(q_offsets, epsilons, frequencies_hz, phases)
     ):
-        rows.append({
+        row = {
             "case_id": case_label(idx),
             "q_offset": float(q_offset),
             "epsilon": float(eps),
             "frequency_hz": float(freq),
             "phase": float(phi),
-        })
+        }
+        if length_ref is not None and velocity_ref is not None:
+            row["reduced_frequency"] = reduced_frequency(
+                freq, length_ref, velocity_ref,
+            )
+        rows.append(row)
     return rows
 
 
@@ -169,7 +191,10 @@ def run_one_case(case_dir, design_row, baseline_state_U, baseline_summary,
         "status": "failed",
         "error_message": "",
     }
+    if "reduced_frequency" in design_row:
+        summary_row["reduced_frequency"] = design_row["reduced_frequency"]
 
+    solver = None
     try:
         t_final = select_t_final(design_row["frequency_hz"], cycles, t_final_static)
 
@@ -213,7 +238,9 @@ def run_one_case(case_dir, design_row, baseline_state_U, baseline_summary,
             if current_solver.step_count % sample_interval_steps == 0:
                 sample(current_solver)
 
-        solver.run(n_steps=step_cap, t_final=t_final, step_callback=callback)
+        solver_run_status = solver.run(
+            n_steps=step_cap, t_final=t_final, step_callback=callback,
+        )
         if forcing_rows[-1]["time"] != solver.time:
             sample(solver)
 
@@ -282,10 +309,34 @@ def run_one_case(case_dir, design_row, baseline_state_U, baseline_summary,
             "min_throat_area": float(cfg.geometry.min_area_value(time=solver.time)),
         })
         _merge_metrics_into_summary(summary_row, metrics)
+        write_json(case_dir / "run_status.json", {
+            "schema_version": ARTIFACT_SCHEMA_VERSION,
+            "workflow_status": status,
+            "reason": reason,
+            "baseline": baseline_summary,
+            "solver": solver_run_status,
+            "requested": {
+                "cycles": float(cycles),
+                "t_final_s": float(t_final),
+                "step_cap": int(step_cap),
+            },
+            "achieved": {
+                "cycles": achieved_cycles,
+                "final_time_s": float(solver.time),
+                "steps": int(solver.step_count),
+            },
+        })
         return summary_row
     except Exception as exc:
         summary_row["error_message"] = f"{type(exc).__name__}: {exc}"
         summary_row["traceback"] = traceback.format_exc(limit=2)
+        write_json(case_dir / "run_status.json", {
+            "schema_version": ARTIFACT_SCHEMA_VERSION,
+            "workflow_status": "failed",
+            "reason": summary_row["error_message"],
+            "baseline": baseline_summary,
+            "solver": getattr(solver, "run_status", None),
+        })
         return summary_row
 
 
@@ -312,7 +363,14 @@ def _merge_metrics_into_summary(summary_row, metrics):
         summary_row[f"probe_{probe_name}_pressure_amplitude"] = sub.get("pressure_amplitude")
         summary_row[f"probe_{probe_name}_pressure_raw_amplitude"] = sub.get("pressure_raw_amplitude")
         summary_row[f"probe_{probe_name}_pressure_mean"] = sub.get("pressure_mean")
-        summary_row[f"probe_{probe_name}_supported"] = sub.get("quality", {}).get("supported", False)
+        summary_row[f"probe_{probe_name}_pressure_phase_lag_rad"] = sub.get(
+            "pressure_phase_lag_vs_q_rad",
+        )
+        quality = sub.get("quality", {})
+        summary_row[f"probe_{probe_name}_supported"] = quality.get("supported", False)
+        summary_row[f"probe_{probe_name}_r_squared"] = quality.get("r_squared")
+        summary_row[f"probe_{probe_name}_drift_fraction"] = quality.get("drift_fraction")
+        summary_row[f"probe_{probe_name}_snr"] = quality.get("snr")
     warnings = metrics.get("warnings", [])
     summary_row["warnings"] = "; ".join(warnings) if warnings else ""
 
@@ -375,12 +433,14 @@ def plot_mean_qoi_vs_q_offset(summary_rows, path):
 
 
 def plot_frequency_response(summary_rows, path):
-    """Aggregate plot: response amplitude vs frequency at fixed epsilon > 0."""
+    """Aggregate plot: response amplitude vs reduced or dimensional frequency."""
     valid = [r for r in summary_rows if r.get("status") == "ok"
              and r.get("exit_mach_amplitude") is not None
              and r.get("epsilon", 0.0) > 0.0]
     if not valid:
         return False
+    use_reduced = all(r.get("reduced_frequency") is not None for r in valid)
+    frequency_key = "reduced_frequency" if use_reduced else "frequency_hz"
     fig, ax = plt.subplots(figsize=(7, 5))
     eps_levels = sorted({r["epsilon"] for r in valid})
     cmap = plt.get_cmap("magma")
@@ -388,13 +448,14 @@ def plot_frequency_response(summary_rows, path):
         rows = [r for r in valid if r["epsilon"] == eps]
         if not rows:
             continue
-        freqs = [r["frequency_hz"] for r in rows]
+        freqs = [r[frequency_key] for r in rows]
         amps = [r["exit_mach_amplitude"] for r in rows]
         order = np.argsort(freqs)
         ax.plot(np.array(freqs)[order], np.array(amps)[order], "o-",
                 color=cmap(0.3 + 0.6 * k / max(len(eps_levels) - 1, 1)),
                 label=f"epsilon = {eps:g}")
-    ax.set_xlabel("frequency [Hz]")
+    ax.set_xlabel("reduced frequency, k = 2*pi*f*L_ref/u_ref"
+                  if use_reduced else "frequency [Hz]")
     ax.set_ylabel("exit Mach amplitude")
     ax.set_title("Frequency response of effective-area forcing")
     ax.grid(True, alpha=0.3)
@@ -434,7 +495,9 @@ def run_doe(output_root=None, q_offsets=None, epsilons=None,
             sample_interval_steps=2, discard_fraction=0.25,
             baseline_steady_rtol=1.0e-6,
             baseline_check_interval=50, preset=None,
-            legacy_breathing_energy=False):
+            legacy_breathing_energy=False,
+            reduced_frequency_length_ref=None,
+            reduced_frequency_velocity_ref=None):
     """Run the DOE and aggregate outputs."""
     q_offsets = list(default_q_offsets() if q_offsets is None else q_offsets)
     epsilons = list(default_epsilons() if epsilons is None else epsilons)
@@ -454,7 +517,27 @@ def run_doe(output_root=None, q_offsets=None, epsilons=None,
     cases_root.mkdir(parents=True, exist_ok=True)
     plots_dir.mkdir(parents=True, exist_ok=True)
 
-    design_rows = design_matrix(q_offsets, epsilons, frequencies_hz, phases)
+    reference_cfg = make_cold_flow_config(
+        nx=nx, ny=ny, n_steps=1, cfl=cfl,
+        mach=mach, altitude=altitude, preset=preset,
+    )
+    length_ref = (
+        float(reference_cfg.geometry.L_total)
+        if reduced_frequency_length_ref is None
+        else float(reduced_frequency_length_ref)
+    )
+    velocity_ref = (
+        float(reference_cfg.inlet.u_inf)
+        if reduced_frequency_velocity_ref is None
+        else float(reduced_frequency_velocity_ref)
+    )
+    # Validate even when all frequencies are zero.
+    reduced_frequency(0.0, length_ref, velocity_ref)
+
+    design_rows = design_matrix(
+        q_offsets, epsilons, frequencies_hz, phases,
+        length_ref=length_ref, velocity_ref=velocity_ref,
+    )
     write_csv(output_root / "design_matrix.csv", design_rows)
 
     write_json(output_root / "manifest.json", {
@@ -467,7 +550,25 @@ def run_doe(output_root=None, q_offsets=None, epsilons=None,
             "q_offset": q_offsets,
             "epsilon": epsilons,
             "frequency_hz": frequencies_hz,
+            "reduced_frequency": [
+                reduced_frequency(f, length_ref, velocity_ref)
+                for f in frequencies_hz
+            ],
             "phase": phases,
+        },
+        "reduced_frequency": {
+            "symbol": "k",
+            "definition": "2*pi*frequency_hz*length_ref_m/velocity_ref_m_s",
+            "length_ref_m": length_ref,
+            "length_source": (
+                "geometry.L_total" if reduced_frequency_length_ref is None
+                else "cli_override"
+            ),
+            "velocity_ref_m_s": velocity_ref,
+            "velocity_source": (
+                "inlet.u_inf" if reduced_frequency_velocity_ref is None
+                else "cli_override"
+            ),
         },
         "n_cases": len(design_rows),
         "config_defaults": {
@@ -606,6 +707,16 @@ def main(argv=None):
                              "overrides --mach/--altitude.")
     parser.add_argument("--legacy-breathing-energy", action="store_true",
                         help="Audit only: reproduce the historically wrong energy source.")
+    parser.add_argument(
+        "--reduced-frequency-length-ref", type=float, default=None,
+        help=("L_ref [m] in k=2*pi*f*L_ref/u_ref. Default: geometry.L_total; "
+              "use the calibrated ramp/motion length for Config-A research."),
+    )
+    parser.add_argument(
+        "--reduced-frequency-velocity-ref", type=float, default=None,
+        help=("u_ref [m/s] in k=2*pi*f*L_ref/u_ref. "
+              "Default: inlet freestream velocity."),
+    )
     args = parser.parse_args(argv)
 
     run_doe(
@@ -626,6 +737,8 @@ def main(argv=None):
         baseline_check_interval=args.baseline_check_interval,
         preset=args.preset,
         legacy_breathing_energy=args.legacy_breathing_energy,
+        reduced_frequency_length_ref=args.reduced_frequency_length_ref,
+        reduced_frequency_velocity_ref=args.reduced_frequency_velocity_ref,
     )
 
 

@@ -17,10 +17,17 @@ with established references BEFORE any wall-motion claim rests on it:
   - in the quasi-steady limit f -> 0 the shock-motion amplitude must
     approach  amp * p_b0 / (dp_e/dx_s),  the slope of the exact
     back-pressure-vs-shock-position map. The script reports the measured/
-    quasi-steady amplitude ratio per frequency; it should approach 1 at
-    the lowest frequencies and roll off/lag as frequency rises
-    (cf. Culick & Rogers, AIAA J 21(10), 1983, for the analytic transfer
-    function; Sajben et al. transonic-diffuser experiments).
+    quasi-steady amplitude ratio per frequency and overlays the first-order
+    Culick--Rogers transfer (their Eqs. 42--44),
+
+        x_s' / p_e' = C / (1 + i*omega*tau)
+
+    in the present positive-lag convention.  Their input p_e' is the acoustic
+    pressure immediately downstream of the shock, whereas this benchmark
+    imposes pressure at the finite-duct outlet.  The plotted exit-forcing curve
+    is therefore explicitly labeled a hybrid: exact exit-pressure static gain
+    times the published relaxation factor.  Discrepancy is reported, not used
+    as a pass/fail assertion.
 
 Outputs (per frequency + aggregate) under runs/:
     summary.csv, response curves, shock-position histories, plots/
@@ -115,6 +122,81 @@ def quasi_steady_slope(x_target, A_in, A_ex, L, M1, p1, gamma=1.4, dx=1e-4):
     return (pe_p - pe_m) / (2.0 * dx)
 
 
+def culick_rogers_coefficients(M_shock, p_upstream, a_upstream,
+                               dln_area_dx, gamma=1.4):
+    """Return the published isentropic-flow ``(C, tau)`` coefficients.
+
+    Implements Culick & Rogers (AIAA Journal 21(10), 1983), Eqs. 43--44.
+    ``M_shock``, ``p_upstream`` and ``a_upstream`` are mean values immediately
+    upstream of the shock, and ``dln_area_dx=(1/A)dA/dx`` is evaluated at the
+    mean shock station.  A diverging duct gives ``C < 0`` and ``tau > 0``.
+    """
+    M_shock = float(M_shock)
+    p_upstream = float(p_upstream)
+    a_upstream = float(a_upstream)
+    dln_area_dx = float(dln_area_dx)
+    if M_shock <= 1.0:
+        raise ValueError("Culick--Rogers normal-shock model requires M_shock > 1")
+    if p_upstream <= 0.0 or a_upstream <= 0.0 or dln_area_dx <= 0.0:
+        raise ValueError("positive p, a, and diverging dln(A)/dx are required")
+    common = 1.0 + ((gamma**2 + 1.0) / (gamma - 1.0)) * M_shock**2
+    length_scale = 1.0 / dln_area_dx
+    C = (
+        -(1.0 / p_upstream) * length_scale * (gamma + 1.0)**2
+        / (2.0 * gamma * (gamma - 1.0) * common)
+    )
+    tau = (
+        (1.0 / a_upstream) * length_scale * 2.0 * (gamma + 1.0) * M_shock
+        / ((gamma - 1.0) * common)
+    )
+    return float(C), float(tau)
+
+
+def culick_rogers_operating_point(x_target, A_in, A_ex, L, M_inlet,
+                                  p_inlet, T_inlet, gamma=1.4,
+                                  R_gas=287.0):
+    """Evaluate the local mean quantities required by Eqs. 43--44."""
+    _, M_shock, _, _ = analytic_map(
+        x_target, A_in, A_ex, L, M_inlet, p_inlet, gamma,
+    )
+    stagnation_factor_inlet = 1.0 + 0.5 * (gamma - 1.0) * M_inlet**2
+    p0 = p_inlet * stagnation_factor_inlet ** (gamma / (gamma - 1.0))
+    T0 = T_inlet * stagnation_factor_inlet
+    local_factor = 1.0 + 0.5 * (gamma - 1.0) * M_shock**2
+    p_upstream = p0 * local_factor ** (-gamma / (gamma - 1.0))
+    T_upstream = T0 / local_factor
+    a_upstream = np.sqrt(gamma * R_gas * T_upstream)
+    A_shock = A_in + (A_ex - A_in) * x_target / L
+    dln_area_dx = ((A_ex - A_in) / L) / A_shock
+    C, tau = culick_rogers_coefficients(
+        M_shock, p_upstream, a_upstream, dln_area_dx, gamma,
+    )
+    return {
+        "M_shock": float(M_shock),
+        "p_upstream_Pa": float(p_upstream),
+        "T_upstream_K": float(T_upstream),
+        "a_upstream_m_s": float(a_upstream),
+        "dln_area_dx_per_m": float(dln_area_dx),
+        "C_m_per_Pa": C,
+        "tau_s": tau,
+    }
+
+
+def culick_rogers_frequency_response(frequency_hz, tau):
+    """Normalized gain and positive phase lag of ``1/(1+i*omega*tau)``."""
+    omega_tau = 2.0 * np.pi * float(frequency_hz) * float(tau)
+    return {
+        "omega_tau": float(omega_tau),
+        "normalized_gain": float(1.0 / np.sqrt(1.0 + omega_tau**2)),
+        "phase_lag_rad": float(np.arctan(omega_tau)),
+    }
+
+
+def wrap_phase(value):
+    """Wrap a phase difference to [-pi, pi)."""
+    return float((float(value) + np.pi) % (2.0 * np.pi) - np.pi)
+
+
 def run_frequency(freq, amp, cycles, settle_steps, nx, x_target,
                   A_in, A_ex, L, M1, p1, T1, sample_interval_steps=5):
     """Run one forced case; return (summary_row, histories)."""
@@ -146,6 +228,10 @@ def run_frequency(freq, amp, cycles, settle_steps, nx, x_target,
     forcing_rows, qoi_rows = [], []
     slope = quasi_steady_slope(x_target, A_in, A_ex, L, M1, p1)
     gain_sign = 1.0 if slope >= 0.0 else -1.0
+    cr_point = culick_rogers_operating_point(
+        x_target, A_in, A_ex, L, M1, p1, T1, gamma, R_gas,
+    )
+    cr_response = culick_rogers_frequency_response(freq, cr_point["tau_s"])
 
     def sample(s):
         d = shock_diagnostics(s)
@@ -193,6 +279,27 @@ def run_frequency(freq, amp, cycles, settle_steps, nx, x_target,
             if amp_meas is not None and qs_amplitude > 0 else None),
         "n_cycles": metrics["n_cycles_after_transient"],
         "warnings": "; ".join(metrics["warnings"]),
+        "cr_local_shock_mach": cr_point["M_shock"],
+        "cr_upstream_pressure_Pa": cr_point["p_upstream_Pa"],
+        "cr_local_sound_speed_m_s": cr_point["a_upstream_m_s"],
+        "cr_dln_area_dx_per_m": cr_point["dln_area_dx_per_m"],
+        "cr_C_m_per_Pa": cr_point["C_m_per_Pa"],
+        "cr_tau_s": cr_point["tau_s"],
+        "cr_omega_tau": cr_response["omega_tau"],
+        "cr_normalized_gain": cr_response["normalized_gain"],
+        "cr_phase_lag_rad": cr_response["phase_lag_rad"],
+        "cr_hybrid_exit_amplitude": (
+            qs_amplitude * cr_response["normalized_gain"]
+        ),
+        "solver_over_cr_hybrid_gain": (
+            amp_meas / (qs_amplitude * cr_response["normalized_gain"])
+            if amp_meas is not None and qs_amplitude > 0.0 else None
+        ),
+        "solver_minus_cr_hybrid_phase_wrapped_rad": (
+            wrap_phase(shock_metric["phase_lag_vs_q_rad"]
+                       - cr_response["phase_lag_rad"])
+            if shock_metric["phase_lag_vs_q_rad"] is not None else None
+        ),
     }
     return row, (forcing_rows, qoi_rows)
 
@@ -239,6 +346,17 @@ def main(argv=None):
             "Culick & Rogers, AIAA J 21(10), 1983 (quasi-1D shock response theory)",
             "Sajben, Bogar & Kroutil forced-oscillation transonic diffuser data",
         ],
+        "culick_rogers_comparison": {
+            "source": "Culick & Rogers (1983), Eqs. 42--44, isentropic-flow limit",
+            "doi": "10.2514/3.60147",
+            "published_input": "acoustic pressure immediately downstream of shock",
+            "numerical_input": "imposed pressure at finite-duct outlet",
+            "overlay": (
+                "hybrid only: exact exit-pressure static gain multiplied by "
+                "the published first-order relaxation factor"
+            ),
+            "pass_fail_assertion": False,
+        },
         "git": git_metadata(),
     })
 
@@ -272,31 +390,62 @@ def main(argv=None):
         ])
         for i, phase_value in zip(phase_indices, unwrapped):
             rows[i]["shock_x_phase_lag_unwrapped_rad"] = float(phase_value)
+            rows[i]["solver_minus_cr_hybrid_phase_unwrapped_rad"] = float(
+                phase_value - rows[i]["cr_phase_lag_rad"],
+            )
     write_csv(output_root / "summary.csv", rows)
 
-    valid = [r for r in rows if r["amplitude_ratio_vs_quasi_steady"] is not None]
+    valid = [
+        r for r in rows
+        if r["amplitude_ratio_vs_quasi_steady"] is not None
+        and r.get("shock_x_phase_lag_rad") is not None
+    ]
     if valid:
-        f_arr = [r["frequency_hz"] for r in valid]
+        omega_tau = [r["cr_omega_tau"] for r in valid]
         a_arr = [r["amplitude_ratio_vs_quasi_steady"] for r in valid]
+        a_cr = [r["cr_normalized_gain"] for r in valid]
         l_arr = [r.get("shock_x_phase_lag_unwrapped_rad",
                        r["shock_x_phase_lag_rad"]) for r in valid]
+        l_cr = [r["cr_phase_lag_rad"] for r in valid]
         fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
-        axes[0].semilogx(f_arr, a_arr, "bo-")
+        axes[0].semilogx(omega_tau, a_arr, "bo-", label="solver / exact static gain")
+        axes[0].semilogx(omega_tau, a_cr, "k--", label="Culick--Rogers hybrid")
         axes[0].axhline(1.0, color="k", ls="--", lw=0.8,
                         label="quasi-steady limit")
-        axes[0].set_xlabel("forcing frequency [Hz]")
+        axes[0].set_xlabel("Culick--Rogers reduced frequency, omega*tau")
         axes[0].set_ylabel("shock amplitude / quasi-steady amplitude")
         axes[0].set_title("Forced-shock amplitude response")
         axes[0].legend(fontsize=9)
-        axes[1].semilogx(f_arr, [x if x is None else float(x) for x in l_arr], "rs-")
-        axes[1].set_xlabel("forcing frequency [Hz]")
+        axes[1].semilogx(omega_tau, [float(x) for x in l_arr], "rs-",
+                         label="solver vs outlet pressure")
+        axes[1].semilogx(omega_tau, l_cr, "k--", label="Culick--Rogers local model")
+        axes[1].set_xlabel("Culick--Rogers reduced frequency, omega*tau")
         axes[1].set_ylabel("phase lag vs p_b(t) [rad]")
         axes[1].set_title("Forced-shock phase response")
+        axes[1].legend(fontsize=9)
         for ax in axes:
             ax.grid(True, alpha=0.3, which="both")
         plt.tight_layout()
         fig.savefig(plots_dir / "shock_response.png", dpi=140)
         plt.close(fig)
+
+        gain_error = np.asarray(a_arr) - np.asarray(a_cr)
+        phase_error = np.asarray(l_arr, dtype=float) - np.asarray(l_cr)
+        write_json(output_root / "culick_rogers_comparison.json", {
+            "schema_version": ARTIFACT_SCHEMA_VERSION,
+            "comparison_kind": "hybrid_exit_pressure_not_strict_local_input",
+            "pass_fail_assertion": False,
+            "n_supported": len(valid),
+            "normalized_gain_rmse": float(np.sqrt(np.mean(gain_error**2))),
+            "unwrapped_phase_difference_rmse_rad": float(
+                np.sqrt(np.mean(phase_error**2)),
+            ),
+            "interpretation": (
+                "The analytic curve isolates local shock relaxation. Extra "
+                "lag in the solver includes propagation through the finite "
+                "post-shock duct and outlet-boundary response."
+            ),
+        })
 
     print(f"\nForced-shock benchmark written to: {output_root}")
     return output_root

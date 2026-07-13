@@ -38,7 +38,9 @@ DEFAULT_WEIGHTS = {
     "warning_penalty": 0.1,
 }
 
-DESIGN_KEYS = ("q_offset", "epsilon", "frequency_hz", "phase")
+DESIGN_KEYS = (
+    "q_offset", "epsilon", "frequency_hz", "reduced_frequency", "phase",
+)
 
 
 def _parse_float(text):
@@ -78,6 +80,37 @@ def load_static_summary(sweep_root):
         return list(csv.DictReader(f))
 
 
+def load_surrogate_audit(surrogate_root):
+    """Load optional LOO predictions and circular validation diagnostics."""
+    if not surrogate_root:
+        return {}, None
+    root = Path(surrogate_root)
+    if not root.is_absolute():
+        root = REPO_ROOT / root
+    prediction_path = root / "loo_predictions.csv"
+    validation_path = root / "surrogate_validation_summary.json"
+    metadata_path = root / "model_metadata.json"
+    if not prediction_path.is_file() or not validation_path.is_file():
+        raise FileNotFoundError(
+            f"surrogate audit requires {prediction_path.name} and "
+            f"{validation_path.name} under {root}"
+        )
+    metadata = json.loads(metadata_path.read_text()) if metadata_path.is_file() else {}
+    if metadata.get("schema_version") != ARTIFACT_SCHEMA_VERSION:
+        raise ValueError(
+            f"response surrogate at {root} is schema_version="
+            f"{metadata.get('schema_version')!r}; version "
+            f"{ARTIFACT_SCHEMA_VERSION} is required"
+        )
+    with prediction_path.open() as handle:
+        predictions = {
+            row.get("case_id", ""): row for row in csv.DictReader(handle)
+            if row.get("case_id")
+        }
+    validation = json.loads(validation_path.read_text())
+    return predictions, validation
+
+
 def normalized(values, higher_is_better):
     """Min-max normalize; higher_is_better picks polarity. Empty -> zeros."""
     arr = np.array([v if v is not None else np.nan for v in values], dtype=float)
@@ -110,7 +143,8 @@ def has_warnings(row):
 
 
 def score_doe_cases(rows, weights, require_finite_phase=True,
-                    include_zero_eps=False):
+                    include_zero_eps=False, surrogate_predictions=None,
+                    require_predicted_phase=False):
     """Score each DOE row. Returns a list of (row, score, breakdown)."""
     weights = {**DEFAULT_WEIGHTS, **(weights or {})}
     eligible = []
@@ -135,6 +169,15 @@ def score_doe_cases(rows, weights, require_finite_phase=True,
             continue
         row = dict(row)
         row["_ranking_exit_mach_amplitude"] = row.get(amplitude_key)
+        prediction = (surrogate_predictions or {}).get(row.get("case_id", ""))
+        if require_predicted_phase:
+            predicted_lag = _parse_float(
+                (prediction or {}).get("predicted_exit_mach_phase_lag_rad"),
+            )
+            if predicted_lag is None:
+                continue
+        if prediction is not None:
+            row["_surrogate_prediction"] = prediction
         eligible.append(row)
     tpr = [_parse_float(r.get("tpr_mean")) for r in eligible]
     mass_defect = [abs(_parse_float(r.get("mass_defect_mean")))
@@ -198,19 +241,33 @@ def to_csv_row(row, score, breakdown, source):
     """Flatten a (row, score, breakdown) tuple for ranked_cases.csv."""
     out = {"source": source, "score": score}
     for key in ("case_id", "q_offset", "epsilon", "frequency_hz", "phase",
+                "reduced_frequency",
                 "q", "exit_mach_mean", "exit_mach_amplitude",
                 "tpr_mean", "tpr", "mass_defect_mean",
                 "exit_mach_phase_lag_rad", "warnings",
                 "status"):
         if key in row:
             out[key] = row.get(key)
+    prediction = row.get("_surrogate_prediction") or {}
+    for key in (
+        "predicted_exit_mach_complex_amplitude",
+        "predicted_exit_mach_phase_lag_rad",
+        "exit_mach_circular_error_rad",
+        "predicted_tpr_complex_amplitude",
+        "predicted_tpr_phase_lag_rad",
+        "tpr_circular_error_rad",
+    ):
+        if key in prediction:
+            out[f"surrogate_loo_{key}"] = prediction.get(key)
     for k, v in breakdown.items():
         out[f"score_{k}"] = v
     return out
 
 
 def write_selection_report(path, doe_root, static_root, weights,
-                            top_k, selected_doe, selected_static):
+                            top_k, selected_doe, selected_static,
+                            surrogate_validation=None,
+                            require_predicted_phase=False):
     """Write a human-readable selection_report.md."""
     lines = []
     lines.append("# Candidate ranking selection report\n")
@@ -221,6 +278,10 @@ def write_selection_report(path, doe_root, static_root, weights,
     lines.append("## Inputs\n")
     lines.append(f"- DOE root: `{doe_root}`")
     lines.append(f"- Static sweep root: `{static_root}`")
+    lines.append(
+        "- Surrogate-predicted phase gate: "
+        f"`{bool(require_predicted_phase)}` (measured supported phase remains authoritative)"
+    )
     lines.append("")
     lines.append("## Scoring weights\n")
     for k, v in weights.items():
@@ -228,13 +289,14 @@ def write_selection_report(path, doe_root, static_root, weights,
     lines.append("")
     lines.append("## Top DOE candidates\n")
     if selected_doe:
-        lines.append("| Rank | case_id | q_offset | epsilon | f [Hz] | phase | score |")
-        lines.append("|---|---|---|---|---|---|---|")
+        lines.append("| Rank | case_id | q_offset | epsilon | f [Hz] | k | measured lag [rad] | score |")
+        lines.append("|---|---|---|---|---|---|---|---|")
         for i, (row, score, _) in enumerate(selected_doe[:top_k], start=1):
             lines.append(
                 f"| {i} | {row.get('case_id', '')} | {row.get('q_offset', '')} | "
                 f"{row.get('epsilon', '')} | {row.get('frequency_hz', '')} | "
-                f"{row.get('phase', '')} | {score:.4f} |"
+                f"{row.get('reduced_frequency', '')} | "
+                f"{row.get('exit_mach_phase_lag_rad', '')} | {score:.4f} |"
             )
     else:
         lines.append("(no DOE candidates were eligible after filtering)")
@@ -250,6 +312,24 @@ def write_selection_report(path, doe_root, static_root, weights,
             )
     else:
         lines.append("(no static sweep summary provided or no eligible cases)")
+    lines.append("")
+    lines.append("## Response-surrogate audit\n")
+    if surrogate_validation:
+        complex_block = surrogate_validation.get("complex_responses", {})
+        lines.append("Surrogate values below are leave-one-out diagnostics only; ")
+        lines.append("they do not replace measured DOE metrics in the score.\n")
+        lines.append("| response | supported LOO samples | circular MAE [rad] | circular RMSE [rad] |")
+        lines.append("|---|---:|---:|---:|")
+        for stem, result in complex_block.items():
+            if result.get("status") != "ok":
+                continue
+            lines.append(
+                f"| {stem} | {result.get('n_samples', '')} | "
+                f"{result.get('circular_mae_rad', float('nan')):.4f} | "
+                f"{result.get('circular_rmse_rad', float('nan')):.4f} |"
+            )
+    else:
+        lines.append("(no response-surrogate audit supplied)")
     lines.append("")
     lines.append("## Limitations\n")
     lines.append("- Low-fidelity effective-area forcing only — not body-fitted CFD.")
@@ -268,8 +348,13 @@ def _greedy_diverse_selection(scored, top_k):
     if not scored or top_k <= 0:
         return []
     pool = scored[:max(top_k * 4, top_k)]
+    use_reduced = all(
+        _parse_float(row.get("reduced_frequency")) is not None
+        for row, _, _ in pool
+    )
+    frequency_key = "reduced_frequency" if use_reduced else "frequency_hz"
     design = np.asarray([
-        [float(row[k]) for k in ("q_offset", "epsilon", "frequency_hz")]
+        [float(row["q_offset"]), float(row["epsilon"]), float(row[frequency_key])]
         for row, _, _ in pool
     ])
     lo, hi = design.min(axis=0), design.max(axis=0)
@@ -292,7 +377,8 @@ def _greedy_diverse_selection(scored, top_k):
 
 def rank_cases(doe_root, output_root=None, static_root=None, top_k=5,
                weights=None, require_finite_phase=True,
-               include_zero_eps=False):
+               include_zero_eps=False, surrogate_root=None,
+               require_predicted_phase=False):
     """Rank DOE + optional static-sweep candidates; write outputs."""
     doe_root = Path(doe_root)
     if not doe_root.is_absolute():
@@ -315,11 +401,20 @@ def rank_cases(doe_root, output_root=None, static_root=None, top_k=5,
 
     doe_rows = load_doe_summary(doe_root)
     static_rows = load_static_summary(static_root) if static_root else []
+    surrogate_predictions, surrogate_validation = load_surrogate_audit(
+        surrogate_root,
+    )
+    if require_predicted_phase and not surrogate_predictions:
+        raise ValueError(
+            "require_predicted_phase=True requires --surrogate-root with LOO predictions"
+        )
 
     scored_doe, effective_weights = score_doe_cases(
         doe_rows, weights,
         require_finite_phase=require_finite_phase,
         include_zero_eps=include_zero_eps,
+        surrogate_predictions=surrogate_predictions,
+        require_predicted_phase=require_predicted_phase,
     )
     scored_doe.sort(key=lambda triple: triple[1], reverse=True)
     scored_static = score_static_cases(static_rows, weights)
@@ -345,12 +440,42 @@ def rank_cases(doe_root, output_root=None, static_root=None, top_k=5,
         "static_sweep_root": str(static_root) if static_root else None,
         "top_k": int(top_k),
         "weights": effective_weights,
+        "surrogate_audit": {
+            "root": str(surrogate_root) if surrogate_root else None,
+            "used_for_scoring": False,
+            "require_finite_predicted_phase": bool(require_predicted_phase),
+            "measured_phase_authoritative": True,
+            "complex_response_validation": (
+                (surrogate_validation or {}).get("complex_responses")
+            ),
+        },
         "doe_candidates": [
             {
                 "case_id": row.get("case_id", ""),
                 "rank": i + 1,
                 "score": float(score),
                 "design": {k: _parse_float(row.get(k)) for k in DESIGN_KEYS},
+                "measured_response": {
+                    "exit_mach_amplitude": _parse_float(row.get(
+                        "_ranking_exit_mach_amplitude",
+                    )),
+                    "exit_mach_phase_lag_rad": _parse_float(row.get(
+                        "exit_mach_phase_lag_rad",
+                    )),
+                    "tpr_mean": _parse_float(row.get("tpr_mean")),
+                },
+                "surrogate_loo_audit": {
+                    key: _parse_float(value)
+                    for key, value in (row.get("_surrogate_prediction") or {}).items()
+                    if key in {
+                        "predicted_exit_mach_complex_amplitude",
+                        "predicted_exit_mach_phase_lag_rad",
+                        "exit_mach_circular_error_rad",
+                        "predicted_tpr_complex_amplitude",
+                        "predicted_tpr_phase_lag_rad",
+                        "tpr_circular_error_rad",
+                    }
+                },
                 "case_relpath": str(Path("cases") / (row.get("case_id") or "")),
                 "score_breakdown": breakdown,
                 "warnings": row.get("warnings", ""),
@@ -373,6 +498,8 @@ def rank_cases(doe_root, output_root=None, static_root=None, top_k=5,
             "Failed cases and warning-flagged cases are filtered or down-weighted.",
             "epsilon=0 baselines are excluded unless explicitly requested.",
             "DOE top-k uses a score/spread greedy selection in (q_offset, epsilon, frequency).",
+            "Reduced frequency replaces dimensional frequency in spread when available.",
+            "Measured supported lag remains authoritative; surrogate LOO lag is audit-only unless its optional finite-value gate is requested.",
             "These selections seed a later high-fidelity CFD workflow.",
         ],
     }
@@ -380,6 +507,8 @@ def rank_cases(doe_root, output_root=None, static_root=None, top_k=5,
     write_selection_report(
         output_root / "selection_report.md", doe_root, static_root,
         effective_weights, top_k, selected_doe, selected_static,
+        surrogate_validation=surrogate_validation,
+        require_predicted_phase=require_predicted_phase,
     )
 
     print(f"Ranked {len(scored_doe)} DOE candidates and {len(scored_static)} static cases.")
@@ -421,6 +550,15 @@ def main(argv=None):
                         help="Allow cases without a finite exit-Mach phase lag.")
     parser.add_argument("--include-zero-eps", action="store_true",
                         help="Allow epsilon=0 labeled baselines in unsteady candidates.")
+    parser.add_argument(
+        "--surrogate-root", default=None,
+        help="Optional response-surrogate output carrying circular LOO diagnostics.",
+    )
+    parser.add_argument(
+        "--require-finite-predicted-phase", action="store_true",
+        help=("Additionally require a finite LOO-predicted exit-Mach lag. "
+              "Measured supported lag remains the scoring source."),
+    )
     args = parser.parse_args(argv)
 
     rank_cases(
@@ -431,6 +569,8 @@ def main(argv=None):
         weights=parse_weights(args.weights),
         require_finite_phase=not args.allow_missing_phase,
         include_zero_eps=args.include_zero_eps,
+        surrogate_root=args.surrogate_root,
+        require_predicted_phase=args.require_finite_predicted_phase,
     )
 
 

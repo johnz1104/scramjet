@@ -158,6 +158,17 @@ A(x; q) = A_{\text{base}}(x) + q\,\phi(x), \qquad
 A(x, t) = A_{\text{base}}(x) + \big(q_{\text{offset}} + \varepsilon \sin(2\pi f t + \psi)\big)\,\phi(x).
 ```
 
+Frequency is also stored as
+
+```math
+k = \frac{2\pi f L_{\mathrm{ref}}}{u_{\mathrm{ref}}}.
+```
+
+Every DoE manifest records the dimensional references. Demo defaults use the
+full duct length and inlet velocity; both are CLI-overridable so calibrated
+Config-A work can use its ramp/motion length rather than silently inheriting a
+generic duct scale.
+
 The static parameter `q` represents an effective throat-area or wall-position
 change and is the axis for the contraction and unstart study. The time-periodic
 mode is a reduced representation of a compression surface oscillating under
@@ -235,9 +246,13 @@ The compressible model is paired with two reduced representations:
   Improvement ranks a candidate pool, the POD ROM screens the top `m`, and one
   selected point is confirmed by the full solver; the returned best point is
   full-verified by construction. The unsteady design of experiments over
-  `(q_offset, eps, f, phase)` is
-  summarized by a scalar response surrogate, with ridge-regression and
-  inverse-distance fallbacks when samples are scarce.
+  `(q_offset, eps, k, phase)` is summarized by a response surrogate, with
+  ridge-regression and inverse-distance fallbacks when samples are scarce.
+  Positive amplitudes are conditioned in log10 space. Periodic response is
+  modeled as the complex coefficient `H = amplitude*exp(-i*lag)`, so phase is
+  never regressed across its wrap discontinuity; circular LOO error, per-target
+  feature association, dense in-domain amplitude/lag maps, and the exact
+  zero-forcing boundary are emitted with the model audit.
 
 Candidate configurations are ranked by a transparent weighted score over
 normalized quantities of interest, and the selected geometries are exported
@@ -247,7 +262,10 @@ structured **Gmsh** mesh definition (`.geo`, transfinite quads, named physical
 groups), and an **OpenFOAM case template** (`rhoCentralFoam`-style `0/`,
 `constant/`, `system/`, and a `pipefail`-safe `Allrun.sh` driver), sampling
 function objects, and an executable `postprocess_qoi.py` that writes the shared
-schema-v2 TPR/shock QoIs. This is designed for apples-to-apples comparison;
+schema-v2 TPR/shock QoIs. Measured supported lag remains authoritative for
+evaluated DoE cases; optional surrogate LOO lag can be carried into the report
+or used as an additional finite-value gate, but never replaces the measured
+value in the score. This is designed for apples-to-apples comparison;
 the loop is not yet closed. Review the dictionaries against the pinned
 OpenFOAM version before production runs.
 
@@ -294,6 +312,7 @@ references (`python3 tests.py`):
 | Breathing static-gas law | ~1e-15 relative | 2e-9 | `rho∝A^-1`, `p∝A^-gamma` |
 | Combustion energy closure | 1674 K final | 2% | `T_i + Q Y_f/c_v` |
 | Busemann generator (Mach conoid / mass balance) | ~1e-11 deg / ~1e-12 | 1e-6 / 1e-8 | Taylor–Maccoll self-consistency |
+| Research coordinates / circular response | machine checks | exact identities | reduced frequency, complex response, C--R limits, deterministic staircase |
 
 ![Sod shock tube](test_sod.png)
 *Sod shock tube against the exact Riemann solution. This exercises the full
@@ -337,6 +356,10 @@ final residual `6.1e-9`, about 2.3 s on the recorded machine).
 | Prescribed inlet mass flow | 7.077 kg/s per unit depth |
 | Exit mass flow / mass defect | 6.933 kg/s / -2.03% |
 
+The harness gates absolute mass defect at 3%, not the former 8%. This is a
+coarse-grid regression guard, not a grid-convergence result; reportable runs
+target 1% after mesh refinement.
+
 ![Mach field](verification/verify_mach.png)
 ![Centerline profiles](verification/verify_centerline.png)
 
@@ -351,12 +374,30 @@ within a fraction of a percent.
 shock-holding diffuser and extracts the shock-position amplitude and phase lag
 per forcing frequency through the same `response_metrics.py` path used by the
 wall-motion studies. The quasi-steady limit is exact and built in: in the
-regenerated schema-v2 demo the amplitude ratio is 1.038 at 20 Hz, 0.954 at
-50 Hz, 0.666 at 100 Hz, 0.249 at 200 Hz, and 0.163 at 400 Hz. On the
-gain-aligned shock coordinate the unwrapped lag grows from 0.455 to 6.068 rad.
+regenerated eight-cycle schema-v2 demo the amplitude ratio is 1.004 at 20 Hz,
+0.978 at 50 Hz, 0.685 at 100 Hz, 0.293 at 200 Hz, and 0.171 at 400 Hz. On the
+gain-aligned shock coordinate the unwrapped lag grows from 0.449 to 6.095 rad.
 This is the expected low-pass shock response and an unsteady-pipeline anchor.
 Because this geometry has `A_t = 0`, corrected and legacy breathing-energy
 paths are bitwise identical for the benchmark.
+
+The benchmark also evaluates Culick and Rogers' published isentropic-flow
+transfer, `x_s'/p_e' = C/(1+i*omega*tau)` (their Eqs. 42--44), at the local
+shock Mach number and area gradient. The paper's input is acoustic pressure
+immediately behind the shock, whereas this code imposes pressure at the end of
+a finite post-shock duct. The plotted comparison is therefore labeled a
+hybrid--exact exit-pressure static gain multiplied by the published relaxation
+factor--and its gain/lag discrepancy is reported without a pass/fail claim.
+For this finite-duct demo the normalized-gain RMSE is 0.160 and the unwrapped
+phase-difference RMSE is 2.41 rad, which is evidence that the local-input
+curve must not be relabeled as a strict outlet-forcing validation.
+
+`experiments/run_hysteresis_sweep.py` carries state through a deterministic
+up/down back-pressure staircase. At 60 cells the regenerated 15-stage demo
+settles every level and finds a classification difference at pressure factor
+1.323: shock-at-inlet on the up leg and a captured shock on the down leg. A
+repeat run is byte-identical. This is numerical path dependence in the
+prescribed-inlet model, not validation of physical spillage hysteresis.
 
 ### Reduced-order model and adaptive sampling
 
@@ -384,8 +425,11 @@ BO on wall time.
 *Full-fidelity GP adaptive-sampling convergence. Plotted observations are full
 solver results; ROM prescreen calls are not inserted into the GP.*
 
-The unsteady design of experiments feeds a scalar response surrogate over the
-post-transient quantities of interest, including TPR and shock position.
+The unsteady design of experiments feeds a quality-gated complex-response
+surrogate over post-transient quantities including TPR and shock position.
+Unsupported lags never enter complex-response training. The sparse 18-case demo
+still has order-one circular lag error, so its maps validate the pipeline, not
+the physics; the artifact says so directly.
 
 ![Surrogate parity](figures/surrogate_parity.png)
 *Response-surrogate predicted against actual mean total-pressure recovery on
@@ -415,16 +459,16 @@ balance to integration accuracy.*
 | `response_metrics.py` | Own-time-array, drift-aware amplitude/positive-lag estimation with support and fit-quality guards. |
 | `diagnostics.py` | TPR, shock detection (total-pressure destruction), scalar-boundedness and flow diagnostics. |
 | `configs/` | Experiment-condition presets: `tusq_m585.json` (Config A), `ncsu_m37.json` (Config B; review-note transcription flagged in-file). |
-| `experiments/` | Static sweep, unsteady runs, DoE, surrogate and ROM builders, candidate ranking, forced-shock benchmark, presets loader, and the OpenFOAM/FUN3D + Gmsh exporter. |
+| `experiments/` | Static sweep, unsteady runs, DoE, complex-response surrogate and ROM builders, candidate ranking, forced-shock benchmark, deterministic hysteresis diagnostic, presets loader, and the OpenFOAM/FUN3D + Gmsh exporter. |
 | `figures/make_geometry_figure.py` | Regenerates the parameterization figure above. |
-| `tests.py` | Twelve validation groups; exits 1 on failure and 2 for an unknown group. |
+| `tests.py` | Thirteen validation groups; exits 1 on failure and 2 for an unknown group. |
 | `verification/verify_all.py` | Assertion-bearing end-to-end harness writing `verify_results.json` and `verify_*.png`. |
 
 ## Quick start
 
 ```bash
 python3 -m pip install -r requirements.txt
-python3 tests.py                            # validation suite, 12 groups
+python3 tests.py                            # validation suite, 13 groups
 python3 verification/verify_all.py          # baseline, ROM, optimization (~1 min)
 python3 figures/make_geometry_figure.py     # regenerate the geometry figure
 python3 busemann.py                         # Busemann generator demo
@@ -437,10 +481,11 @@ python3 experiments/run_static_wall_sweep.py        --output-root runs/static_de
 python3 experiments/run_parametric_unsteady_doe.py  --output-root runs/doe_demo
 python3 experiments/build_unsteady_response_surrogate.py --doe-root runs/doe_demo --output-root runs/surrogate_demo
 python3 experiments/build_steady_q_rom.py           --sweep-root runs/static_demo --output-root runs/rom_demo
-python3 experiments/rank_candidate_cases.py         --doe-root runs/doe_demo --output-root runs/ranked_demo --top-k 5
+python3 experiments/rank_candidate_cases.py         --doe-root runs/doe_demo --static-sweep-root runs/static_demo --surrogate-root runs/surrogate_demo --output-root runs/ranked_demo --top-k 5
 python3 experiments/export_high_fidelity_scaffold.py --sweep-root runs/static_demo \
     --selected-cases runs/ranked_demo/selected_cases.json --output-root runs/export_demo
 python3 experiments/run_forced_shock_benchmark.py   --output-root runs/forced_shock
+python3 experiments/run_hysteresis_sweep.py         --output-root runs/hysteresis_demo
 ```
 
 Experiment-condition presets replace the generic atmosphere baseline
@@ -450,7 +495,8 @@ conditions, shared QoI definitions, mesh and turbulence notes, a structured
 Gmsh `.geo`, an OpenFOAM case template, sampling objects, and an executable QoI
 bridge per selected case. Schema-v2 gates prevent older, pre-energy-fix runs
 from entering the ROM/surrogate/ranking/export stages. Demo runs use three
-cycles with a 25% time discard; for reportable response maps use converged baselines,
+cycles with a 25% time discard; each case also persists `run_status.json`. For
+reportable response maps use converged baselines,
 5–10 post-transient forcing cycles, and a transient discard tied to the
 flow-through time.
 
@@ -510,7 +556,8 @@ arXiv:2311.13050, 2023.
 
 Verification lineage for the forced-shock benchmark: F. E. C. Culick and T.
 Rogers, "The Response of Normal Shocks in Diffusers," AIAA Journal, Vol. 21,
-No. 10, 1983; M. Sajben, T. J. Bogar, and J. C. Kroutil, forced-oscillation
+No. 10, 1983, [doi:10.2514/3.60147](https://doi.org/10.2514/3.60147); M. Sajben,
+T. J. Bogar, and J. C. Kroutil, forced-oscillation
 transonic-diffuser experiments (NASA validation archive). Busemann generator:
 S. Mölder and E. J. Szpiro, "Busemann Inlet for Hypersonic Speeds," Journal of
 Spacecraft and Rockets, Vol. 3, No. 8, 1966.

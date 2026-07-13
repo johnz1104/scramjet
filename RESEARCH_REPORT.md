@@ -1,6 +1,6 @@
-# Eleven-concern remediation and research assessment
+# Eleven-concern remediation and forward research assessment
 
-Date: 2026-07-12
+Date: 2026-07-13
 Scope: quasi-1D scramjet effective-area repository, Paper-1 cold-flow workflow
 
 ## Executive assessment
@@ -18,6 +18,13 @@ multi-fidelity result: Config-A dimensions remain placeholders, the default
 demo uses the generic area law, and no emitted OpenFOAM case has been meshed,
 run, and postprocessed. Those three facts define the critical path to Paper 1.
 
+The 2026-07-13 forward pass completed the remaining small repo work: explicit
+reduced-frequency coordinates, log/complex-response surrogates with circular
+validation, surrogate-aware ranking audits, the quantitative Culick--Rogers
+reference, per-case DoE run status, a deterministic hysteresis driver, and a
+tighter mass-balance regression guard. None of these substitutes for the first
+Config-A/OpenFOAM anchor.
+
 The paper scope remains cold flow. Combustion units and testing are fixed, but
 combustion is parked until the first low/high-fidelity loop closes; that scope
 decision should be revisited after Phase 4 rather than allowed to distract the
@@ -25,7 +32,7 @@ current paper.
 
 ## Judgement calls and disagreements with the proposed remediation
 
-Three adjustments were made rather than following the proposed mechanics
+Six adjustments were made rather than following the proposed mechanics
 literally:
 
 1. The integrated breathing thermodynamics check uses the spatially uniform
@@ -43,6 +50,17 @@ literally:
 3. The OpenFOAM handoff is called an executable comparison design, not a closed
    loop. It emits sampling and QoI code, but compatibility and numerical parity
    cannot be claimed before a case actually runs in the pinned image.
+4. Surrogate-predicted lag does not replace a supported lag measured in an
+   evaluated DoE case during ranking. The complex surrogate is carried as an
+   audit and optional finite-value gate; measured evidence remains stronger.
+5. The Culick--Rogers curve is not called a strict exit-pressure validation.
+   Their transfer input is local post-shock acoustic pressure, whereas the
+   numerical input is imposed at the end of a finite subsonic duct. The emitted
+   hybrid curve isolates the published relaxation from that propagation gap.
+6. Reduced frequency is not hardcoded to an unnamed duct scale, and the
+   hysteresis output is not called physical validation. Both dimensional
+   references are recorded/overridable; the staircase reports numerical path
+   dependence under the prescribed-inlet limitation.
 
 ## Implemented theory
 
@@ -137,6 +155,55 @@ residual RMS, drift fraction, and signal-to-residual ratio. Unsupported raw
 amplitudes remain diagnostic only and do not enter surrogate training.
 Multiple design-phase values are encoded as sine/cosine features.
 
+### Reduced-frequency and complex-response surrogate
+
+The post-remediation follow-up now records
+
+```text
+k = 2*pi*f*L_ref/u_ref
+```
+
+in every new DoE design row, case summary, and manifest. `L_ref` and `u_ref`
+are recorded, not inferred later. The demo default is full duct length and
+freestream velocity; CLI overrides are required when Config A is calibrated so
+the ramp/motion length can be the intended scale. Earlier schema-v2 artifacts
+remain readable through a documented `frequency_hz` fallback; no pre-v2
+artifact is admitted.
+
+Phase is not treated as an ordinary scalar target. For each supported response
+the surrogate fits
+
+```text
+H = amplitude * exp(-i*positive_lag)
+```
+
+through its real and imaginary components. This makes phase wrapping explicit
+and makes the zero-response limit well defined. Scalar amplitude models use a
+log10 target; dense response-surface output enforces exactly zero amplitude and
+undefined phase at `epsilon=0`. Validation reconstructs amplitude and lag and
+reports wrapped circular MAE/RMSE. Each target also records an exploratory
+absolute-Spearman feature association; it is not described as causal
+sensitivity. Unsupported lags never enter complex-response training.
+
+Ranking keeps the stronger evidence source authoritative: a supported lag
+measured in a completed DoE run controls eligibility and scoring. Optional LOO
+surrogate lag is carried into the selection audit and may be required to be
+finite, but it never replaces the measured value. Every new DoE case also
+writes `run_status.json` with requested/achieved time, cycles, baseline status,
+and the underlying solver completion record.
+
+### Deterministic H5 diagnostic
+
+`experiments/run_hysteresis_sweep.py` implements the planned up/down
+back-pressure staircase with state carried continuously between levels. A
+captured shock has a finite raw-RHS floor in the shock-capturing discretization,
+so per-level completion uses three consecutive classification/shock-position/
+TPR checks after at least three flow-through times; the residual is still
+recorded. Matching up/down levels are compared at a two-cell shock-position
+tolerance and a 0.01 TPR tolerance. Its output deliberately says **numerical
+path dependence**, not physical hysteresis: the prescribed inlet still cannot
+model spillage or changing capture.
+
 ### QoI and unstart observability
 
 All transverse averages use `dy`, including mass-flux TPR weighting on
@@ -218,15 +285,40 @@ flow-through-based discard, frequency refinement, and at least 5-10 settled
 cycles.
 
 The forced-shock benchmark is invariant to this correction because `A_t=0`.
-The regenerated gain-aligned amplitude ratio falls from 1.038 at 20 Hz to
-0.163 at 400 Hz; unwrapped lag grows from 0.455 to 6.068 rad. This preserves
+The regenerated eight-cycle gain-aligned amplitude ratio falls from 1.004 at
+20 Hz to 0.171 at 400 Hz; unwrapped lag grows from 0.449 to 6.095 rad. This preserves
 the low-pass/lag verification lineage while separating it from wall breathing.
+
+The benchmark now evaluates the Culick--Rogers isentropic-flow coefficients
+from their Eqs. 42--44. At the present mean shock station, the local upstream
+Mach number is 2.456 and `tau=3.089e-3 s`; the published first-order relaxation
+therefore predicts normalized gains from 0.932 at 20 Hz to 0.128 at 400 Hz and
+positive lag from 0.370 to 1.443 rad. This is not presented as a strict
+point-by-point validation against the imposed exit pressure. Their input is
+the acoustic pressure immediately behind the shock, while the numerical input
+is the boundary pressure after a finite post-shock duct. The overlay uses the
+exact exit-pressure static gain times the published relaxation factor, calls
+it a hybrid, and reports rather than passes/fails the extra propagation lag.
+The resulting normalized-gain RMSE is 0.160 and the unwrapped phase-difference
+RMSE is 2.41 rad; these values quantify the mismatch instead of disguising it.
+
+The 60-cell deterministic hysteresis demo settles all 15 staircase levels. At
+back-pressure factor 1.323, the up leg classifies the shock at the inlet while
+the down leg retains a captured internal shock, so the driver reports
+`numerical_path_dependence_detected`. Repeating the same configuration produces
+byte-identical summary and assessment files. This result is a useful H5 target
+for grid refinement, but it is not physical hysteresis validation because
+inlet capture and spillage cannot vary in this model.
 
 ### Verification, ROM, and cost
 
-`python3 tests.py` passes all 12 groups. The legacy breathing switch makes the
+`python3 tests.py` passes all 13 groups. The legacy breathing switch makes the
 breathing group fail, as intended. `verification/verify_all.py` passes every
 assertion and writes strict JSON without NaNs.
+
+The clean-run mass-balance regression limit is now 3% (measured 2.03%), not
+the earlier 8%. It is labeled as a coarse-grid gross-error guard; research
+results retain a 1% target after an explicit grid-refinement study.
 
 The verification POD uses six full snapshots and four modes. Mean held-out TPR
 error is 1.21% for state-derived POD QoIs and 0.25% for direct IDW. The much
@@ -234,16 +326,19 @@ larger state-derived mass-defect and legacy thrust errors are reported rather
 than hidden; Paper 1 should show POD-versus-IDW error by QoI.
 
 The adaptive-sampling verification uses nine optimizer full solves, six
-ROM-training full solves, and 20 ROM prescreen calls. Including training, it is
-70.2% slower than standard BO at the same nine-full-solve budget, but 36.2%
-cheaper than fully evaluating an equivalent top-four shortlist. The scientific
+ROM-training full solves, and 20 ROM prescreen calls. Including training, the
+regenerated run is 68.6% slower than standard BO at the same nine-full-solve
+budget, but 36.8% cheaper than fully evaluating an equivalent top-four
+shortlist. The scientific
 benefit to test is improved case-selection quality per confirmed run, not a
 blanket BO speedup.
 
-The demo scalar surrogate is also intentionally honest: leave-one-out RMSE is
-0.255 for exit-Mach amplitude (`RMSE/std=1.04`) and 0.0451 for mean TPR
-(`RMSE/std=0.474`). This coarse 18-case map is pipeline validation, not a
-reportable surrogate. It supports the plan's demand for a research-grade DoE.
+The demo surrogate remains intentionally honest. Log conditioning improves
+the physical-space exit-Mach-amplitude LOO RMSE from the earlier 0.255 to about
+0.128 (`RMSE/std` from 1.04 to about 0.52), but the complex-response lag has
+order-one circular error at only 12 supported samples. This coarse 18-case map
+is pipeline validation, not a reportable surrogate. More samples--not cosmetic
+hyperparameter tuning--remain the research requirement.
 
 ## Position against Paper-1 hypotheses and schedule
 
@@ -255,7 +350,9 @@ closed:
    shock detected in the contraction. This is directionally compatible with a
    sub-20% Config-A loss hypothesis, but it is not a Config-A comparison.
 2. **Shock dynamics:** the forced-shock benchmark shows clear low-pass
-   amplitude and increasing unwrapped lag. This is the strongest current
+   amplitude and increasing unwrapped lag. The Culick--Rogers first-order
+   curve now provides a quantitative local-relaxation reference, with the
+   finite-duct input mismatch kept explicit. This is the strongest current
    unsteady anchor.
 3. **Wall-motion response:** corrected breathing dynamics produce measurable,
    quality-gated amplitude and lag, but the large old/new shift requires a new
@@ -296,7 +393,11 @@ validated OpenFOAM canonical duct, and the first static Config-A comparison.
 - **H5 — hysteresis is a cheap discriminator:** up/down amplitude or
   back-pressure sweeps should give a clear yes/no on whether the low-fidelity
   dynamics reproduce restart/unstart path dependence. A classification target
-  may be more defensible than amplitude regression near regime boundaries.
+  may be more defensible than amplitude regression near regime boundaries. The
+  60-cell diagnostic gives a reproducible classification difference at one
+  pressure level; the next test is whether it persists under grid and step-
+  tolerance refinement. It remains a numerical-model diagnostic until a
+  spillage-capable or high-fidelity comparison exists.
 
 ## Next actions
 
@@ -311,8 +412,8 @@ validated OpenFOAM canonical duct, and the first static Config-A comparison.
 4. Run the static Config-A deflection ladder with grid refinement and compare
    TPR/wall pressure against the experiment.
 5. Run a research-grade corrected DoE: at least 5-10 settled cycles, discard
-   tied to flow-through time, frequency in reduced-frequency coordinates, and
-   explicit convergence/quality acceptance thresholds.
+   tied to flow-through time, a calibrated reduced-frequency grid, and explicit
+   convergence/quality acceptance thresholds.
 6. Add the first OpenFOAM QoIs as anchors and measure error reduction versus
    full-only sampling. This is the claim Paper 1 still needs.
 7. After that loop closes, decide whether combustion belongs in the next paper
@@ -328,7 +429,8 @@ validated OpenFOAM canonical duct, and the first static Config-A comparison.
 - No quantitative Config-A/B statement before geometry/preset verification.
 
 Every new experiment manifest carries schema version 2, git state, Python and
-dependency versions. Surrogate, ranking, ROM-from-sweep, and exporter stages
-reject older artifacts. Generated demo outputs live under the git-ignored
+dependency versions. New DoE artifacts add reduced frequency without breaking
+schema-v2 readers. Surrogate, ranking, ROM-from-sweep, and exporter stages
+reject pre-v2 artifacts. Generated demo outputs live under the git-ignored
 `runs/` tree; the committed evidence is the code, tests, verification JSON and
 figures, and this report.

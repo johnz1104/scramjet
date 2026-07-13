@@ -17,6 +17,9 @@ Validation cases, each targeting a different solver component:
     6. Breathing energy     — validates moving-wall pressure work and the
                               isentropic compression law
     7. Transient diffusion  — validates the dynamic-coefficient scaling
+    8. Research workflow    — validates reduced-frequency coordinates,
+                              complex response encoding, circular gates,
+                              Culick--Rogers response, and hysteresis logic
 
 Usage:
     python tests.py              # run all tests
@@ -29,6 +32,7 @@ Usage:
     python tests.py breathing    # moving-wall energy source only
     python tests.py diffusion    # transient diffusion only
     python tests.py config       # config clone/application invariants
+    python tests.py research     # research-coordinate/workflow invariants
 
 Dependency: mesh.py, fvm.py, physics.py, solver.py, diagnostics.py
 """
@@ -552,6 +556,153 @@ def test_response_metrics():
     passed = all(checks.values())
     print(f"  {'PASS' if passed else 'FAIL'}")
     return passed
+
+
+def test_research_workflow_coordinates():
+    """Fast invariants for the post-remediation research workflow."""
+    print("\n" + "=" * 60)
+    print("TEST: Research Workflow Coordinates and Circular Response")
+    print("=" * 60)
+
+    from experiments.build_unsteady_response_surrogate import (
+        _value_for_target,
+        collect_target_vector,
+        feature_names_for_rows,
+        inverse_target,
+        transform_target,
+        zero_forcing_response_value,
+    )
+    from experiments.rank_candidate_cases import score_doe_cases
+    from experiments.run_forced_shock_benchmark import (
+        culick_rogers_frequency_response,
+        culick_rogers_operating_point,
+    )
+    from experiments.run_hysteresis_sweep import (
+        assess_hysteresis,
+        build_staircase,
+        stage_completion_gate,
+    )
+    from experiments.run_parametric_unsteady_doe import (
+        design_matrix,
+        reduced_frequency,
+    )
+
+    k_exact = 2.0 * np.pi * 500.0 * 1.2 / 600.0
+    k_value = reduced_frequency(500.0, 1.2, 600.0)
+    design = design_matrix(
+        [0.0], [0.01], [500.0], [0.0],
+        length_ref=1.2, velocity_ref=600.0,
+    )
+    reduced_frequency_ok = (
+        abs(k_value - k_exact) < 1.0e-14
+        and abs(design[0]["reduced_frequency"] - k_exact) < 1.0e-14
+    )
+
+    supported_row = {
+        "case_id": "supported", "status": "ok",
+        "q_offset": 0.0, "epsilon": 0.01,
+        "frequency_hz": 500.0, "reduced_frequency": k_value, "phase": 0.0,
+        "exit_mach_amplitude": 2.0,
+        "exit_mach_phase_lag_rad": 0.7,
+        "exit_mach_supported": True,
+        "tpr_mean": 0.9, "mass_defect_mean": 0.01,
+    }
+    unsupported_row = {
+        **supported_row,
+        "case_id": "unsupported", "epsilon": 0.0,
+        "exit_mach_amplitude": None,
+        "exit_mach_phase_lag_rad": None,
+        "exit_mach_supported": False,
+    }
+    real = _value_for_target(supported_row, "exit_mach_response_real")
+    imag = _value_for_target(supported_row, "exit_mach_response_imag")
+    real_values, real_mask = collect_target_vector(
+        [supported_row, unsupported_row], "exit_mach_response_real",
+    )
+    complex_encoding_ok = (
+        abs(real - 2.0 * np.cos(0.7)) < 1.0e-14
+        and abs(imag + 2.0 * np.sin(0.7)) < 1.0e-14
+        and real_mask.tolist() == [True, False]
+        and abs(real_values[0] - real) < 1.0e-14
+    )
+    reduced_features_ok = (
+        "reduced_frequency" in feature_names_for_rows([supported_row])
+        and "frequency_hz" not in feature_names_for_rows([supported_row])
+    )
+    legacy_row = dict(supported_row)
+    legacy_row.pop("reduced_frequency")
+    legacy_features_ok = "frequency_hz" in feature_names_for_rows([legacy_row])
+    log_conditioning_ok = np.allclose(
+        inverse_target(transform_target([1.0e-3, 2.0], "log10"), "log10"),
+        [1.0e-3, 2.0], rtol=1.0e-14, atol=0.0,
+    )
+    zero_boundary_ok = (
+        zero_forcing_response_value("exit_mach_amplitude", 2.0, 0.0) == 0.0
+        and zero_forcing_response_value("exit_mach_response_real", 2.0, 0.0) == 0.0
+        and zero_forcing_response_value("exit_mach_mean", 2.0, 0.0) == 2.0
+    )
+
+    cr_point = culick_rogers_operating_point(
+        0.5, 0.05, 0.10, 1.0, 2.0, 20000.0, 300.0,
+    )
+    cr_zero = culick_rogers_frequency_response(0.0, cr_point["tau_s"])
+    cr_low = culick_rogers_frequency_response(20.0, cr_point["tau_s"])
+    cr_high = culick_rogers_frequency_response(400.0, cr_point["tau_s"])
+    culick_rogers_ok = (
+        cr_point["C_m_per_Pa"] < 0.0 and cr_point["tau_s"] > 0.0
+        and np.isclose(cr_point["C_m_per_Pa"], -1.7236066611310142e-5,
+                       rtol=1.0e-12, atol=0.0)
+        and np.isclose(cr_point["tau_s"], 3.0890012768257473e-3,
+                       rtol=1.0e-12, atol=0.0)
+        and cr_zero["normalized_gain"] == 1.0
+        and cr_zero["phase_lag_rad"] == 0.0
+        and cr_low["normalized_gain"] > cr_high["normalized_gain"]
+        and 0.0 < cr_low["phase_lag_rad"] < cr_high["phase_lag_rad"] < np.pi / 2.0
+    )
+
+    predictions = {
+        "supported": {"predicted_exit_mach_phase_lag_rad": "0.6"},
+    }
+    scored, _ = score_doe_cases(
+        [supported_row, {**supported_row, "case_id": "missing_prediction"}],
+        weights=None, require_finite_phase=True,
+        surrogate_predictions=predictions, require_predicted_phase=True,
+    )
+    predicted_phase_gate_ok = len(scored) == 1 and scored[0][0]["case_id"] == "supported"
+
+    staircase_a = build_staircase([1.1, 0.9, 1.0])
+    staircase_b = build_staircase([1.1, 0.9, 1.0])
+    comparison_rows = [
+        {"leg": "up", "pressure_factor": 0.9, "classification": "started",
+         "shock_x": 0.7, "tpr": 0.9, "status": "ok"},
+        {"leg": "down", "pressure_factor": 0.9, "classification": "started",
+         "shock_x": 0.705, "tpr": 0.899, "status": "ok"},
+    ]
+    assessment = assess_hysteresis(
+        comparison_rows, shock_position_tolerance_m=0.02,
+    )
+    hysteresis_logic_ok = (
+        staircase_a == staircase_b
+        and assessment["classification"] == "single_path_within_resolution"
+        and not assessment["physical_hysteresis_validated"]
+        and not stage_completion_gate(3, 3, 2.99, 3.0)
+        and stage_completion_gate(3, 3, 3.0, 3.0)
+    )
+
+    checks = {
+        "reduced-frequency formula and design field": reduced_frequency_ok,
+        "complex response uses H=A*exp(-i lag) and support gate": complex_encoding_ok,
+        "new rows use reduced frequency": reduced_features_ok,
+        "legacy schema-v2 rows retain dimensional-frequency fallback": legacy_features_ok,
+        "log-amplitude transform round trip": log_conditioning_ok,
+        "zero forcing zeros every periodic-response representation": zero_boundary_ok,
+        "Culick--Rogers first-order gain/lag limits": culick_rogers_ok,
+        "optional predicted-phase ranking gate": predicted_phase_gate_ok,
+        "hysteresis sequence and resolution-aware classification deterministic": hysteresis_logic_ok,
+    }
+    for name, ok in checks.items():
+        print(f"  {name}: {'PASS' if ok else 'FAIL'}")
+    return all(checks.values())
 
 
 def test_sod_shock_tube():
@@ -1628,6 +1779,7 @@ if __name__ == "__main__":
         "geometry": test_area_perturbation,
         "reduced": test_reduced_fidelity_extensions,
         "metrics": test_response_metrics,
+        "research": test_research_workflow_coordinates,
         "busemann": test_busemann_generator,
         "sod": test_sod_shock_tube,
         "nozzle": test_nozzle_area_mach,

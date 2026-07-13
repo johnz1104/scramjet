@@ -1,11 +1,19 @@
 """
 Scalar response surrogate over a parametric unsteady DOE.
 
-This trains a small surrogate over the scalar response metrics produced
-by experiments/run_parametric_unsteady_doe.py. The features are the
-design variables (q_offset, epsilon, frequency_hz, phase) and the targets
-are time-averaged means and post-transient amplitudes (and optional probe
-pressure amplitudes) extracted by response_metrics.
+This trains a small surrogate over the response metrics produced by
+experiments/run_parametric_unsteady_doe.py. New DOE artifacts use reduced
+frequency ``k = 2*pi*f*L_ref/u_ref`` as the frequency coordinate; schema-v2
+artifacts created before that additive field remain readable through a
+dimensional-frequency fallback.
+
+Periodic response is represented by the complex harmonic coefficient
+
+    H = amplitude * exp(-i * phase_lag),
+
+so lag is never regressed as a discontinuous raw angle.  Amplitudes are also
+fit in log10 space.  Validation converts both representations back to physical
+amplitude/phase and reports circular phase error.
 
 This is NOT a time-accurate reduced-order model. It is a scalar response
 surrogate intended for trend interpolation and candidate screening only.
@@ -35,6 +43,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+from scipy.stats import rankdata
 
 from experiments.run_static_wall_sweep import (
     ARTIFACT_SCHEMA_VERSION,
@@ -45,14 +54,18 @@ from experiments.run_static_wall_sweep import (
 from optimization import GPSurrogate
 
 
-FEATURE_KEYS = ("q_offset", "epsilon", "frequency_hz", "phase")
+LEGACY_FEATURE_KEYS = ("q_offset", "epsilon", "frequency_hz", "phase")
+RAW_FEATURE_KEYS = (
+    "q_offset", "epsilon", "frequency_hz", "reduced_frequency", "phase",
+)
 
-DEFAULT_TARGETS = (
+SCALAR_TARGETS = (
     "exit_mach_mean",
     "exit_mach_amplitude",
     "tpr_mean",
     "tpr_amplitude",
     "shock_x_mean",
+    "shock_x_amplitude",
     "pressure_recovery_mean",
     "pressure_recovery_amplitude",
     "mdot_exit_mean",
@@ -62,6 +75,33 @@ DEFAULT_TARGETS = (
     "probe_combustor_pressure_amplitude",
     "probe_exit_pressure_amplitude",
 )
+
+COMPLEX_RESPONSE_STEMS = (
+    "exit_mach",
+    "tpr",
+    "shock_x",
+    "pressure_recovery",
+    "probe_throat_pressure",
+    "probe_combustor_pressure",
+    "probe_exit_pressure",
+)
+
+
+def complex_target_names(stem):
+    """Names of the real/imaginary targets for one harmonic response."""
+    return f"{stem}_response_real", f"{stem}_response_imag"
+
+
+DEFAULT_TARGETS = SCALAR_TARGETS + tuple(
+    name
+    for stem in COMPLEX_RESPONSE_STEMS
+    for name in complex_target_names(stem)
+)
+
+
+def default_targets():
+    """Scalar targets plus complex-response components for supported lags."""
+    return list(DEFAULT_TARGETS)
 
 MIN_LOO_SAMPLES = 5
 MIN_FIT_SAMPLES = 3
@@ -106,20 +146,28 @@ def _drop_failed(rows):
         status = (r.get("status") or "").strip().lower()
         if status and status != "ok":
             continue
-        x = [_parse_float(r.get(k)) for k in FEATURE_KEYS]
-        if any(v is None for v in x):
+        base = [_parse_float(r.get(k)) for k in ("q_offset", "epsilon", "phase")]
+        has_frequency = any(
+            _parse_float(r.get(k)) is not None
+            for k in ("reduced_frequency", "frequency_hz")
+        )
+        if any(v is None for v in base) or not has_frequency:
             continue
         cleaned.append(r)
     return cleaned
 
 
 def feature_names_for_rows(rows):
-    """Use circular features when the design actually varies phase."""
+    """Select reduced frequency when available and circularize design phase."""
+    use_reduced = bool(rows) and all(
+        _parse_float(row.get("reduced_frequency")) is not None for row in rows
+    )
+    frequency_key = "reduced_frequency" if use_reduced else "frequency_hz"
     phases = {_parse_float(row.get("phase")) for row in rows}
     phases.discard(None)
     if len(phases) > 1:
-        return ("q_offset", "epsilon", "frequency_hz", "phase_sin", "phase_cos")
-    return FEATURE_KEYS
+        return ("q_offset", "epsilon", frequency_key, "phase_sin", "phase_cos")
+    return ("q_offset", "epsilon", frequency_key, "phase")
 
 
 def build_feature_matrix(rows, feature_names=None):
@@ -133,6 +181,9 @@ def build_feature_matrix(rows, feature_names=None):
             "q_offset": float(row["q_offset"]),
             "epsilon": float(row["epsilon"]),
             "frequency_hz": float(row["frequency_hz"]),
+            "reduced_frequency": float(row.get(
+                "reduced_frequency", row["frequency_hz"],
+            )),
             "phase": phase,
             "phase_sin": float(np.sin(phase)),
             "phase_cos": float(np.cos(phase)),
@@ -154,15 +205,111 @@ def _support_key_for_target(key):
     return f"{stem}_supported"
 
 
+def _complex_target_spec(key):
+    """Return (stem, component) for a derived complex target, else None."""
+    for component in ("real", "imag"):
+        suffix = f"_response_{component}"
+        if key.endswith(suffix):
+            return key[:-len(suffix)], component
+    return None
+
+
+def _value_for_target(row, key):
+    """Extract a direct or derived target value from one summary row."""
+    spec = _complex_target_spec(key)
+    if spec is None:
+        return _parse_float(row.get(key))
+    stem, component = spec
+    amplitude = _parse_float(row.get(f"{stem}_amplitude"))
+    lag = _parse_float(row.get(f"{stem}_phase_lag_rad"))
+    if amplitude is None or lag is None:
+        return None
+    if component == "real":
+        return float(amplitude * np.cos(lag))
+    # H = A exp(-i lag): positive lag has a negative imaginary component.
+    return float(-amplitude * np.sin(lag))
+
+
 def collect_target_vector(rows, key):
     """Return (values_finite, mask) for one target metric."""
-    parsed = [_parse_float(r.get(key)) for r in rows]
-    support_key = _support_key_for_target(key)
+    parsed = [_value_for_target(r, key) for r in rows]
+    complex_spec = _complex_target_spec(key)
+    support_key = (
+        _support_key_for_target(f"{complex_spec[0]}_amplitude")
+        if complex_spec is not None else _support_key_for_target(key)
+    )
     supported = ([True] * len(rows) if support_key is None else
                  [_parse_bool(row.get(support_key)) for row in rows])
-    mask = np.array([v is not None and ok for v, ok in zip(parsed, supported)])
+    positive_required = key.endswith("_amplitude")
+    mask = np.array([
+        v is not None and ok and (not positive_required or v > 0.0)
+        for v, ok in zip(parsed, supported)
+    ])
     values = np.array([v if v is not None else np.nan for v in parsed], dtype=float)
     return values, mask
+
+
+def target_transform(key):
+    """Amplitude scalars use log10 conditioning; other targets are identity."""
+    return "log10" if key.endswith("_amplitude") else "identity"
+
+
+def transform_target(values, transform):
+    values = np.asarray(values, dtype=float)
+    if transform == "log10":
+        if np.any(values <= 0.0):
+            raise ValueError("log-amplitude targets must be positive")
+        return np.log10(values)
+    return values.copy()
+
+
+def inverse_target(values, transform):
+    values = np.asarray(values, dtype=float)
+    if transform == "log10":
+        return np.power(10.0, values)
+    return values.copy()
+
+
+def wrap_phase(values):
+    """Wrap scalar/array angles to [-pi, pi)."""
+    return (np.asarray(values, dtype=float) + np.pi) % (2.0 * np.pi) - np.pi
+
+
+def zero_forcing_response_value(target, value, epsilon, atol=1.0e-15):
+    """Apply the exact zero-input boundary to periodic response outputs."""
+    is_periodic = target.endswith("_amplitude") or _complex_target_spec(target) is not None
+    if is_periodic and abs(float(epsilon)) <= float(atol):
+        return 0.0
+    return float(value)
+
+
+def feature_relevance(X, y, feature_names):
+    """Exploratory per-feature absolute Spearman association.
+
+    This is deliberately reported as association, not causal sensitivity.  It
+    remains meaningful for the fixed-hyperparameter demo GP, whose nominal ARD
+    lengthscales are otherwise all identical.
+    """
+    y_rank = rankdata(np.asarray(y, dtype=float))
+    raw = {}
+    for index, name in enumerate(feature_names):
+        x = np.asarray(X[:, index], dtype=float)
+        if np.ptp(x) <= 1.0e-14 or np.ptp(y_rank) <= 1.0e-14:
+            rho = 0.0
+        else:
+            rho = float(np.corrcoef(rankdata(x), y_rank)[0, 1])
+            if not np.isfinite(rho):
+                rho = 0.0
+        raw[name] = rho
+    total = sum(abs(value) for value in raw.values())
+    return {
+        name: {
+            "spearman_r": value,
+            "absolute": abs(value),
+            "normalized_absolute": (abs(value) / total if total > 0.0 else 0.0),
+        }
+        for name, value in raw.items()
+    }
 
 
 def normalize_features(X):
@@ -316,8 +463,162 @@ def plot_predicted_vs_actual(predicted, actual, target_name, path):
     plt.close(fig)
 
 
+def plot_circular_errors(predicted, actual, stem, path):
+    """Plot wrapped LOO phase errors for one complex response."""
+    error = wrap_phase(np.asarray(predicted) - np.asarray(actual))
+    fig, ax = plt.subplots(figsize=(5.5, 4.5))
+    ax.scatter(actual, error, s=42, color="#7a3db8", alpha=0.85)
+    ax.axhline(0.0, color="k", ls="--", lw=1.0)
+    ax.set_xlabel("actual positive phase lag [rad]")
+    ax.set_ylabel("wrapped predicted - actual [rad]")
+    ax.set_title(f"Circular LOO error: {stem}")
+    ax.set_ylim(-np.pi, np.pi)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+
+
+def _surface_query_rows(valid_rows, resolution):
+    """Dense in-domain (epsilon, frequency) grid at observed q/phase levels."""
+    q_levels = sorted({_parse_float(row.get("q_offset")) for row in valid_rows})
+    phase_levels = sorted({_parse_float(row.get("phase")) for row in valid_rows})
+    eps_values = np.asarray([
+        _parse_float(row.get("epsilon")) for row in valid_rows
+    ], dtype=float)
+    frequency_values = np.asarray([
+        _parse_float(row.get("frequency_hz")) for row in valid_rows
+    ], dtype=float)
+    eps_grid = np.linspace(float(eps_values.min()), float(eps_values.max()), resolution)
+    frequency_grid = np.linspace(
+        float(frequency_values.min()), float(frequency_values.max()), resolution,
+    )
+
+    ratios = []
+    for row in valid_rows:
+        frequency = _parse_float(row.get("frequency_hz"))
+        reduced = _parse_float(row.get("reduced_frequency"))
+        if frequency is not None and reduced is not None and abs(frequency) > 0.0:
+            ratios.append(reduced / frequency)
+    reduced_per_hz = float(np.median(ratios)) if ratios else None
+
+    rows = []
+    for q_offset in q_levels:
+        for phase in phase_levels:
+            for epsilon in eps_grid:
+                for frequency in frequency_grid:
+                    row = {
+                        "q_offset": q_offset,
+                        "epsilon": float(epsilon),
+                        "frequency_hz": float(frequency),
+                        "phase": phase,
+                    }
+                    if reduced_per_hz is not None:
+                        row["reduced_frequency"] = float(reduced_per_hz * frequency)
+                    rows.append(row)
+    return rows, q_levels, phase_levels, eps_grid, frequency_grid
+
+
+def generate_response_surface(valid_rows, feature_names, trained_models,
+                              transforms, x_mins, x_ranges, output_root,
+                              plots_dir, resolution=25):
+    """Predict an in-domain response grid and render complex-response maps."""
+    if not valid_rows or not trained_models:
+        return {"status": "skipped", "reason": "no trained models"}
+    rows, q_levels, phase_levels, eps_grid, frequency_grid = _surface_query_rows(
+        valid_rows, resolution,
+    )
+    X_query = build_feature_matrix(rows, feature_names=feature_names)
+    X_query_norm = (X_query - x_mins) / x_ranges
+
+    for target, model in trained_models.items():
+        prediction_model = predict_model(model, X_query_norm)
+        prediction = inverse_target(prediction_model, transforms[target])
+        for row, value in zip(rows, prediction):
+            # A zero sinusoidal input has zero periodic response, while its
+            # phase remains undefined.
+            value = zero_forcing_response_value(
+                target, value, row["epsilon"],
+            )
+            row[f"predicted_{target}"] = float(value)
+
+    mapped_stems = []
+    for stem in COMPLEX_RESPONSE_STEMS:
+        real_name, imag_name = complex_target_names(stem)
+        real_key = f"predicted_{real_name}"
+        imag_key = f"predicted_{imag_name}"
+        if not rows or real_key not in rows[0] or imag_key not in rows[0]:
+            continue
+        mapped_stems.append(stem)
+        for row in rows:
+            real = row[real_key]
+            imag = row[imag_key]
+            if abs(row["epsilon"]) <= 1.0e-15:
+                row[f"predicted_{stem}_complex_amplitude"] = 0.0
+                row[f"predicted_{stem}_phase_lag_rad"] = None
+            else:
+                row[f"predicted_{stem}_complex_amplitude"] = float(np.hypot(real, imag))
+                row[f"predicted_{stem}_phase_lag_rad"] = float(
+                    wrap_phase(np.arctan2(-imag, real)),
+                )
+
+    write_csv(output_root / "response_surface.csv", rows)
+
+    n_per_map = resolution * resolution
+    for stem in mapped_stems:
+        for q_index, q_offset in enumerate(q_levels):
+            for phase_index, phase in enumerate(phase_levels):
+                block_index = q_index * len(phase_levels) + phase_index
+                block = rows[block_index * n_per_map:(block_index + 1) * n_per_map]
+                amplitude = np.asarray([
+                    row[f"predicted_{stem}_complex_amplitude"] for row in block
+                ]).reshape(resolution, resolution)
+                lag = np.asarray([
+                    (np.nan if row[f"predicted_{stem}_phase_lag_rad"] is None
+                     else row[f"predicted_{stem}_phase_lag_rad"])
+                    for row in block
+                ], dtype=float).reshape(resolution, resolution)
+                fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.5))
+                x_axis = np.asarray([
+                    row.get("reduced_frequency", row["frequency_hz"])
+                    for row in block[:resolution]
+                ])
+                Xp, Yp = np.meshgrid(x_axis, eps_grid)
+                c0 = axes[0].pcolormesh(Xp, Yp, amplitude, shading="auto", cmap="viridis")
+                c1 = axes[1].pcolormesh(
+                    Xp, Yp, lag, shading="auto", cmap="twilight",
+                    vmin=-np.pi, vmax=np.pi,
+                )
+                fig.colorbar(c0, ax=axes[0], label="complex-response amplitude")
+                fig.colorbar(c1, ax=axes[1], label="positive phase lag [rad]")
+                xlabel = ("reduced frequency k" if "reduced_frequency" in block[0]
+                          else "frequency [Hz]")
+                for ax in axes:
+                    ax.set_xlabel(xlabel)
+                    ax.set_ylabel("epsilon")
+                axes[0].set_title(f"{stem}: amplitude")
+                axes[1].set_title(f"{stem}: phase lag")
+                fig.suptitle(f"q_offset={q_offset:g}, forcing phase={phase:g} rad")
+                plt.tight_layout()
+                safe_q = f"{q_offset:+.6f}".replace("+", "p").replace("-", "m").replace(".", "p")
+                safe_phase = f"{phase:+.4f}".replace("+", "p").replace("-", "m").replace(".", "p")
+                fig.savefig(
+                    plots_dir / f"response_map_{stem}_q_{safe_q}_phase_{safe_phase}.png",
+                    dpi=140,
+                )
+                plt.close(fig)
+    return {
+        "status": "ok",
+        "resolution_per_axis": int(resolution),
+        "n_rows": len(rows),
+        "mapped_complex_responses": mapped_stems,
+        "domain_only": True,
+    }
+
+
 def build_surrogate(doe_root, output_root=None, targets=None,
-                    holdout_fraction=0.2, seed=42):
+                    holdout_fraction=0.2, seed=42, surface_resolution=25):
     """Train surrogate per target and emit reports + plots."""
     doe_root = Path(doe_root)
     if not doe_root.is_absolute():
@@ -337,7 +638,7 @@ def build_surrogate(doe_root, output_root=None, targets=None,
     plots_dir.mkdir(parents=True, exist_ok=True)
 
     if targets is None:
-        targets = list(DEFAULT_TARGETS)
+        targets = default_targets()
 
     summary_rows, design_rows = load_doe_summary(doe_root)
     valid_rows = _drop_failed(summary_rows)
@@ -346,13 +647,13 @@ def build_surrogate(doe_root, output_root=None, targets=None,
 
     train_data_rows = []
     for r in valid_rows:
-        record = {k: _parse_float(r.get(k)) for k in FEATURE_KEYS}
+        record = {k: _parse_float(r.get(k)) for k in RAW_FEATURE_KEYS}
         record["case_id"] = r.get("case_id", "")
         for t in targets:
-            record[t] = _parse_float(r.get(t))
+            record[t] = _value_for_target(r, t)
         train_data_rows.append(record)
     write_csv(output_root / "surrogate_training_data.csv", train_data_rows,
-              fieldnames=["case_id", *FEATURE_KEYS, *targets])
+              fieldnames=["case_id", *RAW_FEATURE_KEYS, *targets])
 
     metadata = {
         "schema_version": ARTIFACT_SCHEMA_VERSION,
@@ -360,10 +661,27 @@ def build_surrogate(doe_root, output_root=None, targets=None,
         "doe_root": str(doe_root),
         "n_summary_rows": len(summary_rows),
         "n_valid_rows": len(valid_rows),
-        "raw_design_features": list(FEATURE_KEYS),
+        "raw_design_features": list(RAW_FEATURE_KEYS),
         "features": list(feature_names),
+        "frequency_coordinate": (
+            "reduced_frequency" if "reduced_frequency" in feature_names
+            else "frequency_hz_legacy_fallback"
+        ),
         "circular_phase_encoding": "phase_sin" in feature_names,
         "targets": list(targets),
+        "target_conditioning": {
+            "amplitudes": "log10",
+            "other_scalars": "identity",
+        },
+        "complex_response": {
+            "definition": "H = amplitude*exp(-i*positive_phase_lag)",
+            "stems": list(COMPLEX_RESPONSE_STEMS),
+            "unsupported_lags_trained": False,
+        },
+        "feature_relevance": {
+            "method": "absolute Spearman association on valid target rows",
+            "interpretation": "exploratory association, not causal sensitivity",
+        },
         "min_loo_samples": MIN_LOO_SAMPLES,
         "min_fit_samples": MIN_FIT_SAMPLES,
         "holdout_fraction": holdout_fraction,
@@ -376,6 +694,7 @@ def build_surrogate(doe_root, output_root=None, targets=None,
             "Scalar response surrogate only — predicts post-transient scalar metrics, not time histories.",
             "Trained on low-fidelity effective-area forcing data from the Python prototype.",
             "Not a substitute for high-fidelity unsteady CFD.",
+            "Sparse-demo response maps are visualization aids unless LOO diagnostics are acceptable.",
         ],
     }
 
@@ -399,7 +718,20 @@ def build_surrogate(doe_root, output_root=None, targets=None,
         "min": x_mins.tolist(), "range": x_ranges.tolist(),
     }
 
-    validation_summary = {"status": "ok", "metadata": metadata, "targets": {}}
+    validation_summary = {
+        "status": "ok", "metadata": metadata, "targets": {},
+        "complex_responses": {},
+    }
+    trained_models = {}
+    transforms = {}
+    loo_cache = {}
+    loo_rows = [
+        {
+            "case_id": row.get("case_id", ""),
+            **{key: _parse_float(row.get(key)) for key in RAW_FEATURE_KEYS},
+        }
+        for row in valid_rows
+    ]
 
     for target in targets:
         y, mask = collect_target_vector(valid_rows, target)
@@ -411,6 +743,8 @@ def build_surrogate(doe_root, output_root=None, targets=None,
             "loo": None,
             "holdout": None,
             "warning": "",
+            "transform": target_transform(target),
+            "feature_relevance": None,
         }
 
         if n_valid_target < MIN_FIT_SAMPLES:
@@ -422,15 +756,24 @@ def build_surrogate(doe_root, output_root=None, targets=None,
             continue
 
         X_tgt = X_norm[mask]
-        y_tgt = y[mask]
+        y_physical = y[mask]
+        transform = target_transform(target)
+        y_tgt = transform_target(y_physical, transform)
         model, model_name = fit_model(X_tgt, y_tgt)
         result["model_selected"] = model_name
+        result["feature_relevance"] = feature_relevance(
+            X_tgt, y_tgt, feature_names,
+        )
+        trained_models[target] = model
+        transforms[target] = transform
 
         if n_valid_target >= MIN_LOO_SAMPLES:
             try:
-                preds, actuals = leave_one_out(
+                preds_model, actuals_model = leave_one_out(
                     X_tgt, y_tgt, full_model=model, full_kind=model_name,
                 )
+                preds = inverse_target(preds_model, transform)
+                actuals = inverse_target(actuals_model, transform)
                 err = preds - actuals
                 rmse = float(np.sqrt(np.mean(err**2)))
                 mae = float(np.mean(np.abs(err)))
@@ -440,7 +783,20 @@ def build_surrogate(doe_root, output_root=None, targets=None,
                     "mae": mae,
                     "rmse_over_std": rel_rmse,
                     "n_samples": int(n_valid_target),
+                    "model_space_rmse": float(np.sqrt(np.mean(
+                        (preds_model - actuals_model)**2,
+                    ))),
+                    "model_space": transform,
                 }
+                row_indices = np.flatnonzero(mask)
+                loo_cache[target] = {
+                    "row_indices": row_indices,
+                    "predicted": preds,
+                    "actual": actuals,
+                }
+                for row_index, predicted, actual in zip(row_indices, preds, actuals):
+                    loo_rows[int(row_index)][f"predicted_{target}"] = float(predicted)
+                    loo_rows[int(row_index)][f"actual_{target}"] = float(actual)
                 plot_predicted_vs_actual(
                     preds, actuals, target,
                     plots_dir / f"predicted_vs_actual_{target}.png",
@@ -458,8 +814,10 @@ def build_surrogate(doe_root, output_root=None, targets=None,
                 train_idx = idx[:n_train]
                 test_idx = idx[n_train:]
                 model_h, _ = fit_model(X_tgt[train_idx], y_tgt[train_idx])
-                pred_h = predict_model(model_h, X_tgt[test_idx])
-                err_h = pred_h - y_tgt[test_idx]
+                pred_h_model = predict_model(model_h, X_tgt[test_idx])
+                pred_h = inverse_target(pred_h_model, transform)
+                actual_h = inverse_target(y_tgt[test_idx], transform)
+                err_h = pred_h - actual_h
                 rmse_h = float(np.sqrt(np.mean(err_h**2)))
                 result["holdout"] = {
                     "n_train": int(n_train),
@@ -467,12 +825,91 @@ def build_surrogate(doe_root, output_root=None, targets=None,
                     "rmse": rmse_h,
                 }
         except Exception as exc:
-            result.setdefault("warnings", []).append(
-                f"holdout failed: {type(exc).__name__}: {exc}",
+            message = f"holdout failed: {type(exc).__name__}: {exc}"
+            result["warning"] = "; ".join(
+                part for part in (result.get("warning", ""), message) if part
             )
 
         validation_summary["targets"][target] = result
 
+    for stem in COMPLEX_RESPONSE_STEMS:
+        real_name, imag_name = complex_target_names(stem)
+        if real_name not in loo_cache or imag_name not in loo_cache:
+            validation_summary["complex_responses"][stem] = {
+                "status": "insufficient_supported_data",
+            }
+            continue
+        real_cache = loo_cache[real_name]
+        imag_cache = loo_cache[imag_name]
+        real_by_row = {
+            int(index): (float(predicted), float(actual))
+            for index, predicted, actual in zip(
+                real_cache["row_indices"], real_cache["predicted"], real_cache["actual"],
+            )
+        }
+        imag_by_row = {
+            int(index): (float(predicted), float(actual))
+            for index, predicted, actual in zip(
+                imag_cache["row_indices"], imag_cache["predicted"], imag_cache["actual"],
+            )
+        }
+        common = sorted(set(real_by_row) & set(imag_by_row))
+        pred_real = np.asarray([real_by_row[index][0] for index in common])
+        pred_imag = np.asarray([imag_by_row[index][0] for index in common])
+        actual_real = np.asarray([real_by_row[index][1] for index in common])
+        actual_imag = np.asarray([imag_by_row[index][1] for index in common])
+        predicted_amplitude = np.hypot(pred_real, pred_imag)
+        actual_amplitude = np.hypot(actual_real, actual_imag)
+        predicted_lag = wrap_phase(np.arctan2(-pred_imag, pred_real))
+        actual_lag = wrap_phase(np.arctan2(-actual_imag, actual_real))
+        circular_error = wrap_phase(predicted_lag - actual_lag)
+        amplitude_error = predicted_amplitude - actual_amplitude
+        response_result = {
+            "status": "ok",
+            "n_samples": len(common),
+            "circular_mae_rad": float(np.mean(np.abs(circular_error))),
+            "circular_rmse_rad": float(np.sqrt(np.mean(circular_error**2))),
+            "amplitude_rmse": float(np.sqrt(np.mean(amplitude_error**2))),
+            "amplitude_rmse_over_std": float(
+                np.sqrt(np.mean(amplitude_error**2))
+                / max(float(np.std(actual_amplitude)), 1.0e-12)
+            ),
+            "phase_convention": "positive lag; H=A*exp(-i*lag)",
+        }
+        validation_summary["complex_responses"][stem] = response_result
+        for offset, row_index in enumerate(common):
+            loo_rows[row_index].update({
+                f"predicted_{stem}_complex_amplitude": float(predicted_amplitude[offset]),
+                f"actual_{stem}_complex_amplitude": float(actual_amplitude[offset]),
+                f"predicted_{stem}_phase_lag_rad": float(predicted_lag[offset]),
+                f"actual_{stem}_phase_lag_rad": float(actual_lag[offset]),
+                f"{stem}_circular_error_rad": float(circular_error[offset]),
+            })
+        plot_circular_errors(
+            predicted_lag, actual_lag, stem,
+            plots_dir / f"circular_loo_{stem}.png",
+        )
+
+    loo_fieldnames = sorted({key for row in loo_rows for key in row})
+    write_csv(
+        output_root / "loo_predictions.csv", loo_rows,
+        fieldnames=loo_fieldnames,
+    )
+    surface_summary = generate_response_surface(
+        valid_rows, feature_names, trained_models, transforms,
+        x_mins, x_ranges, output_root, plots_dir,
+        resolution=max(int(surface_resolution), 2),
+    )
+    metadata["response_surface"] = surface_summary
+
+    write_json(output_root / "manifest.json", {
+        "schema_version": ARTIFACT_SCHEMA_VERSION,
+        "created_utc": metadata["created_utc"],
+        "study": "unsteady_response_surrogate",
+        "doe_root": str(doe_root),
+        "features": list(feature_names),
+        "complex_response_stems": list(COMPLEX_RESPONSE_STEMS),
+    })
     write_json(output_root / "model_metadata.json", metadata)
     write_json(output_root / "surrogate_validation_summary.json", validation_summary)
 
@@ -480,8 +917,8 @@ def build_surrogate(doe_root, output_root=None, targets=None,
         validation_summary["targets"][t].get("loo") is not None for t in targets
     )
     note = (
-        "Trained scalar response surrogate. This is NOT a time-accurate "
-        "reduced-order model."
+        "Trained scalar and complex-response surrogate. This is NOT a "
+        "time-accurate reduced-order model."
     )
     print(note)
     print(f"Valid DOE rows used: {len(valid_rows)}/{len(summary_rows)}")
@@ -493,8 +930,8 @@ def build_surrogate(doe_root, output_root=None, targets=None,
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description=(
-            "Train a scalar response surrogate on a parametric unsteady DOE. "
-            "Predicts post-transient scalar metrics, not time histories."
+            "Train a scalar/complex-response surrogate on a parametric "
+            "unsteady DOE. Predicts post-transient metrics, not time histories."
         ),
     )
     parser.add_argument("--doe-root", required=True,
@@ -503,8 +940,10 @@ def main(argv=None):
                         help="Path for surrogate outputs (default: timestamped runs/).")
     parser.add_argument("--targets", default=None,
                         help=("Comma-separated target metric names. Defaults to "
-                              "scalar means and amplitudes from DEFAULT_TARGETS."))
+                              "scalar means/log-amplitudes plus complex responses."))
     parser.add_argument("--holdout-fraction", type=float, default=0.2)
+    parser.add_argument("--surface-resolution", type=int, default=25,
+                        help="Points per epsilon/frequency axis in emitted maps.")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args(argv)
 
@@ -518,6 +957,7 @@ def main(argv=None):
         targets=targets,
         holdout_fraction=args.holdout_fraction,
         seed=args.seed,
+        surface_resolution=args.surface_resolution,
     )
 
 

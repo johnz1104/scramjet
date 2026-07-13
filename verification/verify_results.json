@@ -2,7 +2,7 @@
   "schema_version": 2,
   "scramjet_clean": {
     "scope": "paper-1 cold-flow baseline",
-    "wall_time_s": 2.5653092861175537,
+    "wall_time_s": 0.47634100914001465,
     "n_cells": 768,
     "run_status": {
       "converged": true,
@@ -81,12 +81,17 @@
     "temperature_range_K": [
       187.0485804257132,
       289.6714630283454
-    ]
+    ],
+    "mass_balance_gate": {
+      "absolute_mass_defect_limit": 0.03,
+      "role": "coarse-grid regression guard, not a grid-convergence result",
+      "research_grade_target_after_grid_refinement": 0.01
+    }
   },
   "extended_combustion_capability": {
     "paper_scope": false,
     "decision": "parked; revisit after cold-flow multi-fidelity loop closes",
-    "wall_time_s": 1.3596720695495605,
+    "wall_time_s": 0.26355719566345215,
     "fuel_range": [
       0.019999999999999456,
       0.020000000000000004
@@ -122,8 +127,8 @@
     ],
     "n_training_snapshots": 6,
     "n_modes": 4,
-    "build_time_s": 3.3646938800811768,
-    "mean_full_solver_s": 0.5571977694829305,
+    "build_time_s": 0.5996139049530029,
+    "mean_full_solver_s": 0.09835433959960938,
     "validation_mean_relative_errors": {
       "pod_state": {
         "tpr": 0.012077791448260287,
@@ -152,7 +157,7 @@
     }
   },
   "adaptive_sampling": {
-    "total_session_wall_s": 6.874814033508301,
+    "total_session_wall_s": 1.5730440616607666,
     "objective": "maximize tpr",
     "best_params": {
       "A_exit": 0.12085926525546051,
@@ -181,14 +186,14 @@
       "n_full_optimizer": 9,
       "n_full_rom_training": 6,
       "n_rom_prescreen": 20,
-      "full_optimizer_wall_s": 5.456283330917358,
-      "rom_training_wall_s": 3.3646938800811768,
-      "rom_prescreen_wall_s": 0.16664576530456543,
-      "total_including_training_wall_s": 8.9876229763031,
-      "standard_bo_same_full_budget_wall_s": 5.279681968688965,
-      "overhead_vs_standard_bo_pct": 70.23038564830225,
-      "equivalent_top_m_full_screen_wall_s": 14.079151916503907,
-      "saving_vs_equivalent_top_m_full_screen_pct": 36.16360538188667,
+      "full_optimizer_wall_s": 1.2297449111938477,
+      "rom_training_wall_s": 0.5996139049530029,
+      "rom_prescreen_wall_s": 0.011098861694335938,
+      "total_including_training_wall_s": 1.8404576778411865,
+      "standard_bo_same_full_budget_wall_s": 1.0919225692749024,
+      "overhead_vs_standard_bo_pct": 68.55203195070445,
+      "equivalent_top_m_full_screen_wall_s": 2.911793518066406,
+      "saving_vs_equivalent_top_m_full_screen_pct": 36.792988018485815,
       "comparison_note": "ROM prescreening adds overhead versus standard one-full-candidate BO; savings apply only versus evaluating every top-m shortlist candidate at full fidelity."
     }
   },
@@ -196,7 +201,7 @@
     "passed": true,
     "checks": {
       "clean_run_converged": true,
-      "clean_mass_balance_within_8pct": true,
+      "clean_mass_balance_within_3pct": true,
       "clean_tpr_physical": true,
       "clean_state_admissible": true,
       "rom_has_modes": true,

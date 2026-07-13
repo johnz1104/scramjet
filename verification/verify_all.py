@@ -69,6 +69,11 @@ results["scramjet_clean"] = {
     "qoi": qoi,
     "mach_range": [float(M.min()), float(M.max())],
     "temperature_range_K": [float(T.min()), float(T.max())],
+    "mass_balance_gate": {
+        "absolute_mass_defect_limit": 0.03,
+        "role": "coarse-grid regression guard, not a grid-convergence result",
+        "research_grade_target_after_grid_refinement": 0.01,
+    },
 }
 fig = solver.plot_mach()
 fig.savefig(os.path.join(_HERE, "verify_mach.png"), dpi=140)
@@ -172,7 +177,7 @@ pod_tpr_error = errors.get("pod_state", {}).get("tpr")
 idw_tpr_error = errors.get("idw", {}).get("tpr")
 assertions = {
     "clean_run_converged": bool(run_status["converged"]),
-    "clean_mass_balance_within_8pct": abs(qoi["mass_defect"]) < 0.08,
+    "clean_mass_balance_within_3pct": abs(qoi["mass_defect"]) < 0.03,
     "clean_tpr_physical": 0.0 < qoi["tpr"] <= 1.0 + 1.0e-8,
     "clean_state_admissible": bool(qoi["state_admissible"]),
     "rom_has_modes": n_modes >= 1,
